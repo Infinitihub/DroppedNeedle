@@ -2,7 +2,9 @@ name: Dev Image
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/discovery-edition-picker
     paths:
       - 'backend/**'
       - 'frontend/**'
@@ -109,14 +111,17 @@ jobs:
       - name: Set image tags
         env:
           SHORT_SHA: ${{ steps.sha.outputs.short }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           {
             echo "TAGS<<EOF"
-            echo "ghcr.io/droppedneedle/droppedneedle:dev"
-            echo "ghcr.io/droppedneedle/droppedneedle:dev-$SHORT_SHA"
+            echo "ghcr.io/$OWNER/droppedneedle:latest"
+            echo "ghcr.io/$OWNER/droppedneedle:dev"
+            echo "ghcr.io/$OWNER/droppedneedle:dev-$SHORT_SHA"
             if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-              echo "droppedneedle/droppedneedle:dev"
-              echo "droppedneedle/droppedneedle:dev-$SHORT_SHA"
+              echo "$DOCKERHUB_USERNAME/droppedneedle:latest"
+              echo "$DOCKERHUB_USERNAME/droppedneedle:dev"
+              echo "$DOCKERHUB_USERNAME/droppedneedle:dev-$SHORT_SHA"
             fi
             echo "EOF"
           } >> "$GITHUB_ENV"
