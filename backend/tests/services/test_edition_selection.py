@@ -24,9 +24,11 @@ from infrastructure.cache.cache_keys import (
 )
 from infrastructure.persistence.album_release_pin_store import AlbumReleasePinStore
 from infrastructure.persistence.library_db import LibraryDB
+from infrastructure.persistence.native_library_store import NativeLibraryStore
 from infrastructure.queue.priority_queue import RequestPriority
 from models.album import Track
 from services.album_service import AlbumService
+from services.native.target_reference_adapters import TargetAlbumReleasePinStore
 
 RG = "11111111-1111-4111-8111-111111111111"
 REL_STD = "22222222-2222-4222-8222-222222222222"
@@ -151,6 +153,29 @@ async def test_pin_overrides_owned_and_clearing_reverts(tmp_path: Path):
 
     await pins.clear(RG)
     assert (await service._effective_release_id(RG, _rg_payload()))[0] == REL_STD
+
+
+@pytest.mark.asyncio
+async def test_set_pin_supports_discovery_release_group_ids(tmp_path: Path):
+    lock = threading.Lock()
+    native_store = NativeLibraryStore(tmp_path / "target-library.db", lock)
+    library_db = LibraryDB(db_path=tmp_path / "library.db", write_lock=lock)
+    service = AlbumService(
+        MagicMock(),
+        MagicMock(get_release_group_by_id=AsyncMock(return_value=_rg_payload())),
+        library_db,
+        AsyncMock(),
+        AsyncMock(),
+        MagicMock(),
+        None,
+        None,
+        release_pin_store=TargetAlbumReleasePinStore(native_store),
+    )
+
+    await service.set_edition_pin(RG, REL_DELUXE, "admin-1")
+
+    assert await service._release_pins.get(RG) == REL_DELUXE
+    assert await service._release_pins.clear(RG) is True
 
 
 @pytest.mark.asyncio

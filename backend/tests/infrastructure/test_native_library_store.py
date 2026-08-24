@@ -1044,6 +1044,22 @@ async def test_target_genre_projection_and_release_pins_ignore_legacy_authority(
 
 
 @pytest.mark.asyncio
+async def test_target_release_pins_support_unowned_release_group_mbids(
+    store: NativeLibraryStore,
+) -> None:
+    rg = "11111111-1111-4111-8111-111111111111"
+    release = "22222222-2222-4222-8222-222222222222"
+
+    assert await store.get_target_album_release_pin(rg) is None
+
+    await store.set_target_album_release_pin(rg, release, "admin", "target-time")
+    assert await store.get_target_album_release_pin(rg) == release
+
+    assert await store.clear_target_album_release_pin(rg) is True
+    assert await store.get_target_album_release_pin(rg) is None
+
+
+@pytest.mark.asyncio
 async def test_target_release_pins_reject_ambiguous_provider_album_identity(
     store: NativeLibraryStore, db_path: Path
 ) -> None:

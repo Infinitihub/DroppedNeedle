@@ -1700,12 +1700,19 @@ class NativeLibraryStore(PersistenceBase):
     async def get_target_album_release_pin(self, album_identifier: str) -> str | None:
         def operation(connection: sqlite3.Connection) -> str | None:
             album_id = self._resolve_target_album_pin_id(connection, album_identifier)
-            if album_id is None:
+            if album_id is not None:
+                row = connection.execute(
+                    "SELECT release_mbid FROM library_album_release_pins "
+                    "WHERE local_album_id = ?",
+                    (album_id,),
+                ).fetchone()
+                return str(row["release_mbid"]) if row is not None else None
+            if not is_valid_mbid(album_identifier):
                 return None
             row = connection.execute(
-                "SELECT release_mbid FROM library_album_release_pins "
-                "WHERE local_album_id = ?",
-                (album_id,),
+                "SELECT release_mbid FROM album_release_pins "
+                "WHERE release_group_mbid = ?",
+                (album_identifier.casefold(),),
             ).fetchone()
             return str(row["release_mbid"]) if row is not None else None
 
@@ -1721,9 +1728,26 @@ class NativeLibraryStore(PersistenceBase):
         def operation(connection: sqlite3.Connection) -> None:
             album_id = self._resolve_target_album_pin_id(connection, album_identifier)
             if album_id is None:
-                raise ResourceNotFoundError(
-                    f"Album {album_identifier} is not in the local library"
+                if not is_valid_mbid(album_identifier):
+                    raise ResourceNotFoundError(
+                        f"Album {album_identifier} is not in the local library"
+                    )
+                connection.execute(
+                    "INSERT INTO album_release_pins "
+                    "(release_group_mbid, release_mbid, set_by_user_id, set_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(release_group_mbid) DO UPDATE SET "
+                    "release_mbid = excluded.release_mbid, "
+                    "set_by_user_id = excluded.set_by_user_id, "
+                    "set_at = excluded.set_at",
+                    (
+                        album_identifier.casefold(),
+                        release_mbid,
+                        set_by_user_id,
+                        set_at,
+                    ),
                 )
+                return
             identity = connection.execute(
                 "SELECT release_group_mbid FROM local_album_external_identities "
                 "WHERE local_album_id = ? AND provider = 'musicbrainz'",
@@ -1756,11 +1780,17 @@ class NativeLibraryStore(PersistenceBase):
     async def clear_target_album_release_pin(self, album_identifier: str) -> bool:
         def operation(connection: sqlite3.Connection) -> bool:
             album_id = self._resolve_target_album_pin_id(connection, album_identifier)
-            if album_id is None:
+            if album_id is not None:
+                cursor = connection.execute(
+                    "DELETE FROM library_album_release_pins WHERE local_album_id = ?",
+                    (album_id,),
+                )
+                return cursor.rowcount > 0
+            if not is_valid_mbid(album_identifier):
                 return False
             cursor = connection.execute(
-                "DELETE FROM library_album_release_pins WHERE local_album_id = ?",
-                (album_id,),
+                "DELETE FROM album_release_pins WHERE release_group_mbid = ?",
+                (album_identifier.casefold(),),
             )
             return cursor.rowcount > 0
 
