@@ -76,7 +76,12 @@ class AlbumService:
     async def _provider_album_id(self, identifier: str) -> str:
         if self._ownership is None:
             return identifier
-        return await self._ownership.provider_album_id(identifier)
+        try:
+            return await self._ownership.provider_album_id(identifier)
+        except ResourceNotFoundError:
+            # Discovery / un-downloaded albums are not in local ownership yet.
+            # Fall back to using the raw MusicBrainz ID directly.
+            return identifier
 
     async def resolve_album_identity(
         self,
