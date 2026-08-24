@@ -14,6 +14,7 @@ on:
       - 'frontend/package.json'
       - 'frontend/pnpm-lock.yaml'
       - '.github/workflows/dev-image.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
