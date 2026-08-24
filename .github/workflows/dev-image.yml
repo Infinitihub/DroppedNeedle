@@ -111,8 +111,9 @@ jobs:
       - name: Set image tags
         env:
           SHORT_SHA: ${{ steps.sha.outputs.short }}
-          OWNER: ${{ github.repository_owner }}
+          RAW_OWNER: ${{ github.repository_owner }}
         run: |
+          OWNER=$(echo "$RAW_OWNER" | tr '[:upper:]' '[:lower:]')
           {
             echo "TAGS<<EOF"
             echo "ghcr.io/$OWNER/droppedneedle:latest"
