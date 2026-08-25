@@ -29,7 +29,7 @@ from infrastructure.cache.memory_cache import CacheInterface
 from infrastructure.cache.disk_cache import DiskMetadataCache
 from infrastructure.validators import validate_mbid
 from infrastructure.queue.priority_queue import RequestPriority
-from core.exceptions import ExternalServiceError, ResourceNotFoundError
+from core.exceptions import ConflictError, ExternalServiceError, ResourceNotFoundError
 from services.audiodb_image_service import AudioDBImageService
 from repositories.audiodb_models import AudioDBAlbumImages
 
@@ -73,14 +73,19 @@ class AlbumService:
         self._album_in_flight: dict[str, asyncio.Future[AlbumInfo]] = {}
         self._tracks_in_flight: dict[str, asyncio.Future[AlbumTracksInfo]] = {}
 
-    async def _provider_album_id(self, identifier: str) -> str:
+    async def _provider_album_id(
+        self, identifier: str, *, allow_ambiguous: bool = False
+    ) -> str:
         if self._ownership is None:
             return identifier
         try:
             return await self._ownership.provider_album_id(identifier)
-        except ResourceNotFoundError:
+        except (ResourceNotFoundError, ConflictError) as error:
             # Discovery / un-downloaded albums are not in local ownership yet.
-            # Fall back to using the raw MusicBrainz ID directly.
+            # Read-only provider pages can still use the raw MusicBrainz ID when
+            # local ownership is ambiguous; mutations must retain the conflict.
+            if isinstance(error, ConflictError) and not allow_ambiguous:
+                raise
             return identifier
 
     async def resolve_album_identity(
@@ -261,7 +266,9 @@ class AlbumService:
             pass
 
     async def refresh_album(self, release_group_id: str) -> AlbumInfo:
-        release_group_id = await self._provider_album_id(release_group_id)
+        release_group_id = await self._provider_album_id(
+            release_group_id, allow_ambiguous=True
+        )
         release_group_id = validate_mbid(release_group_id, "album")
 
         await self._cache.delete(f"{ALBUM_INFO_PREFIX}{release_group_id}")
@@ -279,7 +286,9 @@ class AlbumService:
         library_mbids: set[str] = None,
         priority: RequestPriority = RequestPriority.USER_INITIATED,
     ) -> AlbumInfo:
-        release_group_id = await self._provider_album_id(release_group_id)
+        release_group_id = await self._provider_album_id(
+            release_group_id, allow_ambiguous=True
+        )
         try:
             release_group_id = validate_mbid(release_group_id, "album")
         except ValueError as e:
@@ -445,7 +454,9 @@ class AlbumService:
         coverage check - pass BACKGROUND_SYNC so a cold-cache finalize never jumps the
         MusicBrainz queue ahead of a user's page load (honest-priority house rule).
         Normally warm: the request flow fetched this at task creation."""
-        release_group_id = await self._provider_album_id(release_group_id)
+        release_group_id = await self._provider_album_id(
+            release_group_id, allow_ambiguous=True
+        )
         try:
             release_group_id = validate_mbid(release_group_id, "album")
         except ValueError as e:
@@ -560,7 +571,7 @@ class AlbumService:
 
         canonical_rg_id = release_group.get("id") or release_group_id
         selected_release_id, _owned, _pinned = await self._effective_release_id(
-            canonical_rg_id, release_group
+            canonical_rg_id, release_group, allow_ambiguous=True
         )
         ranked_ids = [r.get("id") for r in ranked_releases[:3] if r.get("id")]
         candidate_ids = list(
@@ -909,7 +920,11 @@ class AlbumService:
         return min(counted)[2] if counted else None
 
     async def _effective_release_id(
-        self, release_group_id: str, release_group: dict
+        self,
+        release_group_id: str,
+        release_group: dict,
+        *,
+        allow_ambiguous: bool = False,
     ) -> tuple[str | None, str | None, str | None]:
         """Resolve selected, owned, and pinned release IDs.
 
@@ -926,7 +941,9 @@ class AlbumService:
             str(release["id"]) for release in ranked_releases if release.get("id")
         ]
 
-        pinned = await self._pinned_release_id(release_group_id)
+        pinned = await self._pinned_release_id(
+            release_group_id, allow_ambiguous=allow_ambiguous
+        )
         owned, file_count = await self._library_edition_evidence(release_group_id)
 
         if pinned in release_ids:
@@ -939,10 +956,17 @@ class AlbumService:
                 return inferred, owned, pinned
         return (ranked_ids[0] if ranked_ids else None), owned, pinned
 
-    async def _pinned_release_id(self, release_group_id: str) -> str | None:
+    async def _pinned_release_id(
+        self, release_group_id: str, *, allow_ambiguous: bool = False
+    ) -> str | None:
         if self._release_pins is None:
             return None
-        return await self._release_pins.get(release_group_id)
+        try:
+            return await self._release_pins.get(release_group_id)
+        except ConflictError:
+            if not allow_ambiguous:
+                raise
+            return None
 
     async def resolve_edition(self, release_group_id: str) -> str | None:
         release_group_id = await self._provider_album_id(release_group_id)
@@ -955,7 +979,9 @@ class AlbumService:
         return selected
 
     async def list_editions(self, release_group_id: str) -> dict:
-        release_group_id = await self._provider_album_id(release_group_id)
+        release_group_id = await self._provider_album_id(
+            release_group_id, allow_ambiguous=True
+        )
         release_group_id = validate_mbid(release_group_id, "album")
         release_group = await self._fetch_release_group(release_group_id)
         canonical_id = str(release_group.get("id") or release_group_id)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 from pathlib import Path
 import secrets
 import shutil
@@ -76,6 +77,7 @@ _DISK_SAFETY_BYTES = 64 * 1024 * 1024
 _TERMINAL_DOWNLOAD_STATES = frozenset(
     {"completed", "partial", "failed", "cancelled", "held"}
 )
+logger = logging.getLogger(__name__)
 
 
 def _sha256_file(path: Path) -> str:
@@ -126,6 +128,13 @@ class EditionConversionService:
         release_mbid: str,
         actor_user_id: str,
     ) -> EditionConversionStatusResponse:
+        logger.info(
+            "album_merge.conversion_preflight_requested local_album_id=%s release_group_mbid=%s release_mbid=%s actor_user_id=%s",
+            local_album_id,
+            release_group_mbid,
+            release_mbid,
+            actor_user_id,
+        )
         if not is_valid_mbid(release_group_mbid) or not is_valid_mbid(release_mbid):
             raise ValidationError("Select a valid MusicBrainz release.")
         if await self._store.get_active_edition_conversion(local_album_id) is not None:
@@ -165,6 +174,16 @@ class EditionConversionService:
             for value in local_files
             if value.action == "keep" and value.target_ordinal is not None
         }
+        logger.info(
+            "album_merge.conversion_plan local_album_id=%s release_mbid=%s source_track_count=%d target_track_count=%d kept_count=%d acquire_count=%d recycle_count=%d",
+            local_album_id,
+            release_mbid,
+            len(tracks),
+            len(targets),
+            len(kept_by_ordinal),
+            sum(value.state == "pending" for value in targets),
+            sum(value.action != "keep" for value in local_files),
+        )
         job_id = str(uuid.uuid4())
         targets = tuple(
             EditionConversionTarget(
@@ -548,6 +567,14 @@ class EditionConversionService:
             raise ResourceNotFoundError(
                 "The completed conversion operation disappeared."
             )
+        logger.info(
+            "album_merge.conversion_applied local_album_id=%s release_mbid=%s file_operation_count=%d recycled_file_count=%d operation_job_id=%s",
+            job.local_album_id,
+            job.target_release_mbid,
+            len(bundle.files),
+            sum(value.conversion_recycle_only for value in bundle.files),
+            preview_job_id,
+        )
         from services.native.library_operation_service import LibraryOperationService
 
         return LibraryOperationService._response(row)

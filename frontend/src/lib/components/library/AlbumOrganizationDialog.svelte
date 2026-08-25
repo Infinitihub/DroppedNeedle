@@ -92,6 +92,7 @@
 	}
 
 	function toggleTrack(trackId: string, selected: boolean): void {
+		if (action === 'merge') return;
 		selectedTrackIds = selected
 			? [...new Set([...selectedTrackIds, trackId])]
 			: selectedTrackIds.filter((id) => id !== trackId);
@@ -155,8 +156,8 @@
 	const needsTarget = $derived(action === 'merge' || action === 'move');
 	const canPreview = $derived(
 		selectedTrackIds.length > 0 &&
-		(!needsTarget || (targetAlbumId !== null && !!targetAlbum.data)) &&
-		(action !== 'merge' || !!finalReleaseMbid)
+			(!needsTarget || (targetAlbumId !== null && !!targetAlbum.data)) &&
+			(action !== 'merge' || !!finalReleaseMbid)
 	);
 	const title = $derived(
 		action === 'split'
@@ -257,8 +258,8 @@
 			<section class="mt-5" aria-labelledby="final-edition-title">
 				<h3 id="final-edition-title" class="font-semibold">Choose the final edition</h3>
 				<p class="mt-1 text-sm text-base-content/60">
-					Verified tracks will be moved into the surviving album's edition folder. Duplicate files will be
-					recycled after the final preview is confirmed.
+					Verified tracks will be moved into the surviving album's edition folder. Duplicate files
+					will be recycled after the final preview is confirmed.
 				</p>
 				{#if editionsQuery.isLoading}
 					<div class="mt-2 flex items-center gap-2 text-sm text-base-content/60">
@@ -267,9 +268,13 @@
 				{:else if editionsQuery.isError}
 					<p class="mt-2 text-sm text-error">Could not load editions for the surviving album.</p>
 				{:else if editions.length}
-					<div class="mt-2 grid max-h-48 gap-1 overflow-auto rounded-box border border-base-content/10 p-2">
+					<div
+						class="mt-2 grid max-h-48 gap-1 overflow-auto rounded-box border border-base-content/10 p-2"
+					>
 						{#each editions as edition (edition.release_mbid)}
-							<label class="flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-base-200">
+							<label
+								class="flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-base-200"
+							>
 								<input
 									type="radio"
 									name="final-edition"
@@ -284,7 +289,12 @@
 								<span class="min-w-0">
 									<strong class="block truncate">{edition.title ?? album.title}</strong>
 									<span class="block truncate text-xs text-base-content/55">
-										{[edition.disambiguation, edition.date?.slice(0, 4), edition.country, `${edition.track_count} tracks`]
+										{[
+											edition.disambiguation,
+											edition.date?.slice(0, 4),
+											edition.country,
+											`${edition.track_count} tracks`
+										]
 											.filter(Boolean)
 											.join(' · ')}
 									</span>
@@ -293,14 +303,18 @@
 						{/each}
 					</div>
 				{:else}
-					<p class="mt-2 text-sm text-error">No MusicBrainz editions are available for the surviving album.</p>
+					<p class="mt-2 text-sm text-error">
+						No MusicBrainz editions are available for the surviving album.
+					</p>
 				{/if}
 			</section>
 		{/if}
 
 		{#if action !== 'reset'}
 			<fieldset class="mt-5">
-				<legend class="font-semibold">Tracks included</legend>
+				<legend class="font-semibold">
+					{action === 'merge' ? 'All source tracks included' : 'Tracks included'}
+				</legend>
 				<div
 					class="mt-2 grid max-h-64 gap-1 overflow-auto rounded-box border border-base-content/10 p-2 md:grid-cols-2"
 				>
@@ -309,6 +323,7 @@
 							<input
 								type="checkbox"
 								class="checkbox checkbox-sm"
+								disabled={action === 'merge'}
 								checked={selectedTrackIds.includes(track.id)}
 								onchange={(event) => toggleTrack(track.id, event.currentTarget.checked)}
 							/>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 import uuid
 
@@ -27,6 +28,7 @@ from services.native.local_album_grouping_service import (
 )
 
 PREVIEW_TTL_SECONDS = 15 * 60
+logger = logging.getLogger(__name__)
 
 
 def _token(kind: str, payload: object, issued_at: int) -> str:
@@ -166,6 +168,13 @@ class CatalogCorrectionService:
         aliases = [
             album_id for album_id in sources if album_id != request.target_album_id
         ]
+        if kind == "merge":
+            logger.info(
+                "album_merge.preview source_album_ids=%s target_album_id=%s track_ids=%s",
+                sources,
+                request.target_album_id,
+                request.track_ids,
+            )
         applications = (
             await self._automatic_reset_applications(request) if kind == "reset" else []
         )
@@ -215,7 +224,15 @@ class CatalogCorrectionService:
                 idempotency_key=request.idempotency_key,
                 now=timestamp,
             )
-        return await self._store.apply_membership_correction(
+        if kind == "merge":
+            logger.info(
+                "album_merge.apply source_album_ids=%s target_album_id=%s track_ids=%s identity_choice=%s",
+                sorted(request.expected_album_revisions),
+                request.target_album_id,
+                request.track_ids,
+                request.identity_choice,
+            )
+        result = await self._store.apply_membership_correction(
             kind=kind,
             track_ids=request.track_ids,
             expected_album_revisions=request.expected_album_revisions,
@@ -230,6 +247,14 @@ class CatalogCorrectionService:
             idempotency_key=request.idempotency_key,
             now=timestamp,
         )
+        if kind == "merge":
+            logger.info(
+                "album_merge.applied source_album_ids=%s target_album_id=%s moved_track_count=%d",
+                result.get("source_album_ids", []),
+                result.get("target_album_id"),
+                len(result.get("track_ids", [])),
+            )
+        return result
 
     async def preview_artist_merge(
         self, request: ArtistMergePreviewRequest, *, now: float | None = None
