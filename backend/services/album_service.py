@@ -989,7 +989,7 @@ class AlbumService:
             "release-list", []
         )
         selected, owned, pinned = await self._effective_release_id(
-            canonical_id, release_group
+            canonical_id, release_group, allow_ambiguous=True
         )
         items = []
         for rel in releases:

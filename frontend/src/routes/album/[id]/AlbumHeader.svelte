@@ -361,7 +361,7 @@
 							<GitMerge class="h-4 w-4 shrink-0" />
 							<span class="flex-1">This release group matches multiple local albums.</span>
 							<button class="btn btn-warning btn-sm" onclick={onmergecopies}>
-								Choose a copy to merge
+								Choose a copy to open
 							</button>
 						</div>
 					{/if}
