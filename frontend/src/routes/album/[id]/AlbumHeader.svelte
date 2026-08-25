@@ -356,12 +356,12 @@
 
 			{#if authStore.isTrusted && downloadClientConfigured && editions.length > 0}
 				<div class="flex flex-wrap items-center gap-2">
-					{#if editionConflict && localCopies.length > 1}
+					{#if localCopies.length > 1}
 						<div class="alert alert-warning w-full text-sm">
 							<GitMerge class="h-4 w-4 shrink-0" />
 							<span class="flex-1">This release group matches multiple local albums.</span>
 							<button class="btn btn-warning btn-sm" onclick={onmergecopies}>
-								Choose a copy to open
+								Choose copies to combine
 							</button>
 						</div>
 					{/if}

@@ -238,6 +238,11 @@
 		{#if needsTarget}
 			<section class="mt-5" aria-labelledby="target-album-title">
 				<h3 id="target-album-title" class="font-semibold">Choose the other local album</h3>
+				{#if targetAlbum.data}
+					<p class="mt-2 rounded-box bg-base-200 px-3 py-2 text-sm">
+						Keeping: <strong>{targetAlbum.data.title}</strong>
+					</p>
+				{/if}
 				<input
 					class="input input-bordered mt-2 w-full"
 					placeholder="Search local albums"

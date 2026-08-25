@@ -21,7 +21,9 @@ const {
 	mockDownloadsData,
 	mockHeldData,
 	mockLibraryStatusData,
-	mockLocalCopiesData
+	mockLocalCopiesData,
+	mockEditionData,
+	mockSetPin
 } = vi.hoisted(() => ({
 	mockGoto: vi.fn(),
 	mockPageFetch: vi.fn(),
@@ -35,7 +37,9 @@ const {
 	mockDownloadsData: { value: undefined as unknown },
 	mockHeldData: { value: { items: [] } as unknown },
 	mockLibraryStatusData: { value: undefined as unknown },
-	mockLocalCopiesData: { value: { items: [] } as unknown }
+	mockLocalCopiesData: { value: { items: [] } as unknown },
+	mockEditionData: { value: undefined as unknown },
+	mockSetPin: vi.fn()
 }));
 
 vi.mock('$app/environment', () => ({ browser: true }));
@@ -69,6 +73,10 @@ vi.mock('$lib/stores/integration', () => ({
 		}),
 		ensureLoaded: vi.fn().mockResolvedValue(undefined)
 	}
+}));
+
+vi.mock('$lib/stores/authStore.svelte', () => ({
+	authStore: { isAdmin: true, isTrusted: true, user: { id: 'user-1' } }
 }));
 
 vi.mock('$lib/stores/player.svelte', () => ({
@@ -154,10 +162,10 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 	getAlbumEditionsQuery: () => ({
 		get data() {
-			return undefined;
+			return mockEditionData.value;
 		}
 	}),
-	setEditionPin: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	setEditionPin: () => ({ mutateAsync: mockSetPin, isPending: false }),
 	clearEditionPin: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	acquireEdition: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
@@ -343,6 +351,8 @@ describe('album detail page track rendering', () => {
 		mockHeldData.value = { items: [] };
 		mockLibraryStatusData.value = undefined;
 		mockLocalCopiesData.value = { items: [] };
+		mockEditionData.value = undefined;
+		mockSetPin.mockReset().mockResolvedValue(undefined);
 		mockHydrateDetailCacheEntry.mockImplementation(({ cache, onHydrate }: HydrateOptions) => {
 			if (cache === mockAlbumBasicCache) {
 				onHydrate({
@@ -616,6 +626,30 @@ describe('album detail page track rendering', () => {
 		await expect
 			.element(page.getByRole('link', { name: 'Open Visions, remaster' }))
 			.toHaveAttribute('href', '/album/local-copy-2');
+	});
+
+	it('opens the copy-combine popup and navigates with both selected local albums', async () => {
+		mockLocalCopiesData.value = {
+			items: [
+				{ id: 'local-copy-1', title: 'Visions original', track_count: 4 },
+				{ id: 'local-copy-2', title: 'Visions remaster', track_count: 4 }
+			]
+		};
+		mockEditionData.value = {
+			items: [{ release_mbid: 'release-1', title: 'Visions', track_count: 4 }]
+		};
+
+		render(AlbumPage, { props: { data: { albumId } } } as Parameters<typeof render<typeof AlbumPage>>[1]);
+		await page.getByRole('button', { name: 'Choose copies to combine' }).click();
+
+		await expect.element(page.getByRole('heading', { name: 'Combine local album copies' })).toBeVisible();
+		await page.getByRole('radio', { name: 'Source: Visions original' }).click();
+		await page.getByRole('radio', { name: 'Keep: Visions remaster' }).click();
+		await page.getByRole('button', { name: 'Continue to edition selection' }).click();
+
+		await vi.waitFor(() => {
+			expect(mockGoto).toHaveBeenCalledWith('/album/local-copy-1?mergeTarget=local-copy-2');
+		});
 	});
 
 	it('replaces a release alias URL with the canonical release-group URL', async () => {

@@ -1,7 +1,7 @@
 import { page } from '@vitest/browser/context';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
-import type { LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
+import type { AlbumEditionItem, LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
 import type { MembershipPreviewResponse } from '$lib/queries/library/LibraryOperationsTypes';
 
 const album: LibraryAlbumDetail = {
@@ -90,15 +90,22 @@ const previewResult: MembershipPreviewResponse = {
 
 const h = vi.hoisted(() => ({
 	previewData: undefined as MembershipPreviewResponse | undefined,
+	targetAlbumData: undefined as LibraryAlbumDetail | undefined,
+	editionsData: undefined as { items: AlbumEditionItem[] } | undefined,
 	preview: vi.fn(),
 	apply: vi.fn(),
+	preflight: vi.fn(),
 	previewKinds: [] as string[],
 	applyKinds: [] as string[]
 }));
 
 vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
 	getLibraryAlbumsQuery: () => ({ data: { items: [] } }),
-	getLibraryAlbumDetailQuery: () => ({ data: undefined })
+	getLibraryAlbumDetailQuery: () => ({
+		get data() {
+			return h.targetAlbumData;
+		}
+	})
 }));
 vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
 	previewAlbumMembership: (kind: string) => {
@@ -106,7 +113,7 @@ vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
 		return {
 			mutateAsync: async (input: unknown) => {
 				const result = await h.preview(input);
-				h.previewData = previewResult;
+				h.previewData = result;
 				return result;
 			},
 			get data() {
@@ -124,10 +131,16 @@ vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
 	}
 }));
 vi.mock('$lib/queries/library/EditionConversionQueries.svelte', () => ({
-	createEditionConversionPreflight: () => ({ mutateAsync: vi.fn() })
+	createEditionConversionPreflight: () => ({ mutateAsync: h.preflight })
 }));
 vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
-	getAlbumEditionsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false })
+	getAlbumEditionsQuery: () => ({
+		get data() {
+			return h.editionsData;
+		},
+		isLoading: false,
+		isError: false
+	})
 }));
 
 import AlbumOrganizationDialog from './AlbumOrganizationDialog.svelte';
@@ -142,10 +155,13 @@ async function openSplitAndPreview(): Promise<void> {
 beforeEach(() => {
 	vi.clearAllMocks();
 	h.previewData = undefined;
+	h.targetAlbumData = undefined;
+	h.editionsData = undefined;
 	h.previewKinds = [];
 	h.applyKinds = [];
 	h.preview.mockResolvedValue(previewResult);
 	h.apply.mockResolvedValue({ kind: 'split' });
+	h.preflight.mockResolvedValue({ job_id: 'conversion-1' });
 });
 
 describe('AlbumOrganizationDialog', () => {
@@ -190,6 +206,80 @@ describe('AlbumOrganizationDialog', () => {
 		await page.getByRole('button', { name: 'Apply split album' }).click();
 		await expect.element(page.getByText(/local grouping changed after this preview/)).toBeVisible();
 		await expect.element(page.getByRole('button', { name: 'Preview changes' })).toBeVisible();
+	});
+
+	it('previews, applies, and prepares a merge under the selected edition', async () => {
+		h.targetAlbumData = { ...album, id: 'album-2', title: 'Grouped Album copy', row_revision: 7 };
+		h.editionsData = {
+			items: [
+				{
+					release_mbid: 'release-final',
+					title: 'Grouped Album',
+					disambiguation: null,
+					date: '2024-01-01',
+					country: 'US',
+					packaging: null,
+					status: 'Official',
+					track_count: 2,
+					is_owned: true,
+					is_pinned: false
+				} satisfies AlbumEditionItem
+			]
+		};
+		const mergePreviewResult = {
+			...previewResult,
+			target_album_id: 'album-2',
+			track_ids: ['track-1', 'track-2'],
+			source_album_ids: ['album-1']
+		};
+		h.preview.mockResolvedValue(mergePreviewResult);
+		h.apply.mockResolvedValue({ kind: 'merge', target_album_id: 'album-2' });
+
+		render(AlbumOrganizationDialog, {
+			props: {
+				album,
+				tracks,
+				initialAction: 'merge',
+				initialTargetAlbumId: 'album-2'
+			}
+		} as unknown as Parameters<typeof render>[1]);
+
+		await expect.element(page.getByRole('heading', { name: 'Merge with another local album' })).toBeVisible();
+		await expect.element(page.getByText('Grouped Album copy')).toBeVisible();
+		await expect.element(page.getByRole('heading', { name: 'Choose the final edition' })).toBeVisible();
+		await page.getByRole('radio', { name: /Grouped Album.*2024.*US.*2 tracks/ }).click();
+		await page.getByRole('button', { name: 'Preview changes' }).click();
+
+		await vi.waitFor(() => {
+			expect(h.preview).toHaveBeenCalledWith({
+				albumId: 'album-1',
+				request: {
+					track_ids: ['track-1', 'track-2'],
+					expected_album_revisions: { 'album-1': 5, 'album-2': 7 },
+					target_album_id: 'album-2'
+				}
+			});
+		});
+		await page.getByRole('checkbox', { name: /preserves files and tags/ }).click();
+		await page.getByRole('button', { name: 'Apply merge with another local album' }).click();
+
+		await vi.waitFor(() => {
+			expect(h.apply).toHaveBeenCalledWith({
+				albumId: 'album-1',
+				request: {
+					track_ids: ['track-1', 'track-2'],
+					expected_album_revisions: { 'album-1': 5, 'album-2': 7 },
+					target_album_id: 'album-2'
+				},
+				previewToken: 'preview-1',
+				identityChoice: 'detach'
+			});
+			expect(h.preflight).toHaveBeenCalledWith({
+				albumId: 'album-2',
+				releaseGroupMbid: 'rg-1',
+				releaseMbid: 'release-final'
+			});
+		});
 	});
 
 	it('returns focus to the exact organization action after cancellation', async () => {

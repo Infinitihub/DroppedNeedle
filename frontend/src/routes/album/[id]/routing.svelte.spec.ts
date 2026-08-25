@@ -17,8 +17,8 @@ vi.mock('$app/navigation', () => ({
 }));
 
 vi.mock('./LocalAlbumPage.svelte', () => {
-	const Component = function () {
-		h.localView();
+	const Component = function (props: unknown) {
+		h.localView(props);
 	};
 	Component.prototype = {};
 	return { default: Component };
@@ -45,10 +45,12 @@ import AlbumPage from './+page.svelte';
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	h.album.id = 'local-album-id';
 	h.album.musicbrainz_release_group_id = 'provider-album-id';
 });
 
 it('keeps a linked album on its MusicBrainz release-group route', async () => {
+	h.album.id = 'provider-album-id';
 	render(AlbumPage, {
 		props: { data: { albumId: 'provider-album-id' } }
 	} as unknown as Parameters<typeof render>[1]);
@@ -59,19 +61,15 @@ it('keeps a linked album on its MusicBrainz release-group route', async () => {
 	expect(h.localView).not.toHaveBeenCalled();
 });
 
-it('replaces a linked local route with its MusicBrainz release-group route', async () => {
+it('keeps a linked local route local for copy workflows', async () => {
 	render(AlbumPage, {
 		props: { data: { albumId: 'local-album-id' } }
 	} as unknown as Parameters<typeof render>[1]);
 
-	await vi.waitFor(() => {
-		expect(h.goto).toHaveBeenCalledWith('/album/provider-album-id', {
-			replaceState: true
-		});
-	});
-	expect(h.cache).toHaveBeenCalledWith(expect.objectContaining({ id: 'local-album-id' }));
+	await vi.waitFor(() => expect(h.goto).not.toHaveBeenCalled());
+	expect(h.cache).not.toHaveBeenCalled();
 	expect(h.providerView).not.toHaveBeenCalled();
-	expect(h.localView).not.toHaveBeenCalled();
+	expect(h.localView).toHaveBeenCalled();
 });
 
 it('keeps a local-only album on its local route', async () => {

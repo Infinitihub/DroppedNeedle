@@ -17,7 +17,11 @@
 	const localQuery = getLibraryAlbumDetailQuery(() => data.albumId);
 	const localAlbum = $derived(localQuery.data);
 	const providerAlbumId = $derived(localAlbum?.musicbrainz_release_group_id ?? null);
-	const shouldRedirect = $derived(localAlbum !== undefined && localAlbum.id !== data.albumId);
+	const shouldRedirect = $derived(
+		localAlbum !== undefined &&
+		localAlbum.id !== data.albumId &&
+		providerAlbumId !== null
+	);
 
 	$effect(() => {
 		if (localAlbum && shouldRedirect) {
@@ -38,7 +42,11 @@
 			</div>
 		</div>
 	</div>
-{:else if localAlbum && !providerAlbumId}
+{:else if
+	localAlbum &&
+	localAlbum.id === data.albumId &&
+	(localAlbum.musicbrainz_release_group_id === null ||
+		localAlbum.musicbrainz_release_group_id !== data.albumId)}
 	<LocalAlbumPage
 		albumId={localAlbum.id}
 		initialMergeTargetId={page.url.searchParams.get('mergeTarget')}
