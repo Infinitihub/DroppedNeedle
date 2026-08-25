@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ChevronDown, FolderTree } from 'lucide-svelte';
-	import type { LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
+	import { ChevronDown, FolderTree, RefreshCw } from 'lucide-svelte';
+	import type { AlbumEditionItem, LibraryAlbumDetail, NativeTrackListItem } from '$lib/types';
 	import type { MembershipPreviewResponse } from '$lib/queries/library/LibraryOperationsTypes';
 	import {
 		getLibraryAlbumDetailQuery,
@@ -11,6 +11,8 @@
 		previewAlbumMembership,
 		type MembershipPreviewInput
 	} from '$lib/queries/library/LibraryCatalogMutations.svelte';
+	import { createEditionConversionPreflight } from '$lib/queries/library/EditionConversionQueries.svelte';
+	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
 
 	type Action = 'split' | 'merge' | 'move' | 'reset';
 	interface Props {
@@ -25,6 +27,7 @@
 	let selectedTrackIds = $state<string[]>([]);
 	let targetSearch = $state('');
 	let targetAlbumId = $state<string | null>(null);
+	let finalReleaseMbid = $state<string | null>(null);
 	let identityChoice = $state<'detach' | 'retain_manual'>('detach');
 	let confirmed = $state(false);
 	let stalePreview = $state(false);
@@ -44,6 +47,15 @@
 	const mergeApply = applyAlbumMembership('merge');
 	const moveApply = applyAlbumMembership('move');
 	const resetApply = applyAlbumMembership('reset');
+	const conversionPreflight = createEditionConversionPreflight();
+	const editionGroupMbid = $derived(
+		targetAlbum.data?.musicbrainz_release_group_id ?? album.musicbrainz_release_group_id ?? ''
+	);
+	const editionsQuery = getAlbumEditionsQuery(
+		() => editionGroupMbid,
+		() => action === 'merge' && !!targetAlbumId && !!editionGroupMbid
+	);
+	const editions = $derived<AlbumEditionItem[]>(editionsQuery.data?.items ?? []);
 
 	const previewMutation = $derived(
 		action === 'split'
@@ -70,6 +82,7 @@
 		selectedTrackIds = next === 'reset' || next === 'merge' ? tracks.map((track) => track.id) : [];
 		targetSearch = '';
 		targetAlbumId = null;
+		finalReleaseMbid = null;
 		confirmed = false;
 		stalePreview = false;
 		previewMutation.reset();
@@ -112,12 +125,24 @@
 	async function apply(): Promise<void> {
 		if (!previewResult || !confirmed) return;
 		try {
-			await applyMutation.mutateAsync({
+			const result = await applyMutation.mutateAsync({
 				albumId: album.id,
 				request: request(),
 				previewToken: previewResult.preview_token,
 				identityChoice
 			});
+			if (action === 'merge' && result.target_album_id && finalReleaseMbid && editionGroupMbid) {
+				try {
+					await conversionPreflight.mutateAsync({
+						albumId: result.target_album_id,
+						releaseGroupMbid: editionGroupMbid,
+						releaseMbid: finalReleaseMbid
+					});
+				} catch {
+					dialog.close();
+					return;
+				}
+			}
 			dialog.close();
 		} catch {
 			confirmed = false;
@@ -129,7 +154,9 @@
 
 	const needsTarget = $derived(action === 'merge' || action === 'move');
 	const canPreview = $derived(
-		selectedTrackIds.length > 0 && (!needsTarget || (targetAlbumId !== null && !!targetAlbum.data))
+		selectedTrackIds.length > 0 &&
+		(!needsTarget || (targetAlbumId !== null && !!targetAlbum.data)) &&
+		(action !== 'merge' || !!finalReleaseMbid)
 	);
 	const title = $derived(
 		action === 'split'
@@ -172,7 +199,9 @@
 			{title}
 		</h2>
 		<p class="mt-1 text-sm text-base-content/60">
-			This changes local album membership only. It will not move files or rewrite tags.
+			{action === 'merge'
+				? 'Copies are merged first, then the selected edition conversion moves verified tracks and cleans up duplicate folders.'
+				: 'This changes local album membership only. It will not move files or rewrite tags.'}
 		</p>
 		{#if stalePreview}
 			<div class="alert alert-warning mt-4 text-sm">
@@ -207,6 +236,7 @@
 									checked={targetAlbumId === item.id}
 									onchange={() => {
 										targetAlbumId = item.id;
+										finalReleaseMbid = null;
 										previewMutation.reset();
 										previewResult = null;
 									}}
@@ -219,6 +249,51 @@
 							</label>
 						{/each}
 					</div>
+				{/if}
+			</section>
+		{/if}
+
+		{#if action === 'merge' && targetAlbumId}
+			<section class="mt-5" aria-labelledby="final-edition-title">
+				<h3 id="final-edition-title" class="font-semibold">Choose the final edition</h3>
+				<p class="mt-1 text-sm text-base-content/60">
+					Verified tracks will be moved into the surviving album's edition folder. Duplicate files will be
+					recycled after the final preview is confirmed.
+				</p>
+				{#if editionsQuery.isLoading}
+					<div class="mt-2 flex items-center gap-2 text-sm text-base-content/60">
+						<RefreshCw class="h-4 w-4 animate-spin" /> Loading MusicBrainz editions
+					</div>
+				{:else if editionsQuery.isError}
+					<p class="mt-2 text-sm text-error">Could not load editions for the surviving album.</p>
+				{:else if editions.length}
+					<div class="mt-2 grid max-h-48 gap-1 overflow-auto rounded-box border border-base-content/10 p-2">
+						{#each editions as edition (edition.release_mbid)}
+							<label class="flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-base-200">
+								<input
+									type="radio"
+									name="final-edition"
+									class="radio radio-sm"
+									checked={finalReleaseMbid === edition.release_mbid}
+									onchange={() => {
+										finalReleaseMbid = edition.release_mbid;
+										previewMutation.reset();
+										previewResult = null;
+									}}
+								/>
+								<span class="min-w-0">
+									<strong class="block truncate">{edition.title ?? album.title}</strong>
+									<span class="block truncate text-xs text-base-content/55">
+										{[edition.disambiguation, edition.date?.slice(0, 4), edition.country, `${edition.track_count} tracks`]
+											.filter(Boolean)
+											.join(' · ')}
+									</span>
+								</span>
+							</label>
+						{/each}
+					</div>
+				{:else}
+					<p class="mt-2 text-sm text-error">No MusicBrainz editions are available for the surviving album.</p>
 				{/if}
 			</section>
 		{/if}

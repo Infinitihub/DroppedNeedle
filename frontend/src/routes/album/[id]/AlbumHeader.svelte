@@ -7,6 +7,7 @@
 		LibraryAlbumSummary
 	} from '$lib/types';
 	import { getApiUrl } from '$lib/api/api-utils';
+	import { ApiError } from '$lib/api/client';
 	import { colors } from '$lib/colors';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
@@ -23,7 +24,8 @@
 		TrendingUp,
 		TriangleAlert,
 		ChevronDown,
-		Pin
+		Pin,
+		GitMerge
 	} from 'lucide-svelte';
 	import { rescanAlbum } from '$lib/queries/library/LibraryMutations.svelte';
 	import { requestUpgradeAlbum } from '$lib/queries/downloads/UpgradeQueries.svelte';
@@ -63,6 +65,7 @@
 		ondelete: () => void;
 		onrefresh: () => void;
 		onartistclick: () => void;
+		onmergecopies?: () => void;
 	}
 
 	let {
@@ -87,8 +90,10 @@
 		onrequest,
 		ondelete,
 		onrefresh,
-		onartistclick
+		onartistclick,
+		onmergecopies
 	}: Props = $props();
+	let editionConflict = $state(false);
 
 	const headerSampling = $derived(
 		deckSampler.activeKey === album?.musicbrainz_id && deckSampler.status !== 'idle'
@@ -227,8 +232,10 @@
 				await pinMutation.mutateAsync({ mbid: editionsMbid, releaseMbid });
 				toastStore.show({ message: 'Edition pinned.', type: 'success' });
 			}
+			editionConflict = false;
 			onrefresh(); // the pin changes the served tracklist - refetch the page
 		} catch (e) {
+			editionConflict = e instanceof ApiError && e.status === 409;
 			toastStore.show({
 				message: e instanceof Error ? e.message : 'Could not change the edition',
 				type: 'error'
@@ -349,6 +356,15 @@
 
 			{#if authStore.isTrusted && downloadClientConfigured && editions.length > 0}
 				<div class="flex flex-wrap items-center gap-2">
+					{#if editionConflict && localCopies.length > 1}
+						<div class="alert alert-warning w-full text-sm">
+							<GitMerge class="h-4 w-4 shrink-0" />
+							<span class="flex-1">This release group matches multiple local albums.</span>
+							<button class="btn btn-warning btn-sm" onclick={onmergecopies}>
+								Choose a copy to merge
+							</button>
+						</div>
+					{/if}
 					<div class="dropdown">
 						<button type="button" class="btn btn-ghost btn-xs gap-1" tabindex="0">
 							{#if hasEffectivePin}

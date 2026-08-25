@@ -123,6 +123,12 @@ vi.mock('$lib/queries/library/LibraryCatalogMutations.svelte', () => ({
 		return { mutateAsync: h.apply, isPending: false };
 	}
 }));
+vi.mock('$lib/queries/library/EditionConversionQueries.svelte', () => ({
+	createEditionConversionPreflight: () => ({ mutateAsync: vi.fn() })
+}));
+vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
+	getAlbumEditionsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false })
+}));
 
 import AlbumOrganizationDialog from './AlbumOrganizationDialog.svelte';
 

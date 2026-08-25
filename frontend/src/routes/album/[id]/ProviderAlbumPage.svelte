@@ -28,6 +28,10 @@
 	const localCopiesQuery = getLibraryAlbumCopiesQuery(() => data.albumId);
 	const localCopies = $derived(localCopiesQuery.data?.items ?? []);
 
+	function showCopies(): void {
+		document.getElementById('owned-copies-title')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+	}
+
 	$effect(() => {
 		const canonicalId = state.album?.musicbrainz_id;
 		if (canonicalId && canonicalId !== data.albumId) {
@@ -95,6 +99,7 @@
 				ondelete={state.handleDeleteClick}
 				onrefresh={state.refreshAll}
 				onartistclick={state.goToArtist}
+				onmergecopies={showCopies}
 			/>
 
 			{#if localCopies.length > 1}
