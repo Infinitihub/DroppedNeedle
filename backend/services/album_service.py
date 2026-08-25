@@ -1110,7 +1110,7 @@ class AlbumService:
         )
 
         selected_release_id, _owned, _pinned = await self._effective_release_id(
-            canonical_rg_id, release_group
+            canonical_rg_id, release_group, allow_ambiguous=True
         )
         primary_id = primary_release.get("id") if primary_release else None
         for release_id in dict.fromkeys(
