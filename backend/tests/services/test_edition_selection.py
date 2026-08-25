@@ -470,9 +470,20 @@ async def test_set_pin_validates_edition_and_busts_caches(tmp_path: Path):
 # --- acquire_edition (D13, edition-scoped) --------------------------------------
 
 
-def _mb_track(pos: int, rec: str | None, title: str, disc: int = 1) -> Track:
+def _mb_track(
+    pos: int,
+    rec: str | None,
+    title: str,
+    disc: int = 1,
+    release_track_id: str | None = None,
+) -> Track:
     return Track(
-        position=pos, title=title, disc_number=disc, length=200_000, recording_id=rec
+        position=pos,
+        title=title,
+        disc_number=disc,
+        length=200_000,
+        recording_id=rec,
+        release_track_id=release_track_id or f"release-track-{pos}",
     )
 
 
@@ -533,9 +544,14 @@ async def test_acquire_edition_fills_missing_and_upgrades_below_cutoff(tmp_path:
         },
     ]
     tracks = [
-        _mb_track(1, "rec-1", "Airbag"),
-        _mb_track(2, "rec-2", "Paranoid Android"),
-        _mb_track(3, "rec-3", "Subterranean Homesick Alien"),  # missing -> filled
+        _mb_track(1, "rec-1", "Airbag", release_track_id="rt-1"),
+        _mb_track(2, "rec-2", "Paranoid Android", release_track_id="rt-2"),
+        _mb_track(
+            3,
+            "rec-3",
+            "Subterranean Homesick Alien",
+            release_track_id="rt-3",
+        ),  # missing -> filled
     ]
     service, original = _make_download_service(rows=rows, tracks=tracks)
     try:
@@ -555,8 +571,10 @@ async def test_acquire_edition_fills_missing_and_upgrades_below_cutoff(tmp_path:
     fill = service.request_track.await_args.kwargs
     assert fill["recording_mbid"] == "rec-3"
     assert fill["release_mbid"] == REL_DELUXE  # the edition as a soft target (D14)
+    assert fill["release_track_mbid"] == "rt-3"
     upgrade = service.request_upgrade_track.await_args.kwargs
     assert upgrade["recording_mbid"] == "rec-2"
+    assert upgrade["release_track_mbid"] == "rt-2"
 
 
 @pytest.mark.asyncio

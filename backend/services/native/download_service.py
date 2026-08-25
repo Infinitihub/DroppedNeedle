@@ -1012,6 +1012,7 @@ class DownloadService:
         release_group_mbid: str | None = None,
         artist_mbid: str | None = None,
         release_mbid: str | None = None,
+        release_track_mbid: str | None = None,
     ) -> str:
         """Enqueue a per-track quality upgrade (origin='upgrade', per-recording floor D12)."""
         return await self.request_track(
@@ -1025,6 +1026,7 @@ class DownloadService:
             artist_mbid=artist_mbid,
             origin="upgrade",
             release_mbid=release_mbid,
+            release_track_mbid=release_track_mbid,
         )
 
     async def acquire_edition(self, user_id: str, release_group_mbid: str) -> dict:
@@ -1097,6 +1099,7 @@ class DownloadService:
                     release_group_mbid=release_group_mbid,
                     artist_mbid=artist_mbid,
                     release_mbid=release_id,
+                    release_track_mbid=track.release_track_id,
                 )
                 if result == ALREADY_IN_LIBRARY:
                     skipped += 1
@@ -1122,6 +1125,7 @@ class DownloadService:
                 release_group_mbid=release_group_mbid,
                 artist_mbid=artist_mbid,
                 release_mbid=release_id,
+                release_track_mbid=track.release_track_id,
             )
             if result == ALREADY_IN_LIBRARY:
                 skipped += 1
