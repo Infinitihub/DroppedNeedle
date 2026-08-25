@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import {
 		cacheCanonicalLibraryAlbumDetail,
@@ -16,7 +17,7 @@
 	const localQuery = getLibraryAlbumDetailQuery(() => data.albumId);
 	const localAlbum = $derived(localQuery.data);
 	const providerAlbumId = $derived(localAlbum?.musicbrainz_release_group_id ?? null);
-	const shouldRedirect = $derived(providerAlbumId !== null && providerAlbumId !== data.albumId);
+	const shouldRedirect = $derived(localAlbum !== undefined && localAlbum.id !== data.albumId);
 
 	$effect(() => {
 		if (localAlbum && shouldRedirect) {
@@ -38,7 +39,10 @@
 		</div>
 	</div>
 {:else if localAlbum && !providerAlbumId}
-	<LocalAlbumPage albumId={localAlbum.id} />
+	<LocalAlbumPage
+		albumId={localAlbum.id}
+		initialMergeTargetId={page.url.searchParams.get('mergeTarget')}
+	/>
 {:else}
 	<ProviderAlbumPage {data} />
 {/if}

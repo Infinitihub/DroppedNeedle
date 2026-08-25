@@ -28,9 +28,10 @@
 
 	interface Props {
 		albumId: string;
+		initialMergeTargetId?: string | null;
 	}
 
-	let { albumId }: Props = $props();
+	let { albumId, initialMergeTargetId = null }: Props = $props();
 	const albumQuery = getLibraryAlbumDetailQuery(() => albumId);
 	const tracksQuery = getLibraryAlbumTracksQuery(() => albumId);
 	const album = $derived(albumQuery.data);
@@ -161,10 +162,15 @@
 							{album.contribution_id ? 'Contribution in progress' : 'Contribute to MusicBrainz'}
 						</button>
 					{/if}
-					{#if authStore.isAdmin}<AlbumIdentificationPanel
+					{#if authStore.isAdmin}
+						<AlbumIdentificationPanel {album} attentionLabel={managementIdentityAttention} />
+						<AlbumOrganizationDialog
 							{album}
-							attentionLabel={managementIdentityAttention}
-						/><AlbumOrganizationDialog {album} {tracks} />{/if}
+							{tracks}
+							initialAction={initialMergeTargetId ? 'merge' : undefined}
+							initialTargetAlbumId={initialMergeTargetId}
+						/>
+					{/if}
 				</div>
 				{#if album.review_id && authStore.isAdmin}
 					<a

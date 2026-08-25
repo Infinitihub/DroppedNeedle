@@ -18,8 +18,15 @@
 	interface Props {
 		album: LibraryAlbumDetail;
 		tracks: NativeTrackListItem[];
+		initialAction?: Action;
+		initialTargetAlbumId?: string | null;
 	}
-	let { album, tracks }: Props = $props();
+	let {
+		album,
+		tracks,
+		initialAction,
+		initialTargetAlbumId = null
+	}: Props = $props();
 	let dialog: HTMLDialogElement;
 	let dialogHeading: HTMLHeadingElement;
 	let opener: HTMLButtonElement | null = null;
@@ -32,6 +39,7 @@
 	let confirmed = $state(false);
 	let stalePreview = $state(false);
 	let previewResult = $state<MembershipPreviewResponse | null>(null);
+	let autoOpened = false;
 	const targetAlbums = getLibraryAlbumsQuery(() => ({
 		page: 1,
 		sort: 'title',
@@ -76,12 +84,16 @@
 					: resetApply
 	);
 
-	function open(next: Action, event: MouseEvent & { currentTarget: HTMLButtonElement }): void {
-		opener = event.currentTarget;
+	function open(
+		next: Action,
+		event: (MouseEvent & { currentTarget: HTMLButtonElement }) | null = null,
+		targetId: string | null = null
+	): void {
+		opener = event?.currentTarget ?? null;
 		action = next;
 		selectedTrackIds = next === 'reset' || next === 'merge' ? tracks.map((track) => track.id) : [];
 		targetSearch = '';
-		targetAlbumId = null;
+		targetAlbumId = targetId;
 		finalReleaseMbid = null;
 		confirmed = false;
 		stalePreview = false;
@@ -90,6 +102,13 @@
 		dialog.showModal();
 		dialogHeading.focus();
 	}
+
+	$effect(() => {
+		if (initialAction && tracks.length > 0 && dialog && !autoOpened) {
+			autoOpened = true;
+			open(initialAction, null, initialTargetAlbumId);
+		}
+	});
 
 	function toggleTrack(trackId: string, selected: boolean): void {
 		if (action === 'merge') return;

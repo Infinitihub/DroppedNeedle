@@ -612,10 +612,10 @@ describe('album detail page track rendering', () => {
 			.toBeVisible();
 		await expect
 			.element(page.getByRole('link', { name: 'Open Visions, original files' }))
-			.toHaveAttribute('href', `/album/${albumId}`);
+			.toHaveAttribute('href', '/album/local-copy-1');
 		await expect
 			.element(page.getByRole('link', { name: 'Open Visions, remaster' }))
-			.toHaveAttribute('href', `/album/${albumId}`);
+			.toHaveAttribute('href', '/album/local-copy-2');
 	});
 
 	it('replaces a release alias URL with the canonical release-group URL', async () => {

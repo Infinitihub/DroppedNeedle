@@ -24,16 +24,27 @@
 
 	let { data }: Props = $props();
 
-	const state = createAlbumPageState(() => data.albumId);
+	const pageState = createAlbumPageState(() => data.albumId);
 	const localCopiesQuery = getLibraryAlbumCopiesQuery(() => data.albumId);
 	const localCopies = $derived(localCopiesQuery.data?.items ?? []);
+	let copyDialog: HTMLDialogElement;
+	let mergeSourceId = $state<string | null>(null);
+	let mergeTargetId = $state<string | null>(null);
 
 	function showCopies(): void {
-		document.getElementById('owned-copies-title')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		mergeSourceId = null;
+		mergeTargetId = null;
+		copyDialog.showModal();
+	}
+
+	function startMerge(): void {
+		if (!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId) return;
+		copyDialog.close();
+		void goto(`${albumHref(mergeSourceId)}?mergeTarget=${encodeURIComponent(mergeTargetId)}`);
 	}
 
 	$effect(() => {
-		const canonicalId = state.album?.musicbrainz_id;
+		const canonicalId = pageState.album?.musicbrainz_id;
 		if (canonicalId && canonicalId !== data.albumId) {
 			void goto(albumHref(canonicalId), { replaceState: true });
 		}
@@ -45,13 +56,13 @@
 		<BackButton />
 	</div>
 
-	{#if state.error}
+	{#if pageState.error}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
-				<span>{state.error}</span>
+				<span>{pageState.error}</span>
 			</div>
 		</div>
-	{:else if state.loadingBasic || !state.album}
+	{:else if pageState.loadingBasic || !pageState.album}
 		<div class="space-y-6 sm:space-y-8">
 			<div class="flex flex-col lg:flex-row gap-6 lg:gap-8">
 				<div class="skeleton w-full lg:w-64 xl:w-80 aspect-square rounded-box shrink-0"></div>
@@ -73,32 +84,32 @@
 				{/each}
 			</div>
 		</div>
-	{:else if state.album}
-		{@const album = state.album}
+	{:else if pageState.album}
+		{@const album = pageState.album}
 		<div class="space-y-6 sm:space-y-8">
 			<AlbumHeader
 				{album}
-				tracksInfo={state.tracksInfo}
-				loadingTracks={state.loadingTracks}
-				inLibrary={state.inLibrary}
-				isRequested={state.isRequested}
-				requesting={state.requesting}
-				refreshing={state.refreshing}
-				headerDownloadTask={state.headerDownloadTask}
-				managementHeld={state.headerManagementHeld}
+				tracksInfo={pageState.tracksInfo}
+				loadingTracks={pageState.loadingTracks}
+				inLibrary={pageState.inLibrary}
+				isRequested={pageState.isRequested}
+				requesting={pageState.requesting}
+				refreshing={pageState.refreshing}
+				headerDownloadTask={pageState.headerDownloadTask}
+				managementHeld={pageState.headerManagementHeld}
 				downloadClientConfigured={$integrationStore.download_client}
-				libraryInLibrary={state.libraryInLibrary}
-				libraryTrackCount={state.libraryTrackCount}
-				libraryBelowCutoff={state.libraryBelowCutoff}
-				coverageExpected={state.coverageExpected}
-				coverageCovered={state.coverageCovered}
-				mbTrackCount={state.tracksInfo?.total_tracks ?? 0}
+				libraryInLibrary={pageState.libraryInLibrary}
+				libraryTrackCount={pageState.libraryTrackCount}
+				libraryBelowCutoff={pageState.libraryBelowCutoff}
+				coverageExpected={pageState.coverageExpected}
+				coverageCovered={pageState.coverageCovered}
+				mbTrackCount={pageState.tracksInfo?.total_tracks ?? 0}
 				releaseGroupMbid={album.musicbrainz_id}
 				{localCopies}
-				onrequest={state.handleRequest}
-				ondelete={state.handleDeleteClick}
-				onrefresh={state.refreshAll}
-				onartistclick={state.goToArtist}
+				onrequest={pageState.handleRequest}
+				ondelete={pageState.handleDeleteClick}
+				onrefresh={pageState.refreshAll}
+				onartistclick={pageState.goToArtist}
 				onmergecopies={showCopies}
 			/>
 
@@ -109,8 +120,8 @@
 				>
 					<h2 id="owned-copies-title" class="text-lg font-bold">Copies in your library</h2>
 					<p class="mt-1 max-w-2xl text-sm text-base-content/55">
-						This MusicBrainz release matches more than one local album. Choose the copy you want to
-						open.
+						This MusicBrainz release matches more than one local album. Choose the copies you want to
+						combine.
 					</p>
 					<div class="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
 						{#each localCopies as localCopy (localCopy.id)}
@@ -120,9 +131,9 @@
 				</section>
 			{/if}
 
-			<WhereToBuy releaseGroupMbid={album.musicbrainz_id} enabled={!state.loadingTracks} />
+			<WhereToBuy releaseGroupMbid={album.musicbrainz_id} enabled={!pageState.loadingTracks} />
 
-			{#if state.loadingTracks}
+			{#if pageState.loadingTracks}
 				<div class="space-y-3">
 					<h2 class="text-xl sm:text-2xl font-bold">Tracks</h2>
 					<div class="bg-base-200 rounded-box overflow-hidden">
@@ -139,100 +150,100 @@
 						</ul>
 					</div>
 				</div>
-			{:else if state.tracksInfo && state.tracksInfo.tracks.length > 0}
+			{:else if pageState.tracksInfo && pageState.tracksInfo.tracks.length > 0}
 				<div class="space-y-3">
 					<div class="flex items-center justify-between flex-wrap gap-2">
 						<h2 class="text-xl sm:text-2xl font-bold">Tracks</h2>
-						{#if state.quota}
+						{#if pageState.quota}
 							<div class="flex items-center gap-2">
 								<progress
 									class="progress progress-accent w-20 h-1.5"
-									value={state.quota.used}
-									max={state.quota.limit}
+									value={pageState.quota.used}
+									max={pageState.quota.limit}
 								></progress>
-								<span class="text-xs opacity-60">{state.quota.remaining}/{state.quota.limit}</span>
+								<span class="text-xs opacity-60">{pageState.quota.remaining}/{pageState.quota.limit}</span>
 							</div>
 						{/if}
 					</div>
 
 					<AlbumSourceBars
 						{album}
-						tracksInfo={state.tracksInfo}
-						trackLinks={state.trackLinks}
-						albumLink={state.albumLink}
-						jellyfinMatch={state.jellyfinMatch}
-						localMatch={state.localMatchForPlayback}
-						navidromeMatch={state.navidromeMatch}
-						plexMatch={state.plexMatch}
-						loadingJellyfin={state.loadingJellyfin}
-						loadingLocal={state.loadingLocal}
-						loadingNavidrome={state.loadingNavidrome}
-						loadingPlex={state.loadingPlex}
+						tracksInfo={pageState.tracksInfo}
+						trackLinks={pageState.trackLinks}
+						albumLink={pageState.albumLink}
+						jellyfinMatch={pageState.jellyfinMatch}
+						localMatch={pageState.localMatchForPlayback}
+						navidromeMatch={pageState.navidromeMatch}
+						plexMatch={pageState.plexMatch}
+						loadingJellyfin={pageState.loadingJellyfin}
+						loadingLocal={pageState.loadingLocal}
+						loadingNavidrome={pageState.loadingNavidrome}
+						loadingPlex={pageState.loadingPlex}
 						youtubeEnabled={$integrationStore.youtube}
 						youtubeApiConfigured={$integrationStore.youtube_api}
 						jellyfinEnabled={$integrationStore.jellyfin}
 						localfilesEnabled={$integrationStore.localfiles}
 						navidromeEnabled={$integrationStore.navidrome}
 						plexEnabled={$integrationStore.plex}
-						jellyfinCallbacks={state.jellyfinCallbacks}
-						localCallbacks={state.localCallbacks}
-						localDownloadCallback={state.localDownloadCallback}
-						navidromeCallbacks={state.navidromeCallbacks}
-						plexCallbacks={state.plexCallbacks}
-						onTrackLinksUpdate={state.handleTrackLinksUpdate}
-						onAlbumLinkUpdate={state.handleAlbumLinkUpdate}
-						onQuotaUpdate={state.handleQuotaUpdate}
+						jellyfinCallbacks={pageState.jellyfinCallbacks}
+						localCallbacks={pageState.localCallbacks}
+						localDownloadCallback={pageState.localDownloadCallback}
+						navidromeCallbacks={pageState.navidromeCallbacks}
+						plexCallbacks={pageState.plexCallbacks}
+						onTrackLinksUpdate={pageState.handleTrackLinksUpdate}
+						onAlbumLinkUpdate={pageState.handleAlbumLinkUpdate}
+						onQuotaUpdate={pageState.handleQuotaUpdate}
 					/>
 
 					<AlbumTrackList
 						{album}
-						renderedTrackSections={state.renderedTrackSections}
-						trackLinkMap={state.trackLinkMap}
-						jellyfinMatch={state.jellyfinMatch}
-						localMatch={state.localMatch}
-						navidromeMatch={state.navidromeMatch}
-						plexMatch={state.plexMatch}
-						jellyfinTrackMap={state.jellyfinTrackMap}
-						localTrackMap={state.localTrackMap}
-						navidromeTrackMap={state.navidromeTrackMap}
-						plexTrackMap={state.plexTrackMap}
-						jellyfinTracks={state.jellyfinTracks}
-						localTracks={state.localTracks}
-						navidromeTracks={state.navidromeTracks}
-						plexTracks={state.plexTracks}
-						trackLinks={state.trackLinks}
+					renderedTrackSections={pageState.renderedTrackSections}
+						trackLinkMap={pageState.trackLinkMap}
+						jellyfinMatch={pageState.jellyfinMatch}
+						localMatch={pageState.localMatch}
+						navidromeMatch={pageState.navidromeMatch}
+						plexMatch={pageState.plexMatch}
+						jellyfinTrackMap={pageState.jellyfinTrackMap}
+						localTrackMap={pageState.localTrackMap}
+						navidromeTrackMap={pageState.navidromeTrackMap}
+						plexTrackMap={pageState.plexTrackMap}
+						jellyfinTracks={pageState.jellyfinTracks}
+						localTracks={pageState.localTracks}
+						navidromeTracks={pageState.navidromeTracks}
+						plexTracks={pageState.plexTracks}
+						trackLinks={pageState.trackLinks}
 						youtubeEnabled={$integrationStore.youtube}
 						youtubeApiConfigured={$integrationStore.youtube_api}
 						jellyfinEnabled={$integrationStore.jellyfin}
 						localfilesEnabled={$integrationStore.localfiles}
 						navidromeEnabled={$integrationStore.navidrome}
 						plexEnabled={$integrationStore.plex}
-						libraryTracksByRecording={state.libraryTracksByRecording}
-						libraryTracksByPosition={state.libraryTracksByPosition}
-						heldByRecording={state.heldByRecording}
-						heldByPosition={state.heldByPosition}
-						trackDownloadTasks={state.trackDownloadTasks}
+						libraryTracksByRecording={pageState.libraryTracksByRecording}
+						libraryTracksByPosition={pageState.libraryTracksByPosition}
+						heldByRecording={pageState.heldByRecording}
+						heldByPosition={pageState.heldByPosition}
+						trackDownloadTasks={pageState.trackDownloadTasks}
 						releaseGroupMbid={album.musicbrainz_id}
-						onPlaySourceTrack={state.playSourceTrack}
-						onTrackGenerated={state.handleTrackGenerated}
-						onQuotaUpdate={state.handleQuotaUpdate}
-						getTrackContextMenuItems={state.getTrackContextMenuItems}
+						onPlaySourceTrack={pageState.playSourceTrack}
+						onTrackGenerated={pageState.handleTrackGenerated}
+						onQuotaUpdate={pageState.handleQuotaUpdate}
+						getTrackContextMenuItems={pageState.getTrackContextMenuItems}
 					/>
 
 					<UnmatchedFilesSection
-						orphans={state.libraryOrphans}
+						orphans={pageState.libraryOrphans}
 						albumMbid={album.musicbrainz_id}
 						canRemove={authStore.isTrusted}
 					/>
 
-					<AddToPlaylistModal bind:this={state.playlistModalRef} />
+					<AddToPlaylistModal bind:this={pageState.playlistModalRef} />
 				</div>
-			{:else if state.tracksError}
+			{:else if pageState.tracksError}
 				<div class="space-y-3">
 					<h2 class="text-xl sm:text-2xl font-bold">Tracks</h2>
 					<div class="alert alert-warning">
 						<span>Couldn't load the track list.</span>
-						<button class="btn btn-sm btn-ghost" onclick={state.retryTracks}> Retry </button>
+						<button class="btn btn-sm btn-ghost" onclick={pageState.retryTracks}> Retry </button>
 					</div>
 				</div>
 			{:else}
@@ -240,7 +251,7 @@
 					<h2 class="text-xl sm:text-2xl font-bold">Tracks</h2>
 					<div class="alert alert-warning">
 						<span>No tracks available.</span>
-						<button class="btn btn-sm btn-ghost" onclick={state.retryTracks}> Retry </button>
+						<button class="btn btn-sm btn-ghost" onclick={pageState.retryTracks}> Retry </button>
 					</div>
 				</div>
 			{/if}
@@ -252,17 +263,17 @@
 				</div>
 			{/if}
 
-			{#if state.loadingLastfm || state.lastfmEnrichment}
+			{#if pageState.loadingLastfm || pageState.lastfmEnrichment}
 				<LastFmAlbumEnrichmentComponent
-					enrichment={state.lastfmEnrichment}
-					loading={state.loadingLastfm}
+					enrichment={pageState.lastfmEnrichment}
+					loading={pageState.loadingLastfm}
 				/>
 			{/if}
 
 			<AlbumDiscovery
-				moreByArtist={state.moreByArtist}
-				similarAlbums={state.similarAlbums}
-				loadingDiscovery={state.loadingDiscovery}
+				moreByArtist={pageState.moreByArtist}
+				similarAlbums={pageState.similarAlbums}
+				loadingDiscovery={pageState.loadingDiscovery}
 				artistName={album.artist_name}
 			/>
 		</div>
@@ -273,16 +284,73 @@
 	{/if}
 </div>
 
-<Toast bind:show={state.showToast} message={state.toastMessage} type={state.toastType} />
+<dialog bind:this={copyDialog} class="modal" aria-labelledby="combine-copies-title">
+	<div class="modal-box max-w-2xl">
+		<h2 id="combine-copies-title" class="text-xl font-bold">Combine local album copies</h2>
+		<p class="mt-1 text-sm text-base-content/60">
+			Choose the source copy whose tracks will be combined and the destination copy to keep.
+			You will select the MusicBrainz edition afterward.
+		</p>
+		<div class="mt-5 grid gap-3 sm:grid-cols-2">
+			{#each localCopies as localCopy (localCopy.id)}
+				<label
+					class="flex cursor-pointer items-start gap-3 rounded-box border border-base-content/10 p-3 hover:border-primary/50"
+				>
+					<input
+						type="radio"
+						name="merge-source"
+						class="radio radio-primary mt-1"
+						checked={mergeSourceId === localCopy.id}
+						onchange={() => (mergeSourceId = localCopy.id)}
+					/>
+					<span class="min-w-0">
+						<span class="block font-medium">Source: {localCopy.title}</span>
+						<span class="block text-xs text-base-content/55">{localCopy.track_count} tracks</span>
+					</span>
+				</label>
+			{/each}
+		</div>
+		<div class="mt-4 grid gap-3 sm:grid-cols-2">
+			{#each localCopies as localCopy (localCopy.id)}
+				<label
+					class="flex cursor-pointer items-start gap-3 rounded-box border border-base-content/10 p-3 hover:border-primary/50"
+				>
+					<input
+						type="radio"
+						name="merge-target"
+						class="radio radio-primary mt-1"
+						checked={mergeTargetId === localCopy.id}
+						onchange={() => (mergeTargetId = localCopy.id)}
+					/>
+					<span class="min-w-0">
+						<span class="block font-medium">Keep: {localCopy.title}</span>
+						<span class="block text-xs text-base-content/55">{localCopy.track_count} tracks</span>
+					</span>
+				</label>
+			{/each}
+		</div>
+		<div class="modal-action">
+			<button type="button" class="btn btn-ghost" onclick={() => copyDialog.close()}>Cancel</button>
+			<button
+				type="button"
+				class="btn btn-primary"
+				disabled={!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId}
+				onclick={startMerge}>Continue to edition selection</button
+			>
+		</div>
+	</div>
+</dialog>
 
-{#if state.showDeleteModal && state.album}
+<Toast bind:show={pageState.showToast} message={pageState.toastMessage} type={pageState.toastType} />
+
+{#if pageState.showDeleteModal && pageState.album}
 	<DeleteAlbumModal
-		albumTitle={state.album.title}
-		artistName={state.album.artist_name}
-		musicbrainzId={state.album.musicbrainz_id}
-		ondeleted={state.handleDeleted}
+		albumTitle={pageState.album.title}
+		artistName={pageState.album.artist_name}
+		musicbrainzId={pageState.album.musicbrainz_id}
+		ondeleted={pageState.handleDeleted}
 		onclose={() => {
-			state.showDeleteModal = false;
+			pageState.showDeleteModal = false;
 		}}
 	/>
 {/if}
