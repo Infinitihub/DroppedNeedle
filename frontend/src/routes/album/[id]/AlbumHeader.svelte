@@ -93,7 +93,6 @@
 		onartistclick,
 		onmergecopies
 	}: Props = $props();
-	let editionConflict = $state(false);
 
 	const headerSampling = $derived(
 		deckSampler.activeKey === album?.musicbrainz_id && deckSampler.status !== 'idle'
