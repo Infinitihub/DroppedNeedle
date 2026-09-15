@@ -37,7 +37,6 @@ frontend/.vite/
 
 # Docker (prevent recursive context)
 docker-compose*.yml
-Dockerfile
 manage.sh
 
 # IDE & OS

@@ -761,6 +761,11 @@ def test_docker_image_runs_automatic_upgrade_before_target_application() -> None
     assert automatic_upgrade._target_command(8688)[-2:] == ["--workers", "1"]
 
 
+def test_docker_build_context_keeps_the_root_dockerfile_available() -> None:
+    dockerignore = (Path(__file__).parents[3] / ".dockerignore").read_text(encoding="utf-8")
+    assert "Dockerfile" not in dockerignore.splitlines()
+
+
 def test_upgrade_health_endpoint_keeps_existing_orchestrators_waiting() -> None:
     port = _free_port()
 
