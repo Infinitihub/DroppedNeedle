@@ -677,6 +677,7 @@ export const API = {
 		spotifyAuthUrl: () => '/api/v1/me/connections/spotify/auth/url',
 		spotifyPlaylists: () => '/api/v1/me/spotify/playlists',
 		spotifyImport: (playlistId: string) => `/api/v1/me/spotify/playlists/${playlistId}/import`,
+		spotifyImportLink: () => '/api/v1/me/spotify/import-link',
 		personalMixRefresh: () => '/api/v1/me/personal-mix/refresh'
 	},
 	scrobble: {
@@ -690,6 +691,7 @@ export const API = {
 	playlists: {
 		list: () => '/api/v1/playlists',
 		create: () => '/api/v1/playlists',
+		importExportify: () => '/api/v1/playlists/import/exportify',
 		detail: (id: string) => `/api/v1/playlists/${id}`,
 		update: (id: string) => `/api/v1/playlists/${id}`,
 		delete: (id: string) => `/api/v1/playlists/${id}`,

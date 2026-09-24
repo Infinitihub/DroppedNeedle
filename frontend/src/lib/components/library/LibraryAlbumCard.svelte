@@ -7,10 +7,11 @@
 
 	interface Props {
 		album: LibraryAlbumSummary;
+		localRoute?: boolean;
 	}
 
-	let { album }: Props = $props();
-	let href = $derived(albumHref(album.id));
+	let { album, localRoute = false }: Props = $props();
+	let href = $derived(albumHref(localRoute ? album.id : (album.musicbrainz_release_group_id ?? album.id)));
 </script>
 
 <div

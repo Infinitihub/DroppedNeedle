@@ -200,6 +200,7 @@
 	const pinMutation = setEditionPin();
 	const clearPinMutation = clearEditionPin();
 	const acquireMutation = acquireEdition();
+	let editionConflict = $state(false);
 
 	// SvelteKit reuses this component instance across album navigations, so the
 	// per-album "queued" button states must reset when the album changes

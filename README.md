@@ -127,6 +127,25 @@ volumes remain the recommended setup on Windows.
 
 Open [http://localhost:8688](http://localhost:8688). On first launch you'll be prompted to create the first admin account (a username and password; email is optional); this only happens once. After that, add your library path under Settings > Library, add your slskd URL and API key under Settings > Download Client, then connect whichever streaming and discovery services you use. Run a library scan from Settings > Library.
 
+### Import a Spotify playlist link
+
+Link-based imports are available in the Spotify import page and through the API. The
+authenticated user must have a linked Spotify account because DroppedNeedle reads the
+playlist through Spotify's API:
+
+```http
+POST /api/v1/me/spotify/import-link
+Content-Type: application/json
+
+{"playlist_url":"https://open.spotify.com/playlist/PLAYLIST_ID"}
+```
+
+The response contains `playlist_id`. DroppedNeedle creates or refreshes the local
+playlist in the background, resolves album metadata, and the playlist page can submit
+missing albums to the configured download client. With slskd selected, those requests
+are searched and downloaded by the user's own slskd instance. Exportify CSV files can
+also be uploaded from the same page when a local export is preferred.
+
 ---
 
 ## Native Engine

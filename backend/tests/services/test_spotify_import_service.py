@@ -14,6 +14,7 @@ from services.spotify_import_service import (
     SpotifyImportService,
     SpotifyNotLinkedError,
     _best_image_url,
+    parse_spotify_playlist_link,
 )
 
 
@@ -121,3 +122,19 @@ def test_best_image_url_falls_back_to_largest_when_all_below_min():
 
 def test_best_image_url_none_when_empty():
     assert _best_image_url([]) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://open.spotify.com/playlist/playlist123?si=abc", "playlist123"),
+        ("spotify:playlist:playlist123", "playlist123"),
+    ],
+)
+def test_parse_spotify_playlist_link(value, expected):
+    assert parse_spotify_playlist_link(value) == expected
+
+
+def test_parse_spotify_playlist_link_rejects_other_links():
+    with pytest.raises(ValueError):
+        parse_spotify_playlist_link("https://open.spotify.com/album/album123")

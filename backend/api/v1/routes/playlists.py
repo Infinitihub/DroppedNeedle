@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from api.v1.schemas.common import StatusMessageResponse
@@ -11,6 +11,7 @@ from api.v1.schemas.playlists import (
     CheckTrackMembershipResponse,
     CoverUploadResponse,
     CreatePlaylistRequest,
+    ExportifyImportResponse,
     PlaylistDetailResponse,
     PlaylistListResponse,
     PlaylistSummaryResponse,
@@ -25,7 +26,7 @@ from api.v1.schemas.playlists import (
     UpdateTrackRequest,
 )
 from api.v1.schemas.request import BatchRequestResponse
-from core.dependencies import JellyfinLibraryServiceDep, LocalFilesServiceDep, NavidromeLibraryServiceDep, PlexLibraryServiceDep, PlaylistServiceDep, get_navidrome_folder_scope_service, get_request_service
+from core.dependencies import JellyfinLibraryServiceDep, LocalFilesServiceDep, NavidromeLibraryServiceDep, PlexLibraryServiceDep, PlaylistServiceDep, get_exportify_import_service, get_navidrome_folder_scope_service, get_request_service
 from core.dependencies.type_aliases import CurrentUserDep
 from core.exceptions import PlaylistNotFoundError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
@@ -180,6 +181,25 @@ async def create_playlist(
 ) -> PlaylistDetailResponse:
     playlist = await service.create_playlist(body.name, user_id=current_user.id)
     return _detail_to_response(playlist, [], is_owner=True, owner_name=None)
+
+
+@router.post("/import/exportify", response_model=ExportifyImportResponse, status_code=201)
+async def import_exportify_playlist(
+    current_user: CurrentUserDep,
+    exportify_service=Depends(get_exportify_import_service),
+    file: UploadFile = File(...),
+    name: str | None = Form(None),
+) -> ExportifyImportResponse:
+    data = await file.read()
+    try:
+        playlist_id = await exportify_service.import_csv(
+            current_user.id,
+            name or (file.filename.rsplit(".", 1)[0] if file.filename else "Exportify Playlist"),
+            data,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ExportifyImportResponse(playlist_id=playlist_id)
 
 
 @router.get("/{playlist_id}", response_model=PlaylistDetailResponse | RedactedPlaylist)

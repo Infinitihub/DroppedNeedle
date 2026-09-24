@@ -203,3 +203,9 @@ export interface BatchRequestResult {
 export async function requestMissingTracks(id: string): Promise<BatchRequestResult> {
 	return api.global.post<BatchRequestResult>(API.playlists.requestMissing(id));
 }
+
+export async function importExportifyPlaylist(file: File): Promise<{ playlist_id: string }> {
+	const form = new FormData();
+	form.append('file', file);
+	return api.global.upload<{ playlist_id: string }>(API.playlists.importExportify(), form);
+}

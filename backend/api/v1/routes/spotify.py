@@ -13,13 +13,18 @@ from core.dependencies import (
     get_navidrome_folder_scope_service,
     get_plex_library_service,
     get_playlist_service,
+    get_request_service,
     get_spotify_import_service,
     get_sse_publisher,
 )
 from core.task_registry import TaskRegistry
 from infrastructure.msgspec_fastapi import AppStruct, MsgSpecBody, MsgSpecRoute
 from middleware import CurrentUserDep
-from services.spotify_import_service import SpotifyImportService, SpotifyNotLinkedError
+from services.spotify_import_service import (
+    SpotifyImportService,
+    SpotifyNotLinkedError,
+    parse_spotify_playlist_link,
+)
 from services.local_files_service import LocalFilesService
 from services.playlist_service import PlaylistService
 
@@ -48,6 +53,11 @@ class SpotifyImportRequest(AppStruct):
     name: str
 
 
+class SpotifyLinkImportRequest(AppStruct):
+    playlist_url: str
+    name: str | None = None
+
+
 class SpotifyImportResponse(AppStruct):
     playlist_id: str
 
@@ -60,6 +70,7 @@ async def _background_import(
     current_user: object,
     playlist_service: PlaylistService,
     local_service: LocalFilesService,
+    request_service=None,
 ) -> None:
     try:
         await svc.populate_playlist(user_id, spotify_playlist_id, playlist_id)
@@ -108,6 +119,35 @@ async def _background_import(
                     pass
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Auto-link failed for playlist {playlist_id}: {exc}")
+
+    if request_service is not None:
+        try:
+            detail = await playlist_service.get_playlist_with_tracks(
+                playlist_id, current_user
+            )
+            seen: set[str] = set()
+            items: list[dict] = []
+            for track in detail.tracks:
+                mbid = track.album_id
+                if not mbid or mbid in seen or track.available_sources:
+                    continue
+                seen.add(mbid)
+                items.append(
+                    {
+                        "musicbrainz_id": mbid,
+                        "artist_name": track.artist_name or "Unknown",
+                        "album_title": track.album_name or "Unknown",
+                    }
+                )
+            if items:
+                await request_service.request_batch(
+                    items=items,
+                    user_id=user_id,
+                    user_role=current_user.role,
+                    requested_by_name=current_user.display_name,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Automatic playlist download request failed: %s", exc)
 
     # Tell the detail/list UI the import finished so the tracks appear without a manual
     # refresh. Fires whenever populate succeeded (auto-link above is best-effort). The
@@ -197,4 +237,53 @@ async def import_spotify_playlist(
         except RuntimeError:
             pass
 
+    return SpotifyImportResponse(playlist_id=playlist_id)
+
+
+@router.post("/import-link", response_model=SpotifyImportResponse)
+async def import_spotify_playlist_link(
+    body: SpotifyLinkImportRequest = MsgSpecBody(SpotifyLinkImportRequest),
+    current_user: CurrentUserDep = None,
+    svc: SpotifyImportService = Depends(get_spotify_import_service),
+    playlist_service: PlaylistService = Depends(get_playlist_service),
+    local_service: LocalFilesService = Depends(get_local_files_service),
+    request_service=Depends(get_request_service),
+) -> SpotifyImportResponse:
+    try:
+        spotify_playlist_id = parse_spotify_playlist_link(body.playlist_url)
+        client = await svc._get_client(current_user.id)
+        playlist_info = await client.get_playlist(spotify_playlist_id)
+        playlist_name = body.name or playlist_info.get("name") or "Spotify Playlist"
+        playlist_id = await svc.ensure_playlist_record(
+            current_user.id, spotify_playlist_id, playlist_name
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SpotifyNotLinkedError:
+        raise HTTPException(status_code=400, detail="Spotify account not linked")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Spotify link import setup failed for user %s: %s", current_user.id, exc
+        )
+        raise HTTPException(status_code=502, detail="Failed to fetch Spotify playlist")
+
+    task_key = f"spotify:import:{current_user.id}:{spotify_playlist_id}"
+    registry = TaskRegistry.get_instance()
+    if not registry.is_running(task_key):
+        task = asyncio.create_task(
+            _background_import(
+                svc,
+                current_user.id,
+                spotify_playlist_id,
+                playlist_id,
+                current_user,
+                playlist_service,
+                local_service,
+                request_service,
+            )
+        )
+        try:
+            registry.register(task_key, task)
+        except RuntimeError:
+            pass
     return SpotifyImportResponse(playlist_id=playlist_id)

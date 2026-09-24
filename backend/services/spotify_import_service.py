@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from infrastructure.queue.priority_queue import RequestPriority
@@ -24,10 +25,21 @@ logger = logging.getLogger(__name__)
 # this just caps the fan-out so we don't queue hundreds of coroutines
 # at once for very large playlists.
 _MB_CONCURRENCY = 4
+_SPOTIFY_PLAYLIST_ID_RE = re.compile(
+    r"^(?:https?://open\.spotify\.com/playlist/|spotify:playlist:)([A-Za-z0-9]+)"
+)
 
 
 class SpotifyNotLinkedError(Exception):
     pass
+
+
+def parse_spotify_playlist_link(value: str) -> str:
+    """Return a Spotify playlist ID from an open.spotify.com URL or Spotify URI."""
+    match = _SPOTIFY_PLAYLIST_ID_RE.match(value.strip())
+    if not match:
+        raise ValueError("Expected a Spotify playlist URL or spotify:playlist URI")
+    return match.group(1)
 
 
 def _best_image_url(images: list[dict], min_size: int = 250) -> str | None:

@@ -41,3 +41,20 @@ export const createImportSpotifyPlaylistMutation = () =>
 			});
 		}
 	}));
+
+export const createImportSpotifyLinkMutation = () =>
+	createMutation(() => ({
+		mutationFn: (input: { playlistUrl: string; name?: string }) =>
+			api.global.post<{ playlist_id: string }>(API.me.spotifyImportLink(), {
+				playlist_url: input.playlistUrl,
+				name: input.name || undefined
+			}),
+		onSuccess: () => {
+			invalidateQueriesWithPersister({
+				queryKey: PlaylistQueryKeyFactory.list(authStore.user?.id)
+			});
+			invalidateQueriesWithPersister({
+				queryKey: SPOTIFY_PLAYLISTS_KEY(authStore.user?.id)
+			});
+		}
+	}));

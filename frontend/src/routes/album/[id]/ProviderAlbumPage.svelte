@@ -125,7 +125,7 @@
 					</p>
 					<div class="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
 						{#each localCopies as localCopy (localCopy.id)}
-							<LibraryAlbumCard album={localCopy} />
+							<LibraryAlbumCard album={localCopy} localRoute />
 						{/each}
 					</div>
 				</section>

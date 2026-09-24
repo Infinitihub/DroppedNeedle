@@ -2194,6 +2194,17 @@ def get_spotify_import_service() -> "SpotifyImportService":
 
 
 @singleton
+def get_exportify_import_service():
+    from services.exportify_import_service import ExportifyImportService
+
+    return ExportifyImportService(
+        playlist_repo=get_playlist_repository(),
+        mb_repo=get_musicbrainz_repository(),
+        playlist_service=get_playlist_service(),
+    )
+
+
+@singleton
 def get_target_spotify_import_service() -> "SpotifyImportService":
     from services.spotify_import_service import SpotifyImportService
     from .compat_providers import get_target_consumer_composition

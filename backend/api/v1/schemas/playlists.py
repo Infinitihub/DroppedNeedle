@@ -80,6 +80,10 @@ class CreatePlaylistRequest(AppStruct):
     name: str
 
 
+class ExportifyImportResponse(AppStruct):
+    playlist_id: str
+
+
 class UpdatePlaylistRequest(AppStruct):
     name: str | None = None
 

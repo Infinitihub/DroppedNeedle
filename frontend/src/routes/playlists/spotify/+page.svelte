@@ -1,20 +1,58 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { Loader2, Music2, ArrowLeft, RefreshCw, CheckCircle2, Download } from 'lucide-svelte';
+	import { Loader2, Music2, ArrowLeft, RefreshCw, CheckCircle2, Download, Upload } from 'lucide-svelte';
 	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
+	import { importExportifyPlaylist } from '$lib/api/playlists';
 	import { toastStore } from '$lib/stores/toast';
 	import {
 		getSpotifyPlaylistsQuery,
-		createImportSpotifyPlaylistMutation
+		createImportSpotifyPlaylistMutation,
+		createImportSpotifyLinkMutation
 	} from '$lib/queries/spotify/SpotifyQueries.svelte';
 	import type { SpotifyPlaylistItem } from '$lib/types';
 
 	const playlistsQuery = getSpotifyPlaylistsQuery();
 	const importMutation = createImportSpotifyPlaylistMutation();
+	const linkImportMutation = createImportSpotifyLinkMutation();
 
 	let importing = $state<string | null>(null);
 	let importingAll = $state(false);
 	let importAllProgress = $state({ done: 0, total: 0 });
+	let importingExportify = $state(false);
+	let exportifyInput = $state<HTMLInputElement | null>(null);
+	let playlistUrl = $state('');
+	let importingLink = $state(false);
+
+	async function handleLinkImport() {
+		if (!playlistUrl.trim() || importingLink) return;
+		importingLink = true;
+		try {
+			const result = await linkImportMutation.mutateAsync({ playlistUrl: playlistUrl.trim() });
+			toastStore.show({ message: 'Playlist is importing in the background', type: 'success' });
+			await goto(`/playlists/${result.playlist_id}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'Could not import playlist link';
+			toastStore.show({ message, type: 'error' });
+		} finally {
+			importingLink = false;
+		}
+	}
+
+	async function handleExportifyFile(file: File) {
+		if (importingExportify) return;
+		importingExportify = true;
+		try {
+			const result = await importExportifyPlaylist(file);
+			toastStore.show({ message: `Imported ${file.name}`, type: 'success' });
+			await goto(`/playlists/${result.playlist_id}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'Could not import Exportify CSV';
+			toastStore.show({ message, type: 'error' });
+		} finally {
+			importingExportify = false;
+			if (exportifyInput) exportifyInput.value = '';
+		}
+	}
 
 	async function handleImport(playlist: SpotifyPlaylistItem) {
 		if (importing || importingAll) return;
@@ -80,6 +118,19 @@
 </svelte:head>
 
 <div class="space-y-6 px-4 sm:px-6 lg:px-8">
+	<form class="flex flex-col gap-2 rounded-xl border border-base-300 bg-base-200/40 p-3 sm:flex-row" onsubmit={(event) => { event.preventDefault(); void handleLinkImport(); }}>
+		<input
+			class="input input-bordered min-w-0 flex-1"
+			bind:value={playlistUrl}
+			placeholder="Paste a Spotify playlist link"
+			aria-label="Spotify playlist link"
+			type="url"
+		/>
+		<button class="btn btn-primary gap-1.5" type="submit" disabled={!playlistUrl.trim() || importingLink}>
+			{#if importingLink}<Loader2 class="h-4 w-4 animate-spin" />{:else}<Download class="h-4 w-4" />{/if}
+			Import link
+		</button>
+	</form>
 	<div class="flex items-center gap-3">
 		<a href="/playlists" class="btn btn-ghost btn-sm btn-circle">
 			<ArrowLeft class="h-4 w-4" />
@@ -88,6 +139,25 @@
 			<SpotifyIcon class="h-6 w-6 shrink-0 text-green-400" />
 			Import from Spotify
 		</h1>
+		<input
+			bind:this={exportifyInput}
+			class="hidden"
+			type="file"
+			accept=".csv,text/csv"
+			onchange={(event) => {
+				const file = (event.currentTarget as HTMLInputElement).files?.[0];
+				if (file) void handleExportifyFile(file);
+			}}
+		/>
+		<button
+			class="btn btn-sm gap-1.5 shrink-0"
+			onclick={() => exportifyInput?.click()}
+			disabled={importingExportify}
+			title="Import an Exportify CSV"
+		>
+			{#if importingExportify}<Loader2 class="h-3.5 w-3.5 animate-spin" />{:else}<Upload class="h-3.5 w-3.5" />{/if}
+			<span class="hidden sm:inline">Exportify CSV</span>
+		</button>
 		{#if unimportedCount > 0 && !importingAll}
 			<button
 				class="btn btn-sm gap-1.5 rounded-full bg-green-600 text-white shadow-sm hover:bg-green-500 shrink-0"
