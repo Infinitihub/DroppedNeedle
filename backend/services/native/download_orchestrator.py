@@ -380,8 +380,14 @@ class DownloadOrchestrator:
         )
 
         try:
-            if not self._source_enabled("soulseek") and not self._source_enabled(
-                "usenet"
+            if task.download_type == "track" and not self._source_enabled(
+                "soulseek", download_type="track"
+            ):
+                raise OrchestrationError(
+                    "Track-only downloads require Soulseek; enable slskd in Settings"
+                )
+            if not self._source_enabled("soulseek", download_type=task.download_type) and not self._source_enabled(
+                "usenet", download_type=task.download_type
             ):
                 # Disabled-but-configured slskd shouldn't read as "not configured".
                 if self._client.is_configured():
@@ -445,37 +451,37 @@ class DownloadOrchestrator:
             disposition="preserve" if attempt else None,
         )
 
-    def _source_enabled(self, source: str) -> bool:
+    def _source_enabled(self, source: str, *, download_type: str | None = None) -> bool:
         if source == "soulseek":
             # Both the enable toggle AND a usable URL/key are required - a disabled-but-
             # configured slskd must not be routed to just because it's still configured.
             return self._soulseek_enabled and self._client.is_configured()
         if source == "usenet":
-            return self._usenet_enabled
+            return self._usenet_enabled and download_type != "track"
         return False
 
-    def _enabled_source_names(self) -> list[str]:
+    def _enabled_source_names(self, *, download_type: str | None = None) -> list[str]:
         """Display names of the sources actually searched - so failure messages name what
         was tried, never a source that's switched off."""
         return [
             name
             for source, name in (("soulseek", "Soulseek"), ("usenet", "Usenet"))
-            if self._source_enabled(source)
+            if self._source_enabled(source, download_type=download_type)
         ]
 
-    def _no_source_message(self) -> str:
+    def _no_source_message(self, *, download_type: str | None = None) -> str:
         """The 'nothing usable came back' message, naming the sources that were actually
         searched - so a Usenet-only setup reads "...on Usenet", never "...on Soulseek".
         Search hits every enabled source, so both are named when both are on."""
-        names = self._enabled_source_names()
+        names = self._enabled_source_names(download_type=download_type)
         return f"{_NO_SOURCE_MSG} on {' or '.join(names)}" if names else _NO_SOURCE_MSG
 
-    def _no_match_message(self) -> str:
+    def _no_match_message(self, *, download_type: str | None = None) -> str:
         """The 'the indexers returned nothing for this album' message, naming the sources
         actually searched. A Usenet-only setup reads "...on Usenet" - surfacing that the
         album may well be on Soulseek, which is currently disabled - instead of the
         misleading "...on any source"."""
-        names = self._enabled_source_names()
+        names = self._enabled_source_names(download_type=download_type)
         joined = " or ".join(names) if names else "any source"
         return f"{_NO_MATCH_MSG} on {joined}"
 
@@ -508,7 +514,7 @@ class DownloadOrchestrator:
 
         remembered: list[list] = []
         for source in self._source_priority:
-            if not self._source_enabled(source):
+            if not self._source_enabled(source, download_type=task.download_type):
                 continue
             candidates = await self._search_and_score(task, source)
             remembered.append(candidates)
@@ -577,7 +583,9 @@ class DownloadOrchestrator:
             )
             return False
         await self._store.update_status(
-            task.id, DownloadStatus.FAILED, error_message=self._no_match_message()
+            task.id,
+            DownloadStatus.FAILED,
+            error_message=self._no_match_message(download_type=task.download_type),
         )
         await self._bus.publish(
             f"download:{task.id}",
@@ -1551,7 +1559,7 @@ class DownloadOrchestrator:
         elif import_failed:
             fail_msg = _IMPORT_FAILED_MSG
         else:
-            fail_msg = self._no_source_message()
+            fail_msg = self._no_source_message(download_type=task.download_type)
         if task.download_type == "track":
             await self._finalize(
                 task,

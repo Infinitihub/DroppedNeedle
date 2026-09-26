@@ -17,7 +17,9 @@ class AlbumCoverageService:
         self._store = store
         self._queue = queue
 
-    async def get_coverage(self, album_id: str) -> AlbumCoverage:
+    async def get_coverage(
+        self, album_id: str, *, schedule_stale: bool = True
+    ) -> AlbumCoverage:
         context = await self._store.get_album_identification_context(album_id)
         if context is None:
             return AlbumCoverage(local_album_id=album_id, stale=True)
@@ -40,6 +42,7 @@ class AlbumCoverageService:
         )
         if (
             stale
+            and schedule_stale
             and self._queue is not None
             and identity["decision_source"] in {"automatic", "embedded"}
             and any(track["applied_policy"] == "automatic" for track in tracks)

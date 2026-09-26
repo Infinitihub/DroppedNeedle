@@ -91,6 +91,7 @@ class PlaylistLibraryCandidate(AppStruct):
     album_name: str
     score: float
     album_mbid: str | None = None
+    cover_url: str | None = None
     format: str = ""
 
 

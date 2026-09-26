@@ -61,9 +61,11 @@ from core.dependencies import (
 from core.dependencies import service_providers
 from core.dependencies import repo_providers
 from core.exceptions import ProviderIdentityRequiredError, TargetStartupInvariantError
+from api.v1.routes.library_target import get_target_full_albums
 from services.album_discovery_service import AlbumDiscoveryService
 from services.compat.target_cover_art_service import TargetCoverArtService
 from api.v1.schemas.library_policies import LibrarySettingsResponse
+from api.v1.schemas.library_target import TargetNativeAlbum
 from target_application import (
     _server_timezone_name,
     create_isolated_target_application,
@@ -234,6 +236,56 @@ def test_isolated_target_application_mounts_target_catalog_and_compat_routes() -
     assert app.dependency_overrides[get_events_watcher_getter]() is (
         get_target_events_watcher_service
     )
+
+
+@pytest.mark.asyncio
+async def test_full_albums_route_filters_stale_and_incomplete_coverage() -> None:
+    albums = [
+        TargetNativeAlbum(id=album_id, title=album_id, artist_name="Artist", artist_id="artist")
+        for album_id in ("complete-1", "partial", "stale", "extra", "complete-2")
+    ]
+
+    class LibraryService:
+        async def albums(self, *, limit, offset, sort, search, file_format):
+            return albums[offset : offset + limit], len(albums)
+
+    complete = SimpleNamespace(
+        evidence_revision="evidence-1",
+        musicbrainz_release_group_id="release-group-1",
+        stale=False,
+        supported=[object()],
+        unknown=[],
+        contradictory=[],
+        missing_expected_tracks=[],
+    )
+    coverages = {
+        "complete-1": complete,
+        "complete-2": complete,
+        "partial": SimpleNamespace(**{**vars(complete), "missing_expected_tracks": ["track"]}),
+        "stale": SimpleNamespace(**{**vars(complete), "stale": True}),
+        "extra": SimpleNamespace(**{**vars(complete), "unknown": [object()]}),
+    }
+    coverage_calls: list[tuple[str, bool]] = []
+
+    class CoverageService:
+        async def get_coverage(self, album_id, *, schedule_stale):
+            coverage_calls.append((album_id, schedule_stale))
+            return coverages[album_id]
+
+    result = await get_target_full_albums(
+        object(),
+        LibraryService(),
+        CoverageService(),
+        page=1,
+        page_size=1,
+        sort="recent",
+        q=None,
+        file_format=None,
+    )
+
+    assert result.total == 3
+    assert [album.id for album in result.items] == ["complete-1"]
+    assert all(not schedule for _, schedule in coverage_calls)
 
 
 def test_target_release_cover_warming_uses_the_target_adapter_surface() -> None:

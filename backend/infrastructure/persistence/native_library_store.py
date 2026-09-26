@@ -4550,6 +4550,7 @@ class NativeLibraryStore(PersistenceBase):
         track_source_id: str | None,
         plex_rating_key: str | None | object,
         library_file_id: str | None | object,
+        cover_url: str | None,
         unchanged: object,
         changed_at: str,
     ) -> dict[str, Any] | None:
@@ -4578,6 +4579,7 @@ class NativeLibraryStore(PersistenceBase):
                 if library_file_id is unchanged
                 else library_file_id
             )
+            next_cover_url = cover_url if cover_url is not None else row["cover_url"]
             candidate_id = next_file_id
             if not candidate_id and next_source_type in {
                 "local",
@@ -4613,7 +4615,7 @@ class NativeLibraryStore(PersistenceBase):
             connection.execute(
                 "UPDATE library_playlist_tracks SET source_type = ?, "
                 "available_sources = ?, track_source_id = ?, plex_rating_key = ?, "
-                "library_file_id = ?, local_track_id = ?, local_album_id = ?, "
+                "library_file_id = ?, cover_url = ?, local_track_id = ?, local_album_id = ?, "
                 "local_artist_id = ?, reference_tombstone_id = NULL "
                 "WHERE playlist_id = ? AND id = ?",
                 (
@@ -4622,6 +4624,7 @@ class NativeLibraryStore(PersistenceBase):
                     next_source_id,
                     next_plex_key,
                     next_file_id,
+                    next_cover_url,
                     local_track_id,
                     local_album_id,
                     local_artist_id,

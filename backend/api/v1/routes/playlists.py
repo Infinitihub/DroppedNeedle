@@ -1,3 +1,5 @@
+import unicodedata
+from difflib import SequenceMatcher
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -28,7 +30,7 @@ from api.v1.schemas.playlists import (
     UpdateTrackRequest,
 )
 from api.v1.schemas.request import BatchRequestResponse
-from core.dependencies import JellyfinLibraryServiceDep, LocalFilesServiceDep, NavidromeLibraryServiceDep, PlexLibraryServiceDep, PlaylistServiceDep, get_exportify_import_service, get_navidrome_folder_scope_service, get_request_service
+from core.dependencies import JellyfinLibraryServiceDep, LocalFilesServiceDep, NavidromeLibraryServiceDep, PlexLibraryServiceDep, PlaylistServiceDep, get_album_service, get_exportify_import_service, get_navidrome_folder_scope_service, get_request_service
 from core.dependencies.type_aliases import CurrentUserDep
 from core.exceptions import PlaylistNotFoundError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
@@ -54,6 +56,52 @@ async def _get_user_navidrome_folder_ids(
 ) -> tuple[str, ...] | None:
     resolution = await scope_service.resolve(current_user.id)
     return None if resolution.scope.mode == "all" else resolution.scope.folder_ids
+
+
+def _normalize_track_title(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(character for character in decomposed.casefold() if character.isalnum())
+
+
+def _recording_for_playlist_track(track, album_tracks):  # noqa: ANN001
+    title = _normalize_track_title(track.track_name)
+    candidates = [candidate for candidate in album_tracks if candidate.recording_id]
+    positioned = [
+        candidate
+        for candidate in candidates
+        if candidate.position == track.track_number
+        and (candidate.disc_number or 1) == (track.disc_number or 1)
+    ]
+    if positioned:
+        ranked = sorted(
+            positioned,
+            key=lambda candidate: SequenceMatcher(
+                None, title, _normalize_track_title(candidate.title)
+            ).ratio(),
+            reverse=True,
+        )
+        best = ranked[0]
+        score = SequenceMatcher(None, title, _normalize_track_title(best.title)).ratio()
+        if score >= 0.65:
+            return best
+
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: SequenceMatcher(
+            None, title, _normalize_track_title(candidate.title)
+        ).ratio(),
+        reverse=True,
+    )
+    if not ranked:
+        return None
+    best_score = SequenceMatcher(None, title, _normalize_track_title(ranked[0].title)).ratio()
+    if best_score < 0.92:
+        return None
+    if len(ranked) > 1:
+        second_score = SequenceMatcher(None, title, _normalize_track_title(ranked[1].title)).ratio()
+        if best_score - second_score < 0.05:
+            return None
+    return ranked[0]
 
 
 UserNavidromeFolderIdsDep = Annotated[
@@ -495,38 +543,72 @@ async def request_missing_tracks(
     playlist_id: str,
     service: PlaylistServiceDep,
     current_user: CurrentUserDep,
+    album_service=Depends(get_album_service),
     request_service=Depends(get_request_service),
 ) -> BatchRequestResponse:
     result = await service.get_playlist_with_tracks(playlist_id, current_user)
     if isinstance(result, RedactedDetailView):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    seen: set[str] = set()
-    items: list[dict] = []
+    album_tracklists: dict[str, object | None] = {}
+    seen_recordings: set[str] = set()
+    requested = 0
+    skipped = 0
     for track in result.tracks:
-        mbid = track.album_id
-        if not mbid or mbid in seen:
+        release_group_mbid = track.album_id
+        if (
+            not release_group_mbid
+            or track.track_number is None
+            or track.library_file_id
+            or track.source_type == "local"
+            or track.available_sources
+        ):
+            skipped += 1
             continue
-        if track.available_sources and len(track.available_sources) > 0:
+
+        if release_group_mbid not in album_tracklists:
+            try:
+                album_tracklists[release_group_mbid] = await album_service.get_album_tracks_info(
+                    release_group_mbid
+                )
+            except Exception:  # noqa: BLE001 - unresolved identities must not widen to albums
+                album_tracklists[release_group_mbid] = None
+        album_info = album_tracklists[release_group_mbid]
+        if album_info is None:
+            skipped += 1
             continue
-        seen.add(mbid)
-        items.append(
-            {
-                "musicbrainz_id": mbid,
-                "artist_name": track.artist_name or "Unknown",
-                "album_title": track.album_name or "Unknown",
-            }
+        recording = _recording_for_playlist_track(track, album_info.tracks)
+        recording_mbid = recording.recording_id if recording else None
+        if not recording_mbid or recording_mbid.casefold() in seen_recordings:
+            skipped += 1
+            continue
+        seen_recordings.add(recording_mbid.casefold())
+        response = await request_service.request_track(
+            recording_mbid,
+            artist_name=track.artist_name or "Unknown",
+            track_title=track.track_name,
+            album_title=track.album_name,
+            duration_seconds=track.duration,
+            release_group_mbid=release_group_mbid,
+            release_mbid=album_info.selected_release_mbid,
+            user_id=current_user.id,
+            user_role=current_user.role,
+            requested_by_name=current_user.display_name,
         )
+        if response.status == "already_in_library":
+            skipped += 1
+        else:
+            requested += 1
 
-    if not items:
-        return BatchRequestResponse(
-            success=True,
-            message="No missing albums found, all tracks already have a source",
-        )
-
-    return await request_service.request_batch(
-        items=items,
-        user_id=current_user.id,
-        user_role=current_user.role,
-        requested_by_name=current_user.display_name,
+    message = (
+        f"Queued {requested} individual track request{'s' if requested != 1 else ''}; "
+        f"skipped {skipped} already available or without a confident recording match."
+        if requested
+        else "No identifiable missing tracks were found; no album downloads were requested."
+    )
+    return BatchRequestResponse(
+        success=True,
+        message=message,
+        requested=requested,
+        skipped=skipped,
     )

@@ -730,6 +730,15 @@ def test_no_match_message_names_only_enabled_sources(tmp_path: Path):
     assert orch._no_match_message() == "No matching release found on any source"
 
 
+def test_track_downloads_never_enable_album_sized_usenet(tmp_path: Path):
+    _store, orch, *_ = _build(tmp_path)
+    orch._usenet_enabled = True
+
+    assert orch._source_enabled("usenet", download_type="album") is True
+    assert orch._source_enabled("usenet", download_type="track") is False
+    assert orch._enabled_source_names(download_type="track") == ["Soulseek"]
+
+
 @pytest.mark.asyncio
 async def test_enqueue_failure_fails_without_quarantine(tmp_path: Path):
     client = _StubClient()

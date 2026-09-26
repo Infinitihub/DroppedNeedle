@@ -288,6 +288,7 @@ class TargetPlaylistRepository:
         track_source_id: str | None = None,
         plex_rating_key: str | None = _UNSET,
         library_file_id: str | None = _UNSET,
+        cover_url: str | None = None,
     ) -> PlaylistTrackRecord | None:
         row = await self._store.update_target_playlist_track_source(
             playlist_id,
@@ -297,6 +298,7 @@ class TargetPlaylistRepository:
             track_source_id=track_source_id,
             plex_rating_key=plex_rating_key,
             library_file_id=library_file_id,
+            cover_url=cover_url,
             unchanged=_UNSET,
             changed_at=self._now(),
         )

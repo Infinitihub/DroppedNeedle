@@ -48,6 +48,7 @@ from core.dependencies.type_aliases import (
     TargetLibraryScanCoordinatorDep,
     TargetLibraryOwnershipServiceDep,
     TargetNativeLibraryServiceDep,
+    TargetAlbumCoverageServiceDep,
     EditionConversionServiceDep,
     TargetAlbumEditionFinderServiceDep,
     CachedLocalArtworkServiceDep,
@@ -67,6 +68,16 @@ router = APIRouter(
     prefix="/library",
     tags=["library-target"],
 )
+
+
+def _has_complete_album_coverage(coverage) -> bool:  # noqa: ANN001
+    return bool(
+        coverage.evidence_revision
+        and coverage.musicbrainz_release_group_id
+        and not coverage.stale
+        and coverage.supported
+        and not coverage.missing_expected_tracks
+    )
 
 
 @router.get("/albums/{album_id}/artwork/cached")
@@ -154,6 +165,67 @@ async def get_target_albums(
         file_format=(file_format or "").strip().casefold() or None,
     )
     return TargetNativeAlbumsResponse(items=items, total=total)
+
+
+@router.get("/full-albums", response_model=TargetNativeAlbumsResponse)
+async def get_target_full_albums(
+    _user: CurrentUserDep,
+    service: TargetNativeLibraryServiceDep,
+    coverage_service: TargetAlbumCoverageServiceDep,
+    page: int = 1,
+    page_size: int = 50,
+    sort: str = "recent",
+    q: str | None = None,
+    file_format: str | None = Query(default=None, alias="format"),
+) -> TargetNativeAlbumsResponse:
+    allowed = {"recent", "newest", "oldest", "name", "artist", "random"}
+    normalized_sort = "name" if sort == "title" else sort
+    if normalized_sort not in allowed:
+        normalized_sort = "recent"
+    size = max(1, min(page_size, 100))
+    full_albums = []
+    offset = 0
+    batch_size = 100
+    semaphore = asyncio.Semaphore(8)
+    while True:
+        candidates, total_candidates = await service.albums(
+            limit=batch_size,
+            offset=offset,
+            sort=normalized_sort,
+            search=(q or "").strip() or None,
+            file_format=(file_format or "").strip().casefold() or None,
+        )
+        if not candidates:
+            break
+
+        async def is_full(album) -> bool:  # noqa: ANN001
+            async with semaphore:
+                try:
+                    coverage = await coverage_service.get_coverage(
+                        album.id, schedule_stale=False
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "Complete-album coverage unavailable for %s",
+                        album.id,
+                        exc_info=True,
+                    )
+                    return False
+            return _has_complete_album_coverage(coverage)
+
+        completeness = await asyncio.gather(*(is_full(album) for album in candidates))
+        full_albums.extend(
+            album for album, complete in zip(candidates, completeness) if complete
+        )
+        offset += len(candidates)
+        if offset >= total_candidates:
+            break
+
+    page_offset = max(0, page - 1) * size
+    return TargetNativeAlbumsResponse(
+        items=full_albums[page_offset : page_offset + size],
+        total=len(full_albums),
+    )
 
 
 @router.get("/tracks", response_model=TargetNativeTracksResponse)

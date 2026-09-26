@@ -199,6 +199,7 @@ export interface PlaylistLibraryCandidate {
 	artist_name: string;
 	album_name: string;
 	album_mbid: string | null;
+	cover_url: string | null;
 	format: string;
 	score: number;
 }

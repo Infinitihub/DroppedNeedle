@@ -2,12 +2,13 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.v1.routes.playlists import router as playlists_router
-from core.dependencies import get_playlist_service, get_jellyfin_library_service, get_local_files_service, get_navidrome_library_service
+from core.dependencies import get_album_service, get_playlist_service, get_jellyfin_library_service, get_local_files_service, get_navidrome_library_service, get_request_service
 from core.exceptions import PlaylistNotFoundError, InvalidPlaylistDataError, ResourceNotFoundError, ValidationError
 from core.exception_handlers import resource_not_found_handler, validation_error_handler, general_exception_handler
 from repositories.playlist_repository import PlaylistRecord, PlaylistSummaryRecord, PlaylistTrackRecord
@@ -83,13 +84,32 @@ def mock_nd_service():
 
 
 @pytest.fixture
-def client(mock_playlist_service, mock_jf_service, mock_local_service, mock_nd_service):
+def mock_album_service():
+    return AsyncMock()
+
+
+@pytest.fixture
+def mock_request_service():
+    return AsyncMock()
+
+
+@pytest.fixture
+def client(
+    mock_playlist_service,
+    mock_jf_service,
+    mock_local_service,
+    mock_nd_service,
+    mock_album_service,
+    mock_request_service,
+):
     app = FastAPI()
     app.include_router(playlists_router)
     app.dependency_overrides[get_playlist_service] = lambda: mock_playlist_service
     app.dependency_overrides[get_jellyfin_library_service] = lambda: mock_jf_service
     app.dependency_overrides[get_local_files_service] = lambda: mock_local_service
     app.dependency_overrides[get_navidrome_library_service] = lambda: mock_nd_service
+    app.dependency_overrides[get_album_service] = lambda: mock_album_service
+    app.dependency_overrides[get_request_service] = lambda: mock_request_service
     override_user_auth(app)
     app.add_exception_handler(ResourceNotFoundError, resource_not_found_handler)
     app.add_exception_handler(ValidationError, validation_error_handler)
@@ -419,6 +439,73 @@ class TestLinkLocalPlaylistTrack:
         assert resp.status_code == 200
         assert resp.json()["source_type"] == "local"
         assert resp.json()["library_file_id"] == "file-1"
+
+
+class TestRequestMissingPlaylistTracks:
+    def test_requests_recordings_individually(self, client, mock_playlist_service, mock_album_service, mock_request_service):
+        track = _track()
+        track.album_id = "release-group-1"
+        track.source_type = ""
+        track.available_sources = None
+        mock_playlist_service.get_playlist_with_tracks.return_value = PlaylistDetailView(
+            record=_playlist(), tracks=[track], is_owner=True
+        )
+        mock_album_service.get_album_tracks_info.return_value = SimpleNamespace(
+            tracks=[SimpleNamespace(
+                position=1,
+                disc_number=2,
+                title="Song",
+                recording_id="recording-1",
+            )],
+            selected_release_mbid="release-1",
+        )
+        mock_request_service.request_track.return_value = SimpleNamespace(status="queued")
+
+        resp = client.post("/playlists/p-1/request-missing")
+
+        assert resp.status_code == 202
+        assert resp.json()["requested"] == 1
+        mock_request_service.request_track.assert_awaited_once_with(
+            "recording-1",
+            artist_name="Artist",
+            track_title="Song",
+            album_title="Album",
+            duration_seconds=180,
+            release_group_mbid="release-group-1",
+            release_mbid="release-1",
+            user_id="test-user-id",
+            user_role="user",
+            requested_by_name="Test User",
+        )
+        mock_request_service.request_batch.assert_not_awaited()
+
+    def test_unresolved_recording_is_skipped_without_album_request(
+        self, client, mock_playlist_service, mock_album_service, mock_request_service
+    ):
+        track = _track()
+        track.album_id = "release-group-1"
+        track.source_type = ""
+        track.available_sources = None
+        mock_playlist_service.get_playlist_with_tracks.return_value = PlaylistDetailView(
+            record=_playlist(), tracks=[track], is_owner=True
+        )
+        mock_album_service.get_album_tracks_info.return_value = SimpleNamespace(
+            tracks=[SimpleNamespace(
+                position=1,
+                disc_number=2,
+                title="Song",
+                recording_id=None,
+            )],
+            selected_release_mbid="release-1",
+        )
+
+        resp = client.post("/playlists/p-1/request-missing")
+
+        assert resp.status_code == 202
+        assert resp.json()["requested"] == 0
+        assert resp.json()["skipped"] == 1
+        mock_request_service.request_track.assert_not_awaited()
+        mock_request_service.request_batch.assert_not_awaited()
 
 
 class TestUpdateTrackSourceResolution:

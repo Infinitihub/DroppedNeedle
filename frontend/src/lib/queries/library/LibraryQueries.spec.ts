@@ -18,6 +18,7 @@ vi.mock('../QueryClient', () => ({
 import { api } from '$lib/api/client';
 import {
 	getLibraryAlbumsQueryOptions,
+	getLibraryFullAlbumsQuery,
 	getLibraryStatsQueryOptions,
 	getLibraryAlbumStatusQueryOptions,
 	getLibraryAlbumCopiesQuery,
@@ -53,6 +54,12 @@ describe('LibraryQueryKeyFactory', () => {
 			'albums',
 			{ page: 2, sort: 'title', q: 'foo', format: 'flac' }
 		]);
+	});
+
+	it('full album browse uses a separate cache key', () => {
+		expect(LibraryQueryKeyFactory.fullAlbums(1, 'recent', '', '')).not.toEqual(
+			LibraryQueryKeyFactory.albums(1, 'recent', '', '')
+		);
 	});
 
 	it('produces distinct keys for different params', () => {
@@ -94,6 +101,21 @@ describe('library query endpoints', () => {
 		expect(url).not.toContain('q=');
 		expect(url).not.toContain('format=');
 		expect(opts.placeholderData).toBeDefined();
+	});
+
+	it('full albums query uses the complete-album endpoint', async () => {
+		const opts = getLibraryFullAlbumsQuery(() => ({
+			page: 2,
+			sort: 'artist',
+			q: 'radio',
+			format: 'flac'
+		})) as unknown;
+		await callQueryFn(opts);
+		const url = mockGet.mock.calls[0][0] as string;
+		expect(url).toContain('/api/v1/library/full-albums');
+		expect(url).toContain('page=2');
+		expect(url).toContain('q=radio');
+		expect(url).toContain('format=flac');
 	});
 
 	it('stats query hits /library/stats', async () => {

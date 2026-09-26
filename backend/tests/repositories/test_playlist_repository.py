@@ -360,6 +360,22 @@ class TestUpdateTrackSource:
         assert result is not None
         assert result.available_sources == ["local", "jellyfin"]
 
+    def test_update_cover_url(self, repo):
+        p = repo.create_playlist("Test")
+        tracks = repo.add_tracks(p.id, [
+            {"track_name": "T1", "artist_name": "A1", "album_name": "AL1", "source_type": ""},
+        ])
+
+        updated = repo.update_track_source(
+            p.id, tracks[0].id, cover_url="/api/v1/covers/release-group/release-1?size=300"
+        )
+        unchanged = repo.update_track_source(p.id, tracks[0].id, source_type="local")
+
+        assert updated is not None
+        assert updated.cover_url == "/api/v1/covers/release-group/release-1?size=300"
+        assert unchanged is not None
+        assert unchanged.cover_url == updated.cover_url
+
     def test_non_existent(self, repo):
         p = repo.create_playlist("Test")
         assert repo.update_track_source(p.id, "nonexistent") is None

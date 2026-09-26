@@ -87,6 +87,21 @@ export const getLibraryAlbumsQueryOptions = ({ page, sort, q, format }: LibraryA
 export const getLibraryAlbumsQuery = (getParams: Getter<LibraryAlbumsParams>) =>
 	createQuery(() => getLibraryAlbumsQueryOptions(getParams()));
 
+export const getLibraryFullAlbumsQuery = (getParams: Getter<LibraryAlbumsParams>) =>
+	createQuery(() => {
+		const { page, sort, q, format } = getParams();
+		return {
+			staleTime: CACHE_TTL.LIBRARY_NATIVE,
+			placeholderData: keepPreviousData,
+			queryKey: LibraryQueryKeyFactory.fullAlbums(page, sort, q, format),
+			queryFn: ({ signal }) =>
+				api.global.get<NativeAlbumsResponse>(
+					API.library.fullAlbums(page, sort, q || undefined, format || undefined),
+					{ signal }
+				)
+		};
+	});
+
 export interface LibraryArtistsParams {
 	sortBy: ArtistSort;
 	sortOrder: 'asc' | 'desc';

@@ -1470,11 +1470,18 @@ async def test_target_playlist_writes_and_legacy_track_ids_resolve_to_local_refe
     second = await service.add_file_id_entry(
         playlist.id, LOCAL_TRACK_ID, requesting=owner
     )
+    updated_second = await repository.update_track_source(
+        playlist.id,
+        second.id,
+        cover_url="/api/v1/covers/release-group/release-1?size=300",
+    )
 
     assert first[0].library_file_id == IDENTIFIED_TRACK_ID
     assert first[0].album_id == IDENTIFIED_ALBUM_ID
     assert first[0].artist_id == IDENTIFIED_ARTIST_ID
     assert second.library_file_id == LOCAL_TRACK_ID
+    assert updated_second is not None
+    assert updated_second.cover_url == "/api/v1/covers/release-group/release-1?size=300"
     assert await service.get_imported_source_ids("subsonic:", owner.id) == {"old-7"}
     assert await service.get_streamable_counts() == {playlist.id: (2, 360)}
 

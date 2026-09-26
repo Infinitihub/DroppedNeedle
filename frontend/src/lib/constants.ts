@@ -189,6 +189,12 @@ export const API = {
 			if (format) url += `&format=${encodeURIComponent(format)}`;
 			return url;
 		},
+		fullAlbums: (page = 1, sort = 'recent', q?: string, format?: string, pageSize = 50) => {
+			let url = `/api/v1/library/full-albums?page=${page}&page_size=${pageSize}&sort=${sort}`;
+			if (q) url += `&q=${encodeURIComponent(q)}`;
+			if (format) url += `&format=${encodeURIComponent(format)}`;
+			return url;
+		},
 		tracks: (limit = 48, offset = 0, sort = 'recent', q?: string) => {
 			let url = `/api/v1/library/tracks?limit=${limit}&offset=${offset}&sort=${sort}`;
 			if (q) url += `&q=${encodeURIComponent(q)}`;

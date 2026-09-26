@@ -112,6 +112,7 @@
 				track.library_file_id = match.candidate.track_file_id;
 				track.available_sources = ['local'];
 				track.format = match.candidate.format || track.format;
+				track.cover_url = match.candidate.cover_url || track.cover_url;
 			}
 		} catch {
 			toastStore.show({ message: "Couldn't match playlist tracks to your library", type: 'error' });
@@ -133,6 +134,8 @@
 				track.library_file_id = updated.library_file_id;
 				track.available_sources = updated.available_sources;
 				track.format = updated.format || selectedMatch?.candidate?.format || track.format;
+				track.cover_url =
+					updated.cover_url || selectedMatch?.candidate?.cover_url || track.cover_url;
 			}
 			libraryMatch = {
 				...libraryMatch,

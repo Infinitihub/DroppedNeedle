@@ -766,6 +766,7 @@ class PlaylistRepository:
         track_source_id: Optional[str] = None,
         plex_rating_key: Optional[str] = _UNSET,
         library_file_id: Optional[str] = _UNSET,
+        cover_url: Optional[str] = None,
     ) -> Optional[PlaylistTrackRecord]:
         with self._write_lock:
             conn = self._get_connection()
@@ -793,13 +794,14 @@ class PlaylistRepository:
                 if library_file_id is not _UNSET
                 else (row["library_file_id"] if "library_file_id" in row.keys() else None)
             )
+            new_cover_url = cover_url if cover_url is not None else row["cover_url"]
 
             conn.execute(
                 "UPDATE playlist_tracks SET source_type = ?, available_sources = ?, "
-                "track_source_id = ?, plex_rating_key = ?, library_file_id = ? "
+                "track_source_id = ?, plex_rating_key = ?, library_file_id = ?, cover_url = ? "
                 "WHERE id = ? AND playlist_id = ?",
                 (new_source_type, new_available, new_track_source_id, new_plex_rating_key,
-                 new_library_file_id, track_id, playlist_id),
+                 new_library_file_id, new_cover_url, track_id, playlist_id),
             )
             now = datetime.now(timezone.utc).isoformat()
             conn.execute(
@@ -818,7 +820,7 @@ class PlaylistRepository:
             track_name=row["track_name"], artist_name=row["artist_name"],
             album_name=row["album_name"], album_id=row["album_id"],
             artist_id=row["artist_id"], track_source_id=new_track_source_id,
-            cover_url=row["cover_url"], source_type=new_source_type,
+            cover_url=new_cover_url, source_type=new_source_type,
             available_sources=avail_parsed, format=row["format"],
             track_number=row["track_number"],
             disc_number=row["disc_number"] if "disc_number" in row.keys() else None,

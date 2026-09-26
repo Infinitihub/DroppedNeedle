@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Music, Clock, ArrowUp, HardDrive, Layers } from 'lucide-svelte';
+	import { Music, Clock, ArrowUp, ArrowRight, Disc3, HardDrive, Layers } from 'lucide-svelte';
 	import { onMount } from 'svelte';
 	import { fromStore } from 'svelte/store';
 	import { getLibraryStatsQuery } from '$lib/queries/library/LibraryQueries.svelte';
@@ -65,6 +65,14 @@
 
 	<div class="space-y-4">
 		<LibraryHubTiles {stats} />
+		<a
+			href="/library/full-albums"
+			class="flex w-fit items-center gap-2 border-b border-base-content/15 py-2 text-sm font-semibold text-base-content/70 transition-colors hover:border-primary hover:text-primary"
+		>
+			<Disc3 class="h-4 w-4" aria-hidden="true" />
+			Full Albums
+			<ArrowRight class="h-4 w-4" aria-hidden="true" />
+		</a>
 
 		<div
 			class="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-2xl border border-base-content/5 bg-base-200/30 px-5 py-3 text-sm"

@@ -378,6 +378,7 @@ describe('Playlist detail page', () => {
 						artist_name: 'Other Artist',
 						album_name: 'Test Album',
 						album_mbid: null,
+						cover_url: '/api/v1/covers/release-group/release-2?size=300',
 						format: 'flac',
 						score: 0.82
 					}

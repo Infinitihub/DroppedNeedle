@@ -634,14 +634,19 @@ class PlaylistService:
         semaphore = asyncio.Semaphore(_LIBRARY_MATCH_CONCURRENCY)
 
         async def match_one(track: PlaylistTrackRecord) -> dict[str, Any]:
-            if track.library_file_id or track.source_type == "local":
-                return {"track_id": track.id, "status": "matched", "candidate": None}
-            if track.source_type or track.available_sources:
-                return {"track_id": track.id, "status": "matched", "candidate": None}
+            already_local = bool(
+                track.library_file_id
+                or track.source_type == "local"
+                or (track.available_sources and "local" in track.available_sources)
+            )
 
             search_tracks = getattr(local_service, "search_tracks", None)
             if not callable(search_tracks):
-                return {"track_id": track.id, "status": "missing", "candidate": None}
+                return {
+                    "track_id": track.id,
+                    "status": "matched" if already_local else "missing",
+                    "candidate": None,
+                }
             async with semaphore:
                 try:
                     candidates = await search_tracks(track.track_name, limit=30)
@@ -658,7 +663,11 @@ class PlaylistService:
                 reverse=True,
             )
             if not ranked:
-                return {"track_id": track.id, "status": "missing", "candidate": None}
+                return {
+                    "track_id": track.id,
+                    "status": "matched" if already_local else "missing",
+                    "candidate": None,
+                }
 
             (score, title_score, artist_score), best = ranked[0]
             duration = track.duration
@@ -674,9 +683,38 @@ class PlaylistService:
                 "artist_name": getattr(best, "artist_name", ""),
                 "album_name": getattr(best, "album_name", ""),
                 "album_mbid": getattr(best, "album_mbid", None),
+                "cover_url": getattr(best, "cover_url", None),
                 "format": getattr(best, "format", ""),
                 "score": round(score, 3),
             }
+            existing_file_id = track.library_file_id or (
+                track.track_source_id if track.source_type == "local" else None
+            )
+            if existing_file_id:
+                existing_candidate = next(
+                    (
+                        item
+                        for _candidate_score, item in ranked
+                        if str(getattr(item, "track_file_id", "")) == existing_file_id
+                    ),
+                    None,
+                )
+                if existing_candidate is None:
+                    return {"track_id": track.id, "status": "matched", "candidate": None}
+                existing_cover = getattr(existing_candidate, "cover_url", None)
+                if existing_cover and existing_cover != track.cover_url:
+                    await self._repo.update_track_source(
+                        playlist_id, track.id, cover_url=existing_cover
+                    )
+                return {
+                    "track_id": track.id,
+                    "status": "matched",
+                    "candidate": {
+                        **candidate_data,
+                        "cover_url": existing_cover,
+                        "track_file_id": existing_file_id,
+                    },
+                }
             is_confident = (
                 title_score >= 0.92
                 and artist_score >= 0.72
@@ -684,18 +722,30 @@ class PlaylistService:
                 and bool(candidate_data["track_file_id"])
             )
             if is_confident:
-                await self._repo.update_track_source(
-                    playlist_id,
-                    track.id,
-                    source_type="local",
-                    available_sources=["local"],
-                    track_source_id=candidate_data["track_file_id"],
-                    library_file_id=candidate_data["track_file_id"],
-                )
+                if track.source_type in {"", "local"}:
+                    sources = set(track.available_sources or [])
+                    sources.add("local")
+                    await self._repo.update_track_source(
+                        playlist_id,
+                        track.id,
+                        source_type="local",
+                        available_sources=sorted(sources),
+                        track_source_id=candidate_data["track_file_id"],
+                        library_file_id=candidate_data["track_file_id"],
+                        cover_url=candidate_data["cover_url"],
+                    )
+                elif candidate_data["cover_url"]:
+                    await self._repo.update_track_source(
+                        playlist_id, track.id, cover_url=candidate_data["cover_url"]
+                    )
                 return {"track_id": track.id, "status": "matched", "candidate": candidate_data}
             if score >= 0.50 and title_score >= 0.45:
                 return {"track_id": track.id, "status": "close", "candidate": candidate_data}
-            return {"track_id": track.id, "status": "missing", "candidate": None}
+            return {
+                "track_id": track.id,
+                "status": "matched" if already_local else "missing",
+                "candidate": None,
+            }
 
         matches = await asyncio.gather(*(match_one(track) for track in tracks))
         return {
@@ -735,6 +785,7 @@ class PlaylistService:
             available_sources=["local"],
             track_source_id=track_file_id,
             library_file_id=track_file_id,
+            cover_url=getattr(candidate, "cover_url", None),
         )
         if updated is None:
             raise PlaylistNotFoundError(f"Track {track_id} not found in playlist {playlist_id}")

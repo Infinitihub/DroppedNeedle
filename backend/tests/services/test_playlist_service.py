@@ -108,6 +108,7 @@ class TestMatchLibraryTracks:
             artist_name="Artist",
             album_name="Album",
             album_mbid="release-1",
+            cover_url="/api/v1/covers/release-group/release-1?size=300",
             format="flac",
             duration_seconds=180,
         )
@@ -125,6 +126,7 @@ class TestMatchLibraryTracks:
             "library-file-1",
         )
         assert update_call.args[6] == "library-file-1"
+        assert update_call.args[7] == "/api/v1/covers/release-group/release-1?size=300"
 
     @pytest.mark.asyncio
     async def test_close_candidate_is_reported_without_linking(self, tmp_path):
