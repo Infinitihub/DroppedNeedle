@@ -193,6 +193,43 @@ export async function resolvePlaylistSources(id: string): Promise<Record<string,
 	return data.sources;
 }
 
+export interface PlaylistLibraryCandidate {
+	track_file_id: string;
+	title: string;
+	artist_name: string;
+	album_name: string;
+	album_mbid: string | null;
+	format: string;
+	score: number;
+}
+
+export interface PlaylistLibraryMatch {
+	track_id: string;
+	status: 'matched' | 'close' | 'missing';
+	candidate: PlaylistLibraryCandidate | null;
+}
+
+export interface PlaylistLibraryMatchResult {
+	matched: number;
+	close: number;
+	missing: number;
+	tracks: PlaylistLibraryMatch[];
+}
+
+export async function matchPlaylistLibrary(id: string): Promise<PlaylistLibraryMatchResult> {
+	return api.global.post<PlaylistLibraryMatchResult>(API.playlists.matchLibrary(id));
+}
+
+export async function linkPlaylistTrackToLibrary(
+	id: string,
+	trackId: string,
+	trackFileId: string
+): Promise<PlaylistTrack> {
+	return api.global.post<PlaylistTrack>(API.playlists.matchLibraryTrack(id, trackId), {
+		track_file_id: trackFileId
+	});
+}
+
 export interface BatchRequestResult {
 	success: boolean;
 	message: string;

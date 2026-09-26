@@ -4,11 +4,14 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import {
 		deletePlaylist,
+		linkPlaylistTrackToLibrary,
+		matchPlaylistLibrary,
 		resolvePlaylistSources,
 		requestMissingTracks,
 		isRedactedPlaylist,
 		type PlaylistDetail,
 		type PlaylistDetailItem,
+		type PlaylistLibraryMatchResult,
 		type RedactedPlaylist
 	} from '$lib/api/playlists';
 	import { playlistTrackToQueueItem } from '$lib/player/queueHelpers';
@@ -74,6 +77,10 @@
 	});
 
 	let requesting = $state(false);
+	let matchingLibrary = $state(false);
+	let libraryMatch = $state<PlaylistLibraryMatchResult | null>(null);
+	let matchedPlaylistIds = new SvelteSet<string>();
+	let linkingTrackIds = new SvelteSet<string>();
 
 	async function handleRequestMissing() {
 		if (requesting || !playlist) return;
@@ -85,6 +92,61 @@
 			toastStore.show({ message: "Couldn't submit requests", type: 'error' });
 		} finally {
 			requesting = false;
+		}
+	}
+
+	async function matchPlaylistTracks(playlistId: string) {
+		if (matchingLibrary || matchedPlaylistIds.has(playlistId)) return;
+		matchingLibrary = true;
+		try {
+			const result = await matchPlaylistLibrary(playlistId);
+			matchedPlaylistIds.add(playlistId);
+			if (playlist?.id !== playlistId) return;
+			libraryMatch = result;
+			for (const match of result.tracks) {
+				if (match.status !== 'matched' || !match.candidate) continue;
+				const track = playlist.tracks.find((item) => item.id === match.track_id);
+				if (!track) continue;
+				track.source_type = 'local';
+				track.track_source_id = match.candidate.track_file_id;
+				track.library_file_id = match.candidate.track_file_id;
+				track.available_sources = ['local'];
+				track.format = match.candidate.format || track.format;
+			}
+		} catch {
+			toastStore.show({ message: "Couldn't match playlist tracks to your library", type: 'error' });
+		} finally {
+			matchingLibrary = false;
+		}
+	}
+
+	async function acceptLibraryMatch(trackId: string, trackFileId: string) {
+		if (!playlist || !libraryMatch || linkingTrackIds.has(trackId)) return;
+		const selectedMatch = libraryMatch.tracks.find((match) => match.track_id === trackId);
+		linkingTrackIds.add(trackId);
+		try {
+			const updated = await linkPlaylistTrackToLibrary(playlist.id, trackId, trackFileId);
+			const track = playlist.tracks.find((item) => item.id === trackId);
+			if (track) {
+				track.source_type = updated.source_type;
+				track.track_source_id = updated.track_source_id;
+				track.library_file_id = updated.library_file_id;
+				track.available_sources = updated.available_sources;
+				track.format = updated.format || selectedMatch?.candidate?.format || track.format;
+			}
+			libraryMatch = {
+				...libraryMatch,
+				matched: libraryMatch.matched + 1,
+				close: Math.max(0, libraryMatch.close - 1),
+				tracks: libraryMatch.tracks.map((match) =>
+					match.track_id === trackId ? { ...match, status: 'matched' } : match
+				)
+			};
+			toastStore.show({ message: 'Linked track to your library', type: 'success' });
+		} catch {
+			toastStore.show({ message: "Couldn't link that library match", type: 'error' });
+		} finally {
+			linkingTrackIds.delete(trackId);
 		}
 	}
 
@@ -170,6 +232,9 @@
 				// Clone so optimistic child mutations never touch the query cache.
 				playlist = { ...d, tracks: d.tracks.map((t) => ({ ...t })) };
 				void resolveAndCacheSources(d.id);
+				if (d.source_ref?.startsWith('exportify:') && d.is_owner) {
+					void matchPlaylistTracks(d.id);
+				}
 			} else {
 				playlist = null;
 			}
@@ -374,27 +439,106 @@
 				</div>
 			</div>
 
-			{#if isOwner && missingAlbumCount > 0}
+			{#if isOwner && playlist.source_ref?.startsWith('exportify:')}
+				<section class="space-y-3 border-y border-base-300/50 py-4" aria-live="polite">
+					<div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
+						{#if matchingLibrary && !libraryMatch}
+							<span class="inline-flex items-center gap-2 text-base-content/65">
+								<Loader2 class="h-4 w-4 animate-spin" /> Checking your library…
+							</span>
+						{:else if libraryMatch}
+							<span class="font-medium text-success">{libraryMatch.matched} matched</span>
+							<span class="font-medium text-warning">{libraryMatch.close} close matches</span>
+							<span class="text-base-content/65">{libraryMatch.missing} not found</span>
+						{:else}
+							<span class="text-base-content/65">Library matching has not run</span>
+						{/if}
+					</div>
+					{#if libraryMatch?.tracks.some((match) => match.status === 'close' && match.candidate)}
+						<details>
+							<summary class="cursor-pointer text-sm font-semibold">Review close matches</summary>
+							<ul class="mt-2 divide-y divide-base-300/40 text-sm">
+								{#each libraryMatch.tracks.filter((match) => match.status === 'close' && match.candidate) as match (match.track_id)}
+									{@const sourceTrack = playlist.tracks.find(
+										(track) => track.id === match.track_id
+									)}
+									<li class="grid gap-x-3 gap-y-2 py-2 sm:grid-cols-[1fr_1fr_auto] sm:items-center">
+										<span class="min-w-0 truncate text-base-content/65"
+											>{sourceTrack?.artist_name} · {sourceTrack?.track_name}</span
+										>
+										<span class="min-w-0 truncate"
+											>{match.candidate?.artist_name} · {match.candidate?.title}
+											<span class="text-xs text-base-content/50"
+												>({Math.round((match.candidate?.score ?? 0) * 100)}%)</span
+											></span
+										>
+										<button
+											class="btn btn-xs"
+											onclick={() =>
+												void acceptLibraryMatch(match.track_id, match.candidate!.track_file_id)}
+											disabled={linkingTrackIds.has(match.track_id)}
+										>
+											{#if linkingTrackIds.has(match.track_id)}<Loader2
+													class="h-3 w-3 animate-spin"
+												/>{:else}Use this match{/if}
+										</button>
+									</li>
+								{/each}
+							</ul>
+						</details>
+					{/if}
+					{#if libraryMatch?.missing}
+						<details>
+							<summary class="cursor-pointer text-sm font-semibold"
+								>Not found in your library</summary
+							>
+							<ul class="mt-2 max-h-64 divide-y divide-base-300/40 overflow-y-auto text-sm">
+								{#each libraryMatch.tracks.filter((match) => match.status === 'missing') as match (match.track_id)}
+									{@const sourceTrack = playlist.tracks.find(
+										(track) => track.id === match.track_id
+									)}
+									<li class="py-2 text-base-content/70">
+										{sourceTrack?.artist_name} · {sourceTrack?.track_name}
+									</li>
+								{/each}
+							</ul>
+						</details>
+					{/if}
+				</section>
+			{/if}
+
+			{#if isOwner && (missingAlbumCount > 0 || (libraryMatch && libraryMatch.missing + libraryMatch.close > 0))}
 				<div
 					class="flex items-center gap-3 rounded-xl border border-base-300/40 bg-base-200/40 px-4 py-3"
 				>
 					<Download class="h-4 w-4 shrink-0 text-base-content/50" />
 					<p class="flex-1 text-sm text-base-content/70">
-						{missingAlbumCount}
-						{missingAlbumCount === 1 ? 'album' : 'albums'} not in your library
+						{#if playlist.source_ref?.startsWith('exportify:')}
+							{(libraryMatch?.missing ?? 0) + (libraryMatch?.close ?? 0)} songs still need a match
+						{:else}
+							{missingAlbumCount}
+							{missingAlbumCount === 1 ? 'album' : 'albums'} not in your library
+						{/if}
 					</p>
 					<button
 						class="btn btn-accent btn-sm"
 						onclick={() => void handleRequestMissing()}
-						disabled={requesting}
+						disabled={requesting || missingAlbumCount === 0}
 					>
 						{#if requesting}
 							<Loader2 class="h-3.5 w-3.5 animate-spin" />
 						{:else}
 							<Download class="h-3.5 w-3.5" />
 						{/if}
-						Request {missingAlbumCount === 1 ? 'album' : missingAlbumCount + ' albums'}
+						{playlist.source_ref?.startsWith('exportify:')
+							? 'Look for them all'
+							: `Request ${missingAlbumCount === 1 ? 'album' : missingAlbumCount + ' albums'}`}
 					</button>
+					{#if playlist.source_ref?.startsWith('exportify:') && missingAlbumCount === 0}
+						<p class="basis-full text-xs text-base-content/55">
+							No album match is available to search for these tracks yet.
+						</p>
+					{/if}
 				</div>
 			{/if}
 

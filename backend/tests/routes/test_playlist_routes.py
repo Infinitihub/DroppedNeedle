@@ -373,6 +373,54 @@ class TestResolveSources:
         assert resp.status_code == 404
 
 
+class TestMatchPlaylistLibrary:
+    def test_returns_match_counts_and_candidates(self, client, mock_playlist_service):
+        mock_playlist_service.match_library_tracks.return_value = {
+            "matched": 1,
+            "close": 1,
+            "missing": 1,
+            "tracks": [
+                {"track_id": "t-1", "status": "matched", "candidate": None},
+                {"track_id": "t-2", "status": "close", "candidate": {
+                    "track_file_id": "file-1",
+                    "title": "Song",
+                    "artist_name": "Artist",
+                    "album_name": "Album",
+                    "score": 0.8,
+                    "album_mbid": None,
+                    "format": "flac",
+                }},
+                {"track_id": "t-3", "status": "missing", "candidate": None},
+            ],
+        }
+
+        resp = client.post("/playlists/p-1/match-library")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert (data["matched"], data["close"], data["missing"]) == (1, 1, 1)
+        assert data["tracks"][1]["candidate"]["track_file_id"] == "file-1"
+
+
+class TestLinkLocalPlaylistTrack:
+    def test_links_a_confirmed_local_candidate(self, client, mock_playlist_service):
+        updated = _track()
+        updated.source_type = "local"
+        updated.track_source_id = "file-1"
+        updated.library_file_id = "file-1"
+        updated.available_sources = ["local"]
+        mock_playlist_service.link_library_track.return_value = updated
+
+        resp = client.post(
+            "/playlists/p-1/tracks/t-1/match-library",
+            json={"track_file_id": "file-1"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["source_type"] == "local"
+        assert resp.json()["library_file_id"] == "file-1"
+
+
 class TestUpdateTrackSourceResolution:
     def test_returns_updated_track_source_id(self, client, mock_playlist_service):
         updated = _track()

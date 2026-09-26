@@ -12,6 +12,8 @@ from api.v1.schemas.playlists import (
     CoverUploadResponse,
     CreatePlaylistRequest,
     ExportifyImportResponse,
+    LinkLocalTrackRequest,
+    MatchPlaylistLibraryResponse,
     PlaylistDetailResponse,
     PlaylistListResponse,
     PlaylistSummaryResponse,
@@ -361,6 +363,39 @@ async def update_track(
         nd_service=nd_service,
         plex_service=plex_service,
         navidrome_folder_ids=navidrome_folder_ids,
+    )
+    return _track_to_response(result)
+
+
+@router.post(
+    "/{playlist_id}/match-library",
+    response_model=MatchPlaylistLibraryResponse,
+)
+async def match_library_tracks(
+    playlist_id: str,
+    service: PlaylistServiceDep,
+    current_user: CurrentUserDep,
+    local_service: LocalFilesServiceDep,
+) -> MatchPlaylistLibraryResponse:
+    return MatchPlaylistLibraryResponse(**await service.match_library_tracks(
+        playlist_id, current_user, local_service
+    ))
+
+
+@router.post(
+    "/{playlist_id}/tracks/{track_id}/match-library",
+    response_model=PlaylistTrackResponse,
+)
+async def link_library_track(
+    playlist_id: str,
+    track_id: str,
+    service: PlaylistServiceDep,
+    current_user: CurrentUserDep,
+    local_service: LocalFilesServiceDep,
+    body: LinkLocalTrackRequest = MsgSpecBody(LinkLocalTrackRequest),
+) -> PlaylistTrackResponse:
+    result = await service.link_library_track(
+        playlist_id, track_id, body.track_file_id, current_user, local_service
     )
     return _track_to_response(result)
 

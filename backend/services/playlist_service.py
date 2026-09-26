@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import unicodedata
 from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -76,6 +77,7 @@ MAX_NAME_LENGTH = 100
 # round-trips and made big playlists appear to hang. Bound the fan-out so we
 # don't hammer Navidrome/Plex/Jellyfin all at once.
 _ALBUM_RESOLVE_CONCURRENCY = 8
+_LIBRARY_MATCH_CONCURRENCY = 8
 
 _SOURCE_TYPE_ALIASES = {
     "local": "local",
@@ -133,6 +135,24 @@ def _fuzzy_name_match(name1: str, name2: str) -> bool:
     if n1 in n2 or n2 in n1:
         return True
     return SequenceMatcher(None, n1, n2).ratio() > 0.6
+
+
+def _match_text(value: str | None) -> str:
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    return "".join(char for char in decomposed.casefold() if char.isalnum())
+
+
+def _library_candidate_score(track: PlaylistTrackRecord, candidate: object) -> tuple[float, float, float]:
+    title_score = SequenceMatcher(
+        None, _match_text(track.track_name), _match_text(getattr(candidate, "title", ""))
+    ).ratio()
+    artist_score = SequenceMatcher(
+        None, _match_text(track.artist_name), _match_text(getattr(candidate, "artist_name", ""))
+    ).ratio()
+    album_score = SequenceMatcher(
+        None, _match_text(track.album_name), _match_text(getattr(candidate, "album_name", ""))
+    ).ratio()
+    return title_score * 0.65 + artist_score * 0.25 + album_score * 0.10, title_score, artist_score
 
 
 class PlaylistService:
@@ -602,6 +622,123 @@ class PlaylistService:
         user_id: str | None = None,
     ) -> dict[str, list[int]]:
         return await self._repo.check_track_membership(tracks, user_id)
+
+    async def match_library_tracks(
+        self,
+        playlist_id: str,
+        requesting: UserRecord,
+        local_service: object,
+    ) -> dict[str, Any]:
+        await self._load_owned_or_raise(playlist_id, requesting)
+        tracks = await self._repo.get_tracks(playlist_id)
+        semaphore = asyncio.Semaphore(_LIBRARY_MATCH_CONCURRENCY)
+
+        async def match_one(track: PlaylistTrackRecord) -> dict[str, Any]:
+            if track.library_file_id or track.source_type == "local":
+                return {"track_id": track.id, "status": "matched", "candidate": None}
+            if track.source_type or track.available_sources:
+                return {"track_id": track.id, "status": "matched", "candidate": None}
+
+            search_tracks = getattr(local_service, "search_tracks", None)
+            if not callable(search_tracks):
+                return {"track_id": track.id, "status": "missing", "candidate": None}
+            async with semaphore:
+                try:
+                    candidates = await search_tracks(track.track_name, limit=30)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Playlist library search failed for track %s", track.id, exc_info=True)
+                    candidates = []
+
+            ranked = sorted(
+                (
+                    (_library_candidate_score(track, candidate), candidate)
+                    for candidate in candidates
+                ),
+                key=lambda item: item[0][0],
+                reverse=True,
+            )
+            if not ranked:
+                return {"track_id": track.id, "status": "missing", "candidate": None}
+
+            (score, title_score, artist_score), best = ranked[0]
+            duration = track.duration
+            candidate_duration = getattr(best, "duration_seconds", None)
+            duration_compatible = (
+                duration is None
+                or candidate_duration is None
+                or abs(duration - candidate_duration) <= max(5, duration * 0.08)
+            )
+            candidate_data = {
+                "track_file_id": str(getattr(best, "track_file_id", "")),
+                "title": getattr(best, "title", ""),
+                "artist_name": getattr(best, "artist_name", ""),
+                "album_name": getattr(best, "album_name", ""),
+                "album_mbid": getattr(best, "album_mbid", None),
+                "format": getattr(best, "format", ""),
+                "score": round(score, 3),
+            }
+            is_confident = (
+                title_score >= 0.92
+                and artist_score >= 0.72
+                and duration_compatible
+                and bool(candidate_data["track_file_id"])
+            )
+            if is_confident:
+                await self._repo.update_track_source(
+                    playlist_id,
+                    track.id,
+                    source_type="local",
+                    available_sources=["local"],
+                    track_source_id=candidate_data["track_file_id"],
+                    library_file_id=candidate_data["track_file_id"],
+                )
+                return {"track_id": track.id, "status": "matched", "candidate": candidate_data}
+            if score >= 0.50 and title_score >= 0.45:
+                return {"track_id": track.id, "status": "close", "candidate": candidate_data}
+            return {"track_id": track.id, "status": "missing", "candidate": None}
+
+        matches = await asyncio.gather(*(match_one(track) for track in tracks))
+        return {
+            "matched": sum(match["status"] == "matched" for match in matches),
+            "close": sum(match["status"] == "close" for match in matches),
+            "missing": sum(match["status"] == "missing" for match in matches),
+            "tracks": matches,
+        }
+
+    async def link_library_track(
+        self,
+        playlist_id: str,
+        track_id: str,
+        track_file_id: str,
+        requesting: UserRecord,
+        local_service: object,
+    ) -> PlaylistTrackRecord:
+        await self._load_owned_or_raise(playlist_id, requesting)
+        track = await self._repo.get_track(playlist_id, track_id)
+        if track is None:
+            raise PlaylistNotFoundError(f"Track {track_id} not found in playlist {playlist_id}")
+        candidates = await local_service.search_tracks(track.track_name, limit=30)
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if str(getattr(item, "track_file_id", "")) == track_file_id
+            ),
+            None,
+        )
+        if candidate is None:
+            raise InvalidPlaylistDataError("That library match is no longer available")
+        updated = await self._repo.update_track_source(
+            playlist_id,
+            track_id,
+            source_type="local",
+            available_sources=["local"],
+            track_source_id=track_file_id,
+            library_file_id=track_file_id,
+        )
+        if updated is None:
+            raise PlaylistNotFoundError(f"Track {track_id} not found in playlist {playlist_id}")
+        return updated
 
     async def resolve_track_sources(
         self,

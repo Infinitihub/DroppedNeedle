@@ -18,6 +18,7 @@ const mockUploadPlaylistCover = vi.fn();
 const mockDeletePlaylistCover = vi.fn();
 const mockCheckTrackMembership = vi.fn();
 const mockResolvePlaylistSources = vi.fn();
+const mockMatchPlaylistLibrary = vi.fn();
 
 vi.mock('$lib/api/playlists', () => ({
 	queueItemToTrackData: (item: unknown) => item,
@@ -36,6 +37,8 @@ vi.mock('$lib/api/playlists', () => ({
 	deletePlaylistCover: (...args: unknown[]) => mockDeletePlaylistCover(...args),
 	checkTrackMembership: (...args: unknown[]) => mockCheckTrackMembership(...args),
 	resolvePlaylistSources: (...args: unknown[]) => mockResolvePlaylistSources(...args),
+	matchPlaylistLibrary: (...args: unknown[]) => mockMatchPlaylistLibrary(...args),
+	linkPlaylistTrackToLibrary: vi.fn(),
 	requestMissingTracks: vi.fn()
 }));
 
@@ -182,6 +185,7 @@ describe('Playlist detail page', () => {
 		mockDeletePlaylistCover.mockReset();
 		mockResolvePlaylistSources.mockReset();
 		mockResolvePlaylistSources.mockResolvedValue({});
+		mockMatchPlaylistLibrary.mockReset();
 		mockToastShow.mockReset();
 		mockPlayQueue.mockReset();
 		mockAddToQueue.mockReset();
@@ -355,6 +359,42 @@ describe('Playlist detail page', () => {
 		await vi.waitFor(() => {
 			expect(mockResolvePlaylistSources).toHaveBeenCalledWith('pl-1');
 		});
+	});
+
+	it('shows CSV library match counts and review sections', async () => {
+		detailQuery.data = makePlaylist({ source_ref: 'exportify:test-csv' });
+		mockMatchPlaylistLibrary.mockResolvedValue({
+			matched: 1,
+			close: 1,
+			missing: 1,
+			tracks: [
+				{ track_id: 'trk-1', status: 'matched', candidate: null },
+				{
+					track_id: 'trk-2',
+					status: 'close',
+					candidate: {
+						track_file_id: 'file-2',
+						title: 'Second Track Live',
+						artist_name: 'Other Artist',
+						album_name: 'Test Album',
+						album_mbid: null,
+						format: 'flac',
+						score: 0.82
+					}
+				},
+				{ track_id: 'trk-3', status: 'missing', candidate: null }
+			]
+		});
+		renderDetail('pl-1');
+
+		await vi.waitFor(() => {
+			expect(mockMatchPlaylistLibrary).toHaveBeenCalledWith('pl-1');
+		});
+		await expect.element(page.getByText('1 matched')).toBeVisible();
+		await expect.element(page.getByText('1 close matches')).toBeVisible();
+		await expect.element(page.getByText('1 not found')).toBeVisible();
+		await expect.element(page.getByText('Review close matches')).toBeVisible();
+		await expect.element(page.getByText('Not found in your library')).toBeVisible();
 	});
 
 	it('shows play button on track hover with correct aria label', async () => {

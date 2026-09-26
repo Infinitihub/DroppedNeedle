@@ -84,6 +84,33 @@ class ExportifyImportResponse(AppStruct):
     playlist_id: str
 
 
+class PlaylistLibraryCandidate(AppStruct):
+    track_file_id: str
+    title: str
+    artist_name: str
+    album_name: str
+    score: float
+    album_mbid: str | None = None
+    format: str = ""
+
+
+class PlaylistLibraryMatch(AppStruct):
+    track_id: str
+    status: str
+    candidate: PlaylistLibraryCandidate | None = None
+
+
+class MatchPlaylistLibraryResponse(AppStruct):
+    matched: int
+    close: int
+    missing: int
+    tracks: list[PlaylistLibraryMatch] = msgspec.field(default_factory=list)
+
+
+class LinkLocalTrackRequest(AppStruct):
+    track_file_id: str
+
+
 class UpdatePlaylistRequest(AppStruct):
     name: str | None = None
 

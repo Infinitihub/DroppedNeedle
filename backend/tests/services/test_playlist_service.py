@@ -92,6 +92,90 @@ class TestGetPlaylist:
             await service.get_playlist("nonexistent")
 
 
+class TestMatchLibraryTracks:
+    @pytest.mark.asyncio
+    async def test_confident_match_is_linked_to_local_file(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track()
+        track.source_type = ""
+        track.available_sources = None
+        track.track_name = "Song"
+        track.duration = 180
+        repo.get_tracks.return_value = [track]
+        candidate = SimpleNamespace(
+            track_file_id="library-file-1",
+            title="Song",
+            artist_name="Artist",
+            album_name="Album",
+            album_mbid="release-1",
+            format="flac",
+            duration_seconds=180,
+        )
+        local_service = SimpleNamespace(search_tracks=AsyncMock(return_value=[candidate]))
+
+        result = await service.match_library_tracks("p-1", _OWNER, local_service)
+
+        assert (result["matched"], result["close"], result["missing"]) == (1, 0, 0)
+        update_call = repo.update_track_source.call_args
+        assert update_call.args[:5] == (
+            "p-1",
+            "t-1",
+            "local",
+            ["local"],
+            "library-file-1",
+        )
+        assert update_call.args[6] == "library-file-1"
+
+    @pytest.mark.asyncio
+    async def test_close_candidate_is_reported_without_linking(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track()
+        track.source_type = ""
+        track.available_sources = None
+        track.track_name = "Song"
+        track.duration = 180
+        repo.get_tracks.return_value = [track]
+        candidate = SimpleNamespace(
+            track_file_id="library-file-1",
+            title="Song Live",
+            artist_name="Artist",
+            album_name="Album",
+            album_mbid="release-1",
+            format="flac",
+            duration_seconds=180,
+        )
+        local_service = SimpleNamespace(search_tracks=AsyncMock(return_value=[candidate]))
+
+        result = await service.match_library_tracks("p-1", _OWNER, local_service)
+
+        assert (result["matched"], result["close"], result["missing"]) == (0, 1, 0)
+        assert result["tracks"][0]["candidate"]["track_file_id"] == "library-file-1"
+        repo.update_track_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_can_confirm_a_library_candidate(self, tmp_path):
+        service, repo = _make_service(tmp_path)
+        track = _make_track()
+        track.source_type = ""
+        repo.get_track.return_value = track
+        candidate = SimpleNamespace(track_file_id="library-file-1")
+        local_service = SimpleNamespace(search_tracks=AsyncMock(return_value=[candidate]))
+
+        await service.link_library_track(
+            "p-1", "t-1", "library-file-1", _OWNER, local_service
+        )
+
+        update_call = repo.update_track_source.call_args
+        assert update_call.args[:5] == (
+            "p-1",
+            "t-1",
+            "local",
+            ["local"],
+            "library-file-1",
+        )
+        assert update_call.args[6] == "library-file-1"
+
+
 class TestUpdatePlaylist:
     @pytest.mark.asyncio
     async def test_valid_update(self, tmp_path):

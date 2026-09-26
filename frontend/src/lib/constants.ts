@@ -705,6 +705,9 @@ export const API = {
 		deleteCover: (id: string) => `/api/v1/playlists/${id}/cover`,
 		checkTracks: () => '/api/v1/playlists/check-tracks',
 		resolveSources: (id: string) => `/api/v1/playlists/${id}/resolve-sources`,
+		matchLibrary: (id: string) => `/api/v1/playlists/${id}/match-library`,
+		matchLibraryTrack: (id: string, trackId: string) =>
+			`/api/v1/playlists/${id}/tracks/${trackId}/match-library`,
 		share: (id: string) => `/api/v1/playlists/${id}/share`,
 		requestMissing: (id: string) => `/api/v1/playlists/${id}/request-missing`
 	},
