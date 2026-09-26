@@ -217,6 +217,7 @@ from .service_providers import (  # noqa: F401
     get_spotify_import_service,
     get_exportify_import_service,
     get_target_spotify_import_service,
+    get_target_exportify_import_service,
     get_scrobble_service,
     get_discover_service,
     get_target_discover_service,

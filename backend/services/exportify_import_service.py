@@ -78,8 +78,16 @@ def parse_exportify_csv(data: bytes) -> list[dict[str, Any]]:
 
 
 class ExportifyImportService:
-    def __init__(self, playlist_repo, mb_repo, playlist_service) -> None:
-        self._async_repo = AsyncPlaylistRepository(playlist_repo)
+    def __init__(
+        self, playlist_repo, mb_repo, playlist_service, async_playlist_repo=None
+    ) -> None:
+        if async_playlist_repo is None and playlist_repo is None:
+            raise ValueError("A playlist repository is required.")
+        self._async_repo = (
+            async_playlist_repo
+            if async_playlist_repo is not None
+            else AsyncPlaylistRepository(playlist_repo)
+        )
         self._mb_repo = mb_repo
         self._playlist_service = playlist_service
 

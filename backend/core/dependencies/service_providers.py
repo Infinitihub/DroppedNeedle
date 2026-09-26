@@ -2220,6 +2220,20 @@ def get_target_spotify_import_service() -> "SpotifyImportService":
 
 
 @singleton
+def get_target_exportify_import_service():
+    from services.exportify_import_service import ExportifyImportService
+    from .compat_providers import get_target_consumer_composition
+
+    target = get_target_consumer_composition()
+    return ExportifyImportService(
+        playlist_repo=None,
+        mb_repo=get_musicbrainz_repository(),
+        playlist_service=target.playlists,
+        async_playlist_repo=target.playlist_repository,
+    )
+
+
+@singleton
 def get_scrobble_service() -> "ScrobbleService":
     from services.scrobble_service import ScrobbleService
 

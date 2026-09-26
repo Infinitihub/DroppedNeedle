@@ -15,6 +15,7 @@ from core.dependencies import (
     get_discovery_batch_service,
     get_download_service,
     get_drop_import_service,
+    get_exportify_import_service,
     get_events_watcher_getter,
     get_free_music_service,
     get_home_charts_service,
@@ -38,6 +39,7 @@ from core.dependencies import (
     get_target_discovery_batch_service,
     get_target_download_service,
     get_target_drop_import_service,
+    get_target_exportify_import_service,
     get_target_events_watcher_service,
     get_target_free_music_service,
     get_target_home_charts_service,
@@ -213,6 +215,10 @@ def test_isolated_target_application_mounts_target_catalog_and_compat_routes() -
     assert (
         app.dependency_overrides[get_spotify_import_service]
         is get_target_spotify_import_service
+    )
+    assert (
+        app.dependency_overrides[get_exportify_import_service]
+        is get_target_exportify_import_service
     )
     assert app.dependency_overrides[get_cache_service] is get_target_cache_service
     assert app.dependency_overrides[get_wrapped_service] is get_target_wrapped_service
