@@ -20,7 +20,8 @@
 	const shouldRedirect = $derived(
 		localAlbum !== undefined &&
 		localAlbum.id !== data.albumId &&
-		providerAlbumId !== null
+		providerAlbumId !== null &&
+		providerAlbumId.toLowerCase() !== data.albumId.toLowerCase()
 	);
 
 	$effect(() => {

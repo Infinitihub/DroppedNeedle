@@ -66,6 +66,30 @@ it('keeps a linked album on its MusicBrainz release-group route', async () => {
 	expect(h.localView).not.toHaveBeenCalled();
 });
 
+it('shows a linked album on its MusicBrainz route without redirecting to itself', async () => {
+	await render(AlbumPage, {
+		props: { data: { albumId: 'provider-album-id' } }
+	} as unknown as Parameters<typeof render>[1]);
+
+	await vi.waitFor(() =>
+		expect(h.providerView).toHaveBeenCalledWith(expect.objectContaining({ localAlbum: h.album }))
+	);
+	expect(h.goto).not.toHaveBeenCalled();
+	expect(h.localView).not.toHaveBeenCalled();
+});
+
+it('redirects a retired local album id to its MusicBrainz route', async () => {
+	await render(AlbumPage, {
+		props: { data: { albumId: 'retired-album-id' } }
+	} as unknown as Parameters<typeof render>[1]);
+
+	await vi.waitFor(() =>
+		expect(h.goto).toHaveBeenCalledWith(expect.stringContaining('provider-album-id'), {
+			replaceState: true
+		})
+	);
+});
+
 it('mounts the provider once when local detail returns 404', async () => {
 	h.localDetail404 = true;
 	await render(AlbumPage, {
