@@ -74,7 +74,7 @@
 			<h1 class="text-3xl font-bold">Full Albums</h1>
 			<p class="mt-1 text-sm text-base-content/70">
 				{total}
-				{total === 1 ? 'album' : 'albums'}
+				{total === 1 ? 'album' : 'albums'}. Use the Full checkbox on an album to include it here.
 			</p>
 		</div>
 	</div>

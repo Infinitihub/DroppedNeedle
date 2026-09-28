@@ -1,4 +1,5 @@
 import type { MusicSource } from './stores/musicSource';
+import type { RequestKind } from './types';
 
 export const AUTH_FREE_PATHS = ['/login', '/setup', '/auth/callback', '/recover-password'];
 
@@ -86,6 +87,7 @@ const CACHE_TTL_GROUPS = {
 		ALBUM_DETAIL_LASTFM: 30 * 60 * 1000,
 		ALBUM_DETAIL_YOUTUBE: 60 * 60 * 1000,
 		ALBUM_DETAIL_SOURCE_MATCH: 5 * 60 * 1000,
+		ALBUM_DETAIL_EDITIONS: 5 * 60 * 1000,
 		ARTIST_DETAIL_BASIC: 5 * 60 * 1000,
 		ARTIST_DETAIL_EXTENDED: 30 * 60 * 1000,
 		ARTIST_DETAIL_LASTFM: 30 * 60 * 1000,
@@ -128,11 +130,15 @@ export const STATUS_COLORS = {
 } as const;
 
 export const YOUTUBE_PLAYER_ELEMENT_ID = 'yt-player-embed';
+const requestKindQuery = (requestKind: RequestKind = 'album') =>
+	`?request_kind=${encodeURIComponent(requestKind)}`;
 
 export const API = {
 	auth: {
 		setupStatus: () => '/api/v1/auth/setup/status',
 		me: () => '/api/v1/auth/me',
+		deviceSessions: () => '/api/v1/auth/device-sessions',
+		logout: () => '/api/v1/auth/logout',
 		passwordRecoveryReset: () => '/api/v1/auth/password-recovery/reset',
 		adminPasswordRecovery: (userId: string) =>
 			`/api/v1/auth/admin/users/${encodeURIComponent(userId)}/password-recovery`
@@ -159,6 +165,9 @@ export const API = {
 			return `/api/v1/artists/${id}/purchase-options?${params.toString()}`;
 		}
 	},
+	events: {
+		stream: () => '/api/v1/events/stream'
+	},
 	following: {
 		artists: () => '/api/v1/following/artists',
 		newReleases: (limit: number, offset: number) =>
@@ -167,7 +176,6 @@ export const API = {
 			`/api/v1/following/new-releases/recent?days=${days}&limit=${limit}&include_owned=${includeOwned}`,
 		newReleasesUnseenCount: () => '/api/v1/following/new-releases/unseen-count',
 		markNewReleasesSeen: () => '/api/v1/following/new-releases/seen',
-		events: () => '/api/v1/following/events',
 		concerts: () => '/api/v1/following/concerts',
 		concertCities: () => '/api/v1/following/concerts/cities',
 		concertCitySearch: (q: string) =>
@@ -189,6 +197,7 @@ export const API = {
 			if (format) url += `&format=${encodeURIComponent(format)}`;
 			return url;
 		},
+		markAlbumFull: (albumId: string) => `/api/v1/library/albums/${albumId}/full`,
 		fullAlbums: (page = 1, sort = 'recent', q?: string, format?: string, pageSize = 50) => {
 			let url = `/api/v1/library/full-albums?page=${page}&page_size=${pageSize}&sort=${sort}`;
 			if (q) url += `&q=${encodeURIComponent(q)}`;
@@ -287,11 +296,7 @@ export const API = {
 		},
 		trackTags: (fileId: string) => `/api/v1/library/tracks/${fileId}/tags`,
 		removeTrack: (fileId: string) => `/api/v1/library/tracks/${fileId}`,
-		scanCancel: () => '/api/v1/library/scan/cancel',
-		scanStream: () => '/api/v1/library/scan/stream',
 		activity: () => '/api/v1/library/activity',
-		activityStream: () => '/api/v1/library/activity/stream',
-		operationsStream: () => '/api/v1/library/operations/stream',
 		pauseIdentification: () => '/api/v1/library/identification/pause',
 		resumeIdentification: () => '/api/v1/library/identification/resume',
 		scanRuns: (limit?: number, cursor?: string) => {
@@ -329,6 +334,8 @@ export const API = {
 				policy?: string;
 				search?: string;
 				sort?: string;
+				candidateAvailable?: boolean;
+				exclude_active_jobs?: boolean;
 			} = {}
 		) => {
 			const query = new URLSearchParams();
@@ -340,6 +347,8 @@ export const API = {
 			if (params.policy) query.set('policy', params.policy);
 			if (params.search) query.set('search', params.search);
 			if (params.sort) query.set('sort', params.sort);
+			if (params.candidateAvailable) query.set('candidate_available', 'true');
+			if (params.exclude_active_jobs) query.set('exclude_active_jobs', 'true');
 			return `/api/v1/library/reviews${query.size ? `?${query.toString()}` : ''}`;
 		},
 		review: (reviewId: string) => `/api/v1/library/reviews/${reviewId}`,
@@ -455,10 +464,9 @@ export const API = {
 			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/apply`,
 		discardIdentityPreparation: (jobId: string) =>
 			`/api/v1/library/management/identity-preparations/${encodeURIComponent(jobId)}/discard`,
+		undoAutomaticEdition: (albumId: string) =>
+			`/api/v1/library/albums/${encodeURIComponent(albumId)}/undo-automatic-edition`,
 		scanDiagnostics: (runId: string) => `/api/v1/library/scan-runs/${runId}/diagnostics`,
-		unmatched: () => '/api/v1/library/scan/unmatched',
-		resolveUnmatched: (id: number) => `/api/v1/library/scan/unmatched/${id}/resolve`,
-		resolveUnmatchedBatch: () => '/api/v1/library/scan/unmatched/resolve-batch',
 		settings: () => '/api/v1/settings/library',
 		typedSettings: () => '/api/v1/settings/library/roots',
 		policyTree: () => '/api/v1/settings/library/policy-tree',
@@ -491,6 +499,7 @@ export const API = {
 		activationPreview: (jobId: string) =>
 			`/api/v1/settings/library-management/activation-previews/${encodeURIComponent(jobId)}`,
 		activationConfirmations: () => '/api/v1/settings/library-management/activation-confirmations',
+		activationHealth: () => '/api/v1/settings/library-management/activation-health',
 		previews: () => '/api/v1/library/management/previews',
 		tagEditor: (trackId: string) =>
 			`/api/v1/library/management/tracks/${encodeURIComponent(trackId)}/tag-editor`,
@@ -500,9 +509,13 @@ export const API = {
 		baselinePurgeImpact: () => '/api/v1/library/management/baselines/purge-impact',
 		purgeBaselines: () => '/api/v1/library/management/baselines/purge',
 		recoveryDiagnostics: () => '/api/v1/library/management/recovery/diagnostics',
+		resolveImportBundle: (bundleId: string) =>
+			`/api/v1/library/management/recovery/import-bundles/${encodeURIComponent(bundleId)}/resolve`,
 		preview: (jobId: string) => `/api/v1/library/management/previews/${encodeURIComponent(jobId)}`,
 		applyPreview: (jobId: string) =>
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/apply`,
+		reissuePreview: (jobId: string) =>
+			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/reissue`,
 		discardPreview: (jobId: string) =>
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/discard`,
 		operations: (
@@ -580,16 +593,22 @@ export const API = {
 			`/api/v1/library/management/previews/${encodeURIComponent(jobId)}/items/${ordinal}/artwork/${encodeURIComponent(sha256)}`
 	},
 	search: {
-		artists: (query: string, limit = 50) =>
-			`/api/v1/search/artists?q=${encodeURIComponent(query)}&limit=${limit}`,
-		albums: (query: string, limit = 50) =>
-			`/api/v1/search/albums?q=${encodeURIComponent(query)}&limit=${limit}`,
+		artists: (query: string, limit = 50, offset = 0) =>
+			`/api/v1/search/artists?q=${encodeURIComponent(query)}&limit=${limit}${offset ? `&offset=${offset}` : ''}`,
+		albums: (query: string, limit = 50, offset = 0) =>
+			`/api/v1/search/albums?q=${encodeURIComponent(query)}&limit=${limit}${offset ? `&offset=${offset}` : ''}`,
 		enrichment: () => '/api/v1/search/enrich/batch',
 		suggest: (query: string, limit = 5) =>
 			`/api/v1/search/suggest?q=${encodeURIComponent(query.trim())}&limit=${limit}`
 	},
 	system: {
-		health: () => '/api/v1/system/health'
+		health: () => '/api/v1/system/health',
+		queueStats: () => '/api/v1/system/queue-stats',
+		providerStats: () => '/api/v1/system/provider-stats'
+	},
+	cacheSync: {
+		status: () => '/api/v1/cache/sync/status',
+		cancel: () => '/api/v1/cache/sync/cancel'
 	},
 	home: () => '/api/v1/home',
 	homeGenre: (genre: string, limit = 50, artistOffset = 0, albumOffset = 0) => {
@@ -603,6 +622,8 @@ export const API = {
 	homeIntegrationStatus: () => '/api/v1/home/integration-status',
 	discover: () => '/api/v1/discover',
 	discoverRefresh: () => '/api/v1/discover/refresh',
+	discoverActivity: () => '/api/v1/discover/activity',
+	discoverQueuePreview: (mbid: string) => `/api/v1/discover/queue/preview/${mbid}`,
 	discoverQueue: () => '/api/v1/discover/queue',
 	discoverQueueStatus: () => '/api/v1/discover/queue/status',
 	discoverQueueGenerate: () => '/api/v1/discover/queue/generate',
@@ -646,6 +667,7 @@ export const API = {
 	settingsPrimarySource: () => '/api/v1/settings/primary-source',
 	settingsNavidrome: () => '/api/v1/settings/navidrome',
 	settingsNavidromeVerify: () => '/api/v1/settings/navidrome/verify',
+	settingsNavidromePlaylistSync: () => '/api/v1/settings/navidrome/playlist-sync',
 	settingsPlex: () => '/api/v1/settings/plex',
 	settingsPlexVerify: () => '/api/v1/settings/plex/verify',
 	settingsPlexLibraries: () => '/api/v1/settings/plex/libraries',
@@ -654,7 +676,12 @@ export const API = {
 	settingsLocalFiles: () => '/api/v1/settings/local-files',
 	settingsLocalFilesVerify: () => '/api/v1/settings/local-files/verify',
 	settingsMusicbrainz: () => '/api/v1/settings/musicbrainz',
+	settingsMusicbrainzBrainzMashStage: () => '/api/v1/settings/musicbrainz/brainzmash/stage',
+	settingsMusicbrainzBrainzMashConsent: () => '/api/v1/settings/musicbrainz/brainzmash/consent',
 	settingsMusicbrainzVerify: () => '/api/v1/settings/musicbrainz/verify',
+	settingsMusicbrainzActivate: () => '/api/v1/settings/musicbrainz/activate',
+	settingsSpotify: () => '/api/v1/settings/spotify',
+	settingsSpotifyRedirectUri: () => '/api/v1/settings/spotify/redirect-uri',
 	settingsGetIt: () => '/api/v1/settings/get-it',
 	settingsFreeMusic: () => '/api/v1/settings/free-music',
 	profile: {
@@ -691,8 +718,7 @@ export const API = {
 		submit: () => '/api/v1/scrobble/submit'
 	},
 	nowPlaying: {
-		report: () => '/api/v1/now-playing',
-		events: () => '/api/v1/now-playing/events'
+		report: () => '/api/v1/now-playing'
 	},
 	playlists: {
 		list: () => '/api/v1/playlists',
@@ -734,8 +760,9 @@ export const API = {
 	},
 	download: {
 		localTrack: (trackId: string) => `/api/v1/download/local/track/${trackId}`,
-		localAlbum: (albumId: number) => `/api/v1/download/local/album/${albumId}`,
-		localAlbumByMbid: (mbid: string) => `/api/v1/download/local/album/mbid/${mbid}`
+		localAlbum: (albumId: string) => `/api/v1/download/local/album/${albumId}`,
+		localAlbumByMbid: (mbid: string) => `/api/v1/download/local/album/mbid/${mbid}`,
+		access: () => '/api/v1/download/access'
 	},
 	downloadClient: {
 		config: () => '/api/v1/download-client/config',
@@ -748,12 +775,16 @@ export const API = {
 		update: (id: string) => `/api/v1/indexers/${id}`,
 		remove: (id: string) => `/api/v1/indexers/${id}`,
 		reorder: () => '/api/v1/indexers/reorder',
-		test: () => '/api/v1/indexers/test'
+		test: () => '/api/v1/indexers/test',
+		searchBackend: () => '/api/v1/indexers/search-backend'
+	},
+	prowlarr: {
+		config: () => '/api/v1/prowlarr/config',
+		test: () => '/api/v1/prowlarr/test'
 	},
 	lidarrImport: {
 		config: () => '/api/v1/lidarr-import/config',
 		test: () => '/api/v1/lidarr-import/test',
-		status: () => '/api/v1/lidarr-import/status',
 		artists: () => '/api/v1/lidarr-import/artists',
 		import: () => '/api/v1/lidarr-import/import'
 	},
@@ -768,8 +799,12 @@ export const API = {
 	plugins: {
 		list: () => '/api/v1/plugins',
 		install: () => '/api/v1/plugins/install',
-		update: (name: string) => `/api/v1/plugins/${name}`,
-		uninstall: (name: string) => `/api/v1/plugins/${name}`
+		sources: () => '/api/v1/plugins/sources',
+		ext: (name: string, subpath: string) =>
+			`/api/v1/plugins/ext/${encodeURIComponent(name)}/${subpath.replace(/^\/+/, '')}`,
+		uiBundle: (name: string) => `/api/v1/plugins/${encodeURIComponent(name)}/ui/panel.js`,
+		update: (name: string) => `/api/v1/plugins/${encodeURIComponent(name)}`,
+		uninstall: (name: string) => `/api/v1/plugins/${encodeURIComponent(name)}`
 	},
 	dropImport: {
 		uploads: () => '/api/v1/import/uploads',
@@ -781,7 +816,11 @@ export const API = {
 	downloadClients: {
 		sabnzbd: () => '/api/v1/download-clients/sabnzbd',
 		sabnzbdTest: () => '/api/v1/download-clients/sabnzbd/test',
+		sabnzbdStatus: () => '/api/v1/download-clients/sabnzbd/status',
 		policy: () => '/api/v1/download-clients/policy',
+		policySave: () => '/api/v1/download-clients/policy',
+		policySummary: () => '/api/v1/download-clients/policy-summary',
+		policyImpact: () => '/api/v1/download-clients/policy/impact',
 		sourcePriority: () => '/api/v1/download-clients/source-priority',
 		wanted: () => '/api/v1/download-clients/wanted'
 	},
@@ -796,6 +835,8 @@ export const API = {
 		activitySummary: () => '/api/v1/downloads/activity-summary',
 		searchAlbum: () => '/api/v1/downloads/search/album',
 		searchJob: (jobId: string) => `/api/v1/downloads/search/${jobId}`,
+		restartWithPolicy: (taskId: string) =>
+			`/api/v1/downloads/${taskId}/restart-with-current-policy`,
 		pick: (jobId: string) => `/api/v1/downloads/search/${jobId}/pick`,
 		dismissReview: (jobId: string) => `/api/v1/downloads/search/${jobId}/dismiss`,
 		cancelSearch: (jobId: string) => `/api/v1/downloads/search/${jobId}/cancel`,
@@ -826,9 +867,12 @@ export const API = {
 		},
 		heldImport: (id: number) => `/api/v1/downloads/held/${id}/import`,
 		heldDiscard: (id: number) => `/api/v1/downloads/held/${id}/discard`,
+		heldReverify: (id: number) => `/api/v1/downloads/held/${id}/reverify`,
+		heldReverifyBulk: () => '/api/v1/downloads/held/reverify',
 		heldManagementRetry: (taskId: string) => `/api/v1/downloads/held/management/${taskId}/retry`,
 		heldManagementDiscard: (taskId: string) =>
 			`/api/v1/downloads/held/management/${taskId}/discard`,
+		heldVerdictDiscard: (taskId: string) => `/api/v1/downloads/held/verdict/${taskId}/discard`,
 		heldAudio: (id: number) => `/api/v1/downloads/held/${id}/audio`,
 		reimport: (taskId: string) => `/api/v1/downloads/${taskId}/reimport`,
 		cutoffUnmet: () => '/api/v1/downloads/cutoff-unmet',
@@ -837,6 +881,24 @@ export const API = {
 	},
 	requests: {
 		new: () => '/api/v1/requests/new',
+		active: () => '/api/v1/requests/active',
+		history: (page = 1, pageSize = 20, status?: string, sort?: string) => {
+			const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+			if (status) params.set('status', status);
+			if (sort) params.set('sort', sort);
+			return `/api/v1/requests/history?${params.toString()}`;
+		},
+		pendingApprovals: () => '/api/v1/requests/pending-approvals',
+		cancel: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/active/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		retry: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/retry/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		clearHistoryItem: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/history/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		approve: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/approve/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
+		reject: (musicbrainzId: string, requestKind: RequestKind = 'album') =>
+			`/api/v1/requests/reject/${encodeURIComponent(musicbrainzId)}${requestKindQuery(requestKind)}`,
 		pendingApprovalCount: () => '/api/v1/requests/pending-approvals/count',
 		autoDownloadApprovals: () => '/api/v1/requests/auto-download-approvals',
 		approveAutoDownload: (userId: string, mbid: string) =>
@@ -1072,3 +1134,7 @@ export const API = {
 		decades: () => '/api/v1/local/decades'
 	}
 } as const;
+
+// URL builder for the admin-only plugin UI bundle; kept beside API so the
+// Settings -> Plugins panel mount stays a pure URL (no fetching here).
+export const getPluginUiBundleUrl = (name: string): string => API.plugins.uiBundle(name);

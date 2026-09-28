@@ -1,11 +1,11 @@
 <script lang="ts">
 	import {
-		AlertTriangle,
+		TriangleAlert,
 		ArrowRight,
 		CircleCheck,
 		Clock3,
 		FolderCog,
-		Fingerprint,
+		FingerprintPattern,
 		History,
 		ListChecks,
 		Music2,
@@ -32,14 +32,18 @@
 	} from '$lib/queries/library-management/LibraryManagementQueries.svelte';
 	import { getLibraryIdentityPreparationEstimateQuery } from '$lib/queries/library/LibraryIdentityPreparationQueries.svelte';
 	import type { LibraryWorkItem } from '$lib/queries/library/LibraryOperationsTypes';
+	import { withBasePath } from '$lib/utils/basePath';
 	import LibraryWorkIcon from './LibraryWorkIcon.svelte';
 	import LibraryWorkProgress from './LibraryWorkProgress.svelte';
 	import {
+		WAITING_FOR_SCAN_HINT,
+		isQueuedPreview,
 		libraryWorkContext,
 		libraryWorkEffect,
 		libraryWorkFacts,
 		libraryWorkHref,
-		libraryWorkTitle
+		libraryWorkTitle,
+		scanIsActive
 	} from './LibraryWorkPresentation';
 
 	const activityQuery = getLibraryActivityQuery(() => authStore.user?.id);
@@ -70,9 +74,25 @@
 		return () => window.clearInterval(timer);
 	});
 
-	const items = $derived(activityQuery.data?.work_items ?? []);
+	const items = $derived(
+		(activityQuery.data?.work_items ?? []).filter((item) => item.id !== 'identification-drain')
+	);
+	const drain = $derived(
+		(activityQuery.data?.work_items ?? []).find((item) => item.id === 'identification-drain')
+	);
+	const identificationActivity = $derived(
+		(activityQuery.data?.items ?? []).find((item) => item.kind === 'identification')
+	);
+	const drainPending = $derived(
+		drain?.pending_identification ??
+			(identificationActivity?.waiting_count ?? 0) + (identificationActivity?.deferred_count ?? 0)
+	);
+	const drainActive = $derived(
+		Boolean(drain?.synthetic) && (drainPending ?? 0) > 0
+	);
 	const primary = $derived(items[0] ?? null);
 	const additional = $derived(items.slice(1));
+	const scanActive = $derived(scanIsActive(items));
 	const facts = $derived(primary ? libraryWorkFacts(primary) : []);
 	const steps = $derived(primary && primary.effect !== 'attention' ? workSteps(primary) : []);
 	const effect = $derived(primary?.effect ?? 'idle');
@@ -115,7 +135,7 @@
 		scheduleQuery.data?.scan_frequency === 'daily'
 			? `Next scan: ${scheduleQuery.data.daily_scan_time} ${scheduleQuery.data.server_timezone ?? ''}`
 			: scheduleQuery.data?.scan_frequency === 'manual'
-				? 'Automatic scanning off'
+				? 'Scheduled scans off (file watcher still active)'
 				: `Schedule: ${scheduleQuery.data?.scan_frequency?.replace('_', ' ') ?? 'loading'}`
 	);
 
@@ -194,13 +214,14 @@
 <div class="space-y-6">
 	{#if !libraryEnabled}
 		<div class="alert alert-warning">
-			<AlertTriangle class="h-5 w-5" />
+			<TriangleAlert class="h-5 w-5" />
 			<div class="min-w-0 flex-1">
 				<strong>The local library is disabled</strong>
 				<p class="text-sm">
 					Scanning and file organization are paused. Existing catalog data and playback keep
 					working. Enable the library in
-					<a class="link link-primary" href="/settings?tab=library">Settings</a> to start new work.
+					<a class="link link-primary" href={withBasePath('/settings?tab=library')}>Settings</a> to start
+					new work.
 				</p>
 			</div>
 		</div>
@@ -215,25 +236,55 @@
 		{:else if activityQuery.isError}
 			<div class="alert alert-error m-5 sm:m-6">Could not load current work.</div>
 		{:else if !primary}
-			<div class="flex flex-wrap items-center gap-4 p-5 sm:p-6">
-				<span
-					class="flex h-11 w-11 flex-none items-center justify-center rounded-2xl bg-primary/10 text-primary"
-				>
-					<CircleCheck class="h-5 w-5" />
-				</span>
-				<div class="min-w-0 flex-1">
-					<p
-						class="font-mono text-[0.65rem] font-semibold tracking-widest text-primary/70 uppercase"
+			{#if drainActive}
+				<div class="flex flex-wrap items-center gap-4 p-5 sm:p-6">
+					<span
+						class="flex h-11 w-11 flex-none items-center justify-center rounded-2xl bg-primary/10 text-primary"
 					>
-						Current work
-					</p>
-					<h2 class="font-display mt-1 text-2xl font-bold">Nothing is running right now</h2>
-					<p class="mt-1 text-sm text-base-content/60">
-						Start a scan or preview file organization below - anything in progress will show up
-						here.
-					</p>
+						<ScanSearch class="h-5 w-5" />
+					</span>
+					<div class="min-w-0 flex-1">
+						<p
+							class="font-mono text-[0.65rem] font-semibold tracking-widest text-primary/70 uppercase"
+						>
+							Current work
+						</p>
+						<h2 class="font-display mt-1 text-2xl font-bold">
+							Scan complete ({totalTracks.toLocaleString()} files) — Matching {drainPending.toLocaleString()}
+							{drainPending === 1 ? 'album' : 'albums'}
+						</h2>
+						<p class="mt-1 text-sm text-base-content/60">
+							MusicBrainz 1/s limit, playback unaffected.
+						</p>
+					</div>
+					<a
+						class="btn btn-ghost btn-sm"
+						href={withBasePath('/library/management?tab=scanning#scanning-controls')}
+					>
+						View matching progress <ArrowRight class="h-4 w-4" />
+					</a>
 				</div>
-			</div>
+			{:else}
+				<div class="flex flex-wrap items-center gap-4 p-5 sm:p-6">
+					<span
+						class="flex h-11 w-11 flex-none items-center justify-center rounded-2xl bg-primary/10 text-primary"
+					>
+						<CircleCheck class="h-5 w-5" />
+					</span>
+					<div class="min-w-0 flex-1">
+						<p
+							class="font-mono text-[0.65rem] font-semibold tracking-widest text-primary/70 uppercase"
+						>
+							Current work
+						</p>
+						<h2 class="font-display mt-1 text-2xl font-bold">Nothing is running right now</h2>
+						<p class="mt-1 text-sm text-base-content/60">
+							Start a scan or preview file organization below - anything in progress will show up
+							here.
+						</p>
+					</div>
+				</div>
+			{/if}
 		{:else}
 			<div class="space-y-4 p-5 sm:p-6">
 				<header class="flex flex-wrap items-start gap-4">
@@ -254,6 +305,9 @@
 								><Clock3 class="h-3.5 w-3.5" /> {timing(primary)}</span
 							>
 							{#if libraryWorkContext(primary)}<span>{libraryWorkContext(primary)}</span>{/if}
+							{#if scanActive && isQueuedPreview(primary)}<span
+									class="text-base-content/55">{WAITING_FOR_SCAN_HINT}</span
+								>{/if}
 						</div>
 					</div>
 					<a class="btn btn-ghost btn-sm" href={libraryWorkHref(primary)}>
@@ -307,7 +361,10 @@
 								<LibraryWorkIcon {item} className="h-4 w-4 text-base-content/60" />
 								<span class="min-w-0 flex-1"
 									><strong class="font-semibold">{libraryWorkTitle(item)}</strong>
-									<span class="text-base-content/50">· {libraryWorkEffect(item)}</span></span
+									<span class="text-base-content/50">· {libraryWorkEffect(item)}</span>
+									{#if scanActive && isQueuedPreview(item)}<span
+											class="block text-xs text-base-content/55">{WAITING_FOR_SCAN_HINT}</span
+										>{/if}</span
 								>
 								<ArrowRight class="h-4 w-4 text-base-content/40" />
 							</a>
@@ -320,7 +377,7 @@
 
 	<div class="stagger-fade-in grid grid-cols-2 gap-3 lg:grid-cols-4">
 		<a
-			href="/library/tracks"
+			href={withBasePath('/library/tracks')}
 			class="rounded-2xl border border-base-content/10 bg-base-200/40 p-4 transition-colors hover:border-base-content/20 hover:bg-base-200/60"
 		>
 			<span class="flex h-9 w-9 items-center justify-center rounded-xl bg-primary/10 text-primary"
@@ -335,7 +392,7 @@
 			>
 		</a>
 		<a
-			href="/library/management?tab=scanning#recent-runs"
+			href={withBasePath('/library/management?tab=scanning#recent-runs')}
 			class="rounded-2xl border border-base-content/10 bg-base-200/40 p-4 transition-colors hover:border-base-content/20 hover:bg-base-200/60"
 		>
 			<span
@@ -353,7 +410,7 @@
 			>
 		</a>
 		<a
-			href="/library/review"
+			href={withBasePath('/library/review')}
 			class="rounded-2xl border border-base-content/10 bg-base-200/40 p-4 transition-colors hover:border-base-content/20 hover:bg-base-200/60"
 		>
 			<span class="flex h-9 w-9 items-center justify-center rounded-xl bg-accent/10 text-accent"
@@ -372,11 +429,11 @@
 		</a>
 		{#if attentionCount > 0}
 			<a
-				href="/library/management?tab=organize"
+				href={withBasePath('/library/management?tab=organize')}
 				class="rounded-2xl border border-warning/30 bg-base-200/40 p-4 transition-colors hover:border-warning/50 hover:bg-base-200/60"
 			>
 				<span class="flex h-9 w-9 items-center justify-center rounded-xl bg-warning/15 text-warning"
-					><AlertTriangle class="h-4 w-4" /></span
+					><TriangleAlert class="h-4 w-4" /></span
 				>
 				<strong class="font-display mt-3 block text-2xl font-bold text-warning tabular-nums"
 					>{attentionCount.toLocaleString()}</strong
@@ -388,7 +445,7 @@
 			</a>
 		{:else}
 			<a
-				href="/library/management?tab=organize"
+				href={withBasePath('/library/management?tab=organize')}
 				class="rounded-2xl border border-base-content/10 bg-base-200/40 p-4 transition-colors hover:border-base-content/20 hover:bg-base-200/60"
 			>
 				<span class="flex h-9 w-9 items-center justify-center rounded-xl bg-warning/10 text-warning"
@@ -429,8 +486,9 @@
 				</button>
 				<div class="flex items-center justify-between gap-2 text-xs text-base-content/55">
 					<span>{scheduleText}</span>
-					<a class="link-hover font-semibold text-primary" href="/library/management?tab=scanning"
-						>More scan actions →</a
+					<a
+						class="link-hover font-semibold text-primary"
+						href={withBasePath('/library/management?tab=scanning')}>More scan actions →</a
 					>
 				</div>
 			</div>
@@ -448,12 +506,15 @@
 				Preview exactly what would change to tags, names, and paths before anything is written.
 			</p>
 			<div class="mt-auto flex flex-col gap-2">
-				<a class="btn management-btn" href="/library/management?tab=organize&runner=manage"
+				<a
+					class="btn management-btn"
+					href={withBasePath('/library/management?tab=organize&runner=manage')}
 					><Sparkles class="h-4 w-4" /> Preview organization...</a
 				>
 				<div class="flex items-center justify-end gap-2 text-xs text-base-content/55">
-					<a class="link-hover font-semibold text-warning" href="/library/management?tab=automation"
-						>Automation & profiles →</a
+					<a
+						class="link-hover font-semibold text-warning"
+						href={withBasePath('/library/management?tab=automation')}>Automation & profiles →</a
 					>
 				</div>
 			</div>
@@ -463,7 +524,7 @@
 		>
 			<div class="flex items-center gap-2.5">
 				<span class="flex h-9 w-9 items-center justify-center rounded-xl bg-accent/10 text-accent"
-					><Fingerprint class="h-4 w-4" /></span
+					><FingerprintPattern class="h-4 w-4" /></span
 				>
 				<h3 class="font-display text-lg font-bold">Prepare identities</h3>
 			</div>
@@ -474,7 +535,9 @@
 					>{/if}
 			</p>
 			<div class="mt-auto flex flex-col gap-2">
-				<a class="btn btn-outline" href="/library/management?tab=organize#identity-readiness"
+				<a
+					class="btn btn-outline"
+					href={withBasePath('/library/management?tab=organize#identity-readiness')}
 					>Open identity readiness</a
 				>
 			</div>

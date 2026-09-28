@@ -13,6 +13,11 @@ vi.mock('$lib/stores/integration', async () => {
 		integrationStore: readable({ download_client: true, youtube: true, youtube_api: true })
 	};
 });
+// Stub the album-request mutation factory so AlbumRequestButton renders without a
+// QueryClientProvider (same approach as the album page's rescanAlbum stub).
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	requestAlbum: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
 
 const section: TopPicksSection = {
 	title: 'Top Picks for You',
@@ -58,7 +63,7 @@ import TopPicksDeck from './TopPicksDeck.svelte';
 
 describe('TopPicksDeck', () => {
 	it('renders the featured pick with match percentage and reasons', async () => {
-		render(TopPicksDeck, { props: { section } } as Parameters<
+		await render(TopPicksDeck, { props: { section } } as Parameters<
 			typeof render<typeof TopPicksDeck>
 		>[1]);
 
@@ -69,7 +74,7 @@ describe('TopPicksDeck', () => {
 	});
 
 	it('cycles manually with the arrows', async () => {
-		render(TopPicksDeck, { props: { section } } as Parameters<
+		await render(TopPicksDeck, { props: { section } } as Parameters<
 			typeof render<typeof TopPicksDeck>
 		>[1]);
 
@@ -79,7 +84,7 @@ describe('TopPicksDeck', () => {
 	});
 
 	it('promotes a thumbnail to featured on click', async () => {
-		render(TopPicksDeck, { props: { section } } as Parameters<
+		await render(TopPicksDeck, { props: { section } } as Parameters<
 			typeof render<typeof TopPicksDeck>
 		>[1]);
 
@@ -88,7 +93,7 @@ describe('TopPicksDeck', () => {
 	});
 
 	it('renders nothing for an empty section', async () => {
-		render(TopPicksDeck, {
+		await render(TopPicksDeck, {
 			props: { section: { ...section, items: [] } as TopPicksSection }
 		} as Parameters<typeof render<typeof TopPicksDeck>>[1]);
 
@@ -96,7 +101,7 @@ describe('TopPicksDeck', () => {
 	});
 
 	it('shows the personalising hint only while still warming', async () => {
-		render(TopPicksDeck, {
+		await render(TopPicksDeck, {
 			props: { section: { ...section, personalizing: true } as TopPicksSection }
 		} as Parameters<typeof render<typeof TopPicksDeck>>[1]);
 
@@ -105,7 +110,7 @@ describe('TopPicksDeck', () => {
 
 	it('dismisses a pick only after the preference is saved', async () => {
 		const onignore: (pick: TopPickItem) => Promise<void> = vi.fn(async () => {});
-		render(TopPicksDeck, { props: { section, onignore } } as Parameters<
+		await render(TopPicksDeck, { props: { section, onignore } } as Parameters<
 			typeof render<typeof TopPicksDeck>
 		>[1]);
 

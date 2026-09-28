@@ -21,6 +21,7 @@ from models.library_management_planning import (
 )
 from services.native.audio_write_planning_service import AudioWritePlanningService
 from services.native.automatic_scan_management_service import (
+    SCAN_PREVIEW_SETTLE_SECONDS,
     AutomaticScanManagementService,
 )
 from services.native.library_management_profile_service import (
@@ -280,8 +281,15 @@ async def test_scan_preview_seals_directly_into_durable_automatic_apply(
     _record_applied_policy(tmp_path / "library.db", policy_revision)
     _activate_scan(preferences, policy_revision)
     planner = _planner(tmp_path, store, preferences)
+    # Settle-gate clock: explicit mutable box so the tail can age past
+    # SCAN_PREVIEW_SETTLE_SECONDS without disturbing the worker's frozen
+    # lease time above.
+    now_box = [0.0]
     service = AutomaticScanManagementService(
-        store, LibraryManagementProfileService(preferences), planner
+        store,
+        LibraryManagementProfileService(preferences),
+        planner,
+        clock=lambda: now_box[0],
     )
     context = await store.get_album_identification_context("album-1")
     assert context is not None
@@ -346,7 +354,168 @@ async def test_scan_preview_seals_directly_into_durable_automatic_apply(
     managed_path = Path(managed_context["tracks"][0]["file_path"])
     with managed_path.open("ab") as output:
         output.write(b"externally-changed")
+    # Settle-gate awareness: creation debounces while the catalog recently
+    # moved, so prime the gate memo (absorbs the apply's delta) and age past
+    # the settle window before the legitimate re-fire.
+    assert (
+        await service.schedule_identified_album("album-1", managed_input_revision)
+        is None
+    )
+    now_box[0] += SCAN_PREVIEW_SETTLE_SECONDS + 1.0
     assert (
         await service.schedule_identified_album("album-1", managed_input_revision)
         is not None
     )
+
+
+@pytest.mark.asyncio
+async def test_managed_path_revision_cache_skips_hash_until_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-110: unchanged live stat signature reuses the stored verdict without
+    re-reading bytes; a real content change re-hashes."""
+    service = AutomaticScanManagementService(AsyncMock(), AsyncMock(), AsyncMock())
+    relative = Path("a") / "b.flac"
+    managed = tmp_path / relative
+    managed.parent.mkdir(parents=True)
+    managed.write_bytes(b"x" * 10)
+    track = {
+        "root_id": "root-1",
+        "relative_path": relative.as_posix(),
+        "file_path": str(managed),
+    }
+
+    calls: list[Path] = []
+    real_hash = service._hash_file
+
+    def counting_hash(path: Path) -> str:
+        calls.append(path)
+        return real_hash(path)
+
+    monkeypatch.setattr(
+        AutomaticScanManagementService,
+        "_hash_file",
+        staticmethod(counting_hash),
+    )
+
+    first = await service._managed_path_revision_cached(track, tmp_path)
+    second = await service._managed_path_revision_cached(track, tmp_path)
+
+    assert first is not None
+    assert first == second
+    assert len(calls) == 1
+
+    managed.write_bytes(b"x" * 11)
+
+    third = await service._managed_path_revision_cached(track, tmp_path)
+
+    assert third != first
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_preview_skipped_while_scan_run_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pre-fix reasoning: no creation-time gate existed, so the first call
+    # created a job; with the gate it must return None without planning.
+    _root, _source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _record_applied_policy(tmp_path / "library.db", policy_revision)
+    _activate_scan(preferences, policy_revision)
+    planner = _planner(tmp_path, store, preferences)
+    service = AutomaticScanManagementService(
+        store,
+        LibraryManagementProfileService(preferences),
+        planner,
+        clock=lambda: 1000.0,
+    )
+    planned: list[str] = []
+    original_create_preview = planner.create_preview
+
+    async def counting_create_preview(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        planned.append("preview")
+        return await original_create_preview(*args, **kwargs)
+
+    monkeypatch.setattr(planner, "create_preview", counting_create_preview)
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "INSERT INTO library_scan_runs "
+            "(id, kind, trigger, state, phase, aggregate_scope, queued_at, "
+            "updated_at) "
+            "VALUES ('scan-active', 'incremental', 'manual', 'discovering', "
+            "'discovering', 'root-1', 1, 1)"
+        )
+
+    assert await service.schedule_scanned_album("album-1") is None
+    assert planned == []
+
+    # Per-attempt skip only: once the run leaves the current states, the next
+    # attempt retries instead of starving.
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "UPDATE library_scan_runs SET state='completed', terminal_at=2 "
+            "WHERE id='scan-active'"
+        )
+    assert await service.schedule_scanned_album("album-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_scan_preview_skipped_after_recent_catalog_move(
+    tmp_path: Path,
+) -> None:
+    # Pre-fix reasoning: preview creation ignored catalog movement, so the
+    # second call returned the same idempotent job id; with the gate it must
+    # return None until the settle window elapses.
+    _root, _source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _record_applied_policy(tmp_path / "library.db", policy_revision)
+    _activate_scan(preferences, policy_revision)
+    now = [2000.0]
+    service = AutomaticScanManagementService(
+        store,
+        LibraryManagementProfileService(preferences),
+        _planner(tmp_path, store, preferences),
+        clock=lambda: now[0],
+    )
+    first = await service.schedule_scanned_album("album-1")
+    assert first is not None
+    with sqlite3.connect(tmp_path / "library.db") as connection:
+        connection.execute(
+            "UPDATE library_catalog_revision SET value = value + 1 "
+            "WHERE singleton = 1"
+        )
+
+    assert await service.schedule_scanned_album("album-1") is None
+    now[0] += 1.0
+    assert await service.schedule_scanned_album("album-1") is None
+    now[0] += SCAN_PREVIEW_SETTLE_SECONDS
+    assert await service.schedule_scanned_album("album-1") == first
+
+
+@pytest.mark.asyncio
+async def test_scan_preview_created_when_settled_and_idle(
+    tmp_path: Path,
+) -> None:
+    # Settled/idle behavior is unchanged: no current run, no catalog movement.
+    _root, _source, preferences, store, _settings, policy_revision = _configured(
+        tmp_path
+    )
+    _record_applied_policy(tmp_path / "library.db", policy_revision)
+    _activate_scan(preferences, policy_revision)
+    service = AutomaticScanManagementService(
+        store,
+        LibraryManagementProfileService(preferences),
+        _planner(tmp_path, store, preferences),
+        clock=lambda: 3000.0,
+    )
+    job_id = await service.schedule_scanned_album("album-1")
+
+    assert job_id is not None
+    snapshot = await store.get_library_management_job_snapshot(job_id)
+    assert snapshot is not None
+    assert snapshot.origin == "scan_discovered"

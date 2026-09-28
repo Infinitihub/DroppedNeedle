@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { AlertTriangle, Check, ExternalLink, History, Music2, XCircle } from 'lucide-svelte';
+	import { TriangleAlert, Check, ExternalLink, History, Music2, CircleX } from 'lucide-svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { getLibraryReviewQuery } from '$lib/queries/library/LibraryReviewQueries.svelte';
 	import {
@@ -11,6 +11,7 @@
 		ReviewActionRequest,
 		ReviewDetailResponse
 	} from '$lib/queries/library/LibraryOperationsTypes';
+	import { isEditionToConfirmReview } from '$lib/queries/library/LibraryOperationsTypes';
 	import { createUuid } from '$lib/utils/uuid';
 
 	type ReviewCandidate = ReviewDetailResponse['candidates'][number];
@@ -142,10 +143,12 @@
 			(item) => item.classification === classification
 		).length;
 	}
-
 	function reasonLabel(reasonCode: string): string {
 		const labels: Record<string, string> = {
-			CONTRADICTORY: 'The local evidence conflicts with this release',
+			NO_CANDIDATE: 'No external result',
+			AMBIGUOUS: 'Several equally likely releases',
+			CONTRADICTORY: 'Conflicting track evidence',
+			EDITION_UNCERTAIN: 'Release group matched - the exact edition is unproven',
 			RELEASE_TYPE_REQUIRES_CONFIRMATION: 'Compilation or live edition needs confirmation',
 			UNSAFE_RELEASE_TYPE: 'Compilation or live edition needs confirmation',
 			MULTIPLE_LIKELY_RELEASES: 'More than one release is equally likely',
@@ -153,6 +156,20 @@
 			INCOMPLETE_SUPPORT: 'The available evidence does not support the whole album'
 		};
 		return labels[reasonCode] ?? reasonCode.replaceAll('_', ' ').toLowerCase();
+	}
+
+	function rankedIndex(keys: readonly string[] | null | undefined, key: string): number {
+		if (!keys) return 999;
+		const index = keys.indexOf(key);
+		return index === -1 ? 999 : index;
+	}
+
+	function orderedCandidates(detail: ReviewDetailResponse): ReviewCandidate[] {
+		const keys = detail.review.ranked_edition_keys ?? [];
+		return [...detail.candidates].sort(
+			(first, second) =>
+				rankedIndex(keys, first.candidate_key) - rankedIndex(keys, second.candidate_key)
+		);
 	}
 
 	function localTrackLabel(localTrackId: string): string {
@@ -172,6 +189,7 @@
 			<div class="p-6"><div class="alert alert-error">Could not load this review item.</div></div>
 		{:else}
 			{@const detail = query.data}
+			{@const isTier = isEditionToConfirmReview(detail.review)}
 			<header
 				class="sticky top-0 z-10 flex items-start gap-4 border-b border-base-content/10 bg-base-100/95 p-5 backdrop-blur"
 			>
@@ -185,7 +203,7 @@
 				/>
 				<div class="min-w-0 flex-1">
 					<p class="font-mono text-xs uppercase tracking-wider text-primary/70">
-						Identification review
+						{isTier ? 'Edition to confirm' : 'Identification review'}
 					</p>
 					<h2
 						bind:this={reviewHeading}
@@ -208,28 +226,32 @@
 				<button
 					class="btn btn-ghost btn-sm btn-square"
 					onclick={() => dialog.close()}
-					aria-label="Close review"><XCircle class="h-5 w-5" /></button
+					aria-label="Close review"><CircleX class="h-5 w-5" /></button
 				>
 			</header>
 
 			<div class="space-y-6 p-5">
-				<div class="alert alert-warning text-sm">
-					<AlertTriangle class="h-4 w-4" /><span
-						>{detail.review.reason_code === 'NO_CANDIDATE'
-							? 'No external result'
-							: detail.review.reason_code === 'AMBIGUOUS'
-								? 'Several equally likely releases'
-								: detail.review.reason_code === 'CONTRADICTORY'
-									? 'Conflicting track evidence'
-									: detail.review.reason_code.replaceAll('_', ' ').toLowerCase()}</span
-					>
-				</div>
+				{#if isTier}
+					<div class="alert alert-info text-sm" role="status">
+						<TriangleAlert class="h-4 w-4" /><span
+							>Release group pinned - exact edition unproven. Year, country and cover are not
+							proven. Confirm one edition below.</span
+						>
+					</div>
+				{:else}
+					<div class="alert alert-warning text-sm">
+						<TriangleAlert class="h-4 w-4" /><span>{reasonLabel(detail.review.reason_code)}</span>
+					</div>
+				{/if}
 
 				<section>
-					<h3 class="mb-2 font-semibold">Current identity</h3>
+					<h3 class="mb-2 font-semibold">{isTier ? 'Pinned release group' : 'Current identity'}</h3>
 					{#if detail.review.release_group_mbid}<div class="rounded-box bg-base-200 p-3 text-sm">
-							<strong>MusicBrainz identity attached</strong><code
-								class="mt-1 block select-all text-xs text-base-content/55"
+							<strong
+								>{isTier
+									? 'Release group pinned - not an exact edition'
+									: 'MusicBrainz identity attached'}</strong
+							><code class="mt-1 block select-all text-xs text-base-content/55"
 								>{detail.review.release_group_mbid}</code
 							>
 						</div>{:else}<p class="text-sm text-base-content/55">
@@ -238,13 +260,49 @@
 				</section>
 
 				<section>
-					<h3 class="mb-3 font-semibold">Release candidates</h3>
+					<h3 class="mb-3 font-semibold">
+						{isTier ? 'Editions to confirm (ranked)' : 'Release candidates'}
+					</h3>
 					{#if detail.candidates.length === 0}<p
 							class="rounded-box border border-dashed border-base-content/20 p-4 text-sm text-base-content/55"
 						>
 							No external result
-						</p>{:else}<div class="grid gap-3 lg:grid-cols-2">
-							{#each detail.candidates as candidate (candidate.candidate_key)}<article
+						</p>{:else}
+						{@const rankedCandidates = orderedCandidates(detail)}
+						{#if isTier}
+							{@const top = rankedCandidates[0]}
+							<div
+								class="mb-3 rounded-box border border-info/30 bg-info/10 p-3 text-sm"
+								role="status"
+							>
+								<p>
+									<strong>{detail.review.album_title || 'Untitled local album'}</strong> ·
+									{detail.review.album_artist_name || 'Unknown album artist'} - edition to confirm: year,
+									country and cover are not proven.
+								</p>
+								<p class="mt-1 text-xs text-base-content/60">
+									Top edition option: {top.evidence.album_title} · score {top.evidence.score.toFixed(
+										2
+									)}
+								</p>
+								<div class="mt-2 flex flex-wrap gap-2">
+									<button
+										class="btn btn-primary btn-sm"
+										disabled={accept.isPending}
+										onclick={() => void acceptCandidate(top, false).catch(() => undefined)}
+										>Accept exact edition</button
+									>
+									<button
+										class="btn btn-outline btn-sm"
+										disabled={accept.isPending}
+										onclick={(event) => openOverrideConfirmation(top, event)}
+										>Pick manually...</button
+									>
+								</div>
+							</div>
+						{/if}
+						<div class="grid gap-3 lg:grid-cols-2">
+							{#each rankedCandidates as candidate, index (candidate.candidate_key)}<article
 									class="rounded-box border border-base-content/10 bg-base-100 p-4"
 								>
 									<div class="flex items-start justify-between gap-3">
@@ -258,7 +316,11 @@
 											class="badge {candidate.automatic_safe
 												? 'badge-success'
 												: 'badge-warning'} badge-sm"
-											>{candidate.automatic_safe ? 'Supported' : 'Review evidence'}</span
+											>{isTier
+												? `Edition option ${index + 1}`
+												: candidate.automatic_safe
+													? 'Supported'
+													: 'Review evidence'}</span
 										>
 									</div>
 									<p class="mt-2 text-xs text-base-content/50">
@@ -323,8 +385,17 @@
 							{#each detail.history as entry (entry.id)}<li
 									class="flex items-center justify-between gap-3 rounded-lg bg-base-200 px-3 py-2 text-sm"
 								>
-									<span>{entry.state.replaceAll('_', ' ')}</span><time
-										class="text-xs text-base-content/50"
+									<span class="flex items-center gap-2"
+										>{entry.state.replaceAll('_', ' ')}<span
+											class="badge badge-ghost badge-xs"
+											title={entry.actor_user_id
+												? 'Decided by a user.'
+												: detail.available_actions.includes('retry')
+													? 'Decided automatically; use Retry identification to reopen it.'
+													: 'Decided automatically.'}
+											>{entry.actor_user_id ? 'Manual' : 'Automatic'}</span
+										></span
+									><time class="text-xs text-base-content/50"
 										>{new Date(entry.created_at * 1000).toLocaleString()}</time
 									>
 								</li>{/each}

@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { Pause, Play, Trash2, TriangleAlert, X } from 'lucide-svelte';
 
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { API } from '$lib/constants';
 	import { removeLibraryTrack } from '$lib/queries/library/LibraryMutations.svelte';
+	import { albumSourceMatchCacheKey } from '$lib/utils/albumDetailCache';
 	import { formatCountdown } from '$lib/queries/downloads/downloadStatus';
 	import { toastStore } from '$lib/stores/toast';
 	import type { LibraryTrack } from '$lib/types';
@@ -27,7 +29,7 @@
 		confirmingId = null;
 		if (activeId === file.id) stopPreview();
 		remove.mutate(
-			{ fileId: file.id, albumMbid },
+			{ fileId: file.id, albumMbid, albumCacheKey: albumSourceMatchCacheKey(albumMbid) },
 			{
 				onSuccess: () => toastStore.show({ message: 'File removed', type: 'success' }),
 				onError: () => toastStore.show({ message: "Couldn't remove this file", type: 'error' })
@@ -64,7 +66,7 @@
 		activeId = file.id;
 		currentTime = 0;
 		mediaDuration = 0;
-		audioEl.src = API.stream.local(file.id);
+		audioEl.src = getApiUrl(API.stream.local(file.id));
 		void audioEl.play().catch(() => (failed = true));
 	}
 

@@ -15,9 +15,11 @@ from core.exception_handlers import (
     circuit_open_error_handler,
     client_disconnected_handler,
     configuration_error_handler,
+    automatic_management_hold_handler,
     external_service_error_handler,
     general_exception_handler,
     http_exception_handler,
+    rate_limited_error_handler,
     request_validation_error_handler,
     resource_not_found_handler,
     source_resolution_error_handler,
@@ -33,9 +35,11 @@ from core.exception_handlers import (
 from core.exceptions import (
     ClientDisconnectedError,
     ConfigurationError,
+    AutomaticManagementHoldError,
     ConflictError,
     ExternalServiceError,
     PermissionDeniedError,
+    RateLimitedError,
     ResourceNotFoundError,
     RevisionOverflowError,
     SourceResolutionError,
@@ -89,10 +93,14 @@ def override_user_auth(
 def add_production_exception_handlers(app: FastAPI) -> FastAPI:
     app.add_exception_handler(ClientDisconnectedError, client_disconnected_handler)
     app.add_exception_handler(ResourceNotFoundError, resource_not_found_handler)
+    app.add_exception_handler(RateLimitedError, rate_limited_error_handler)
     app.add_exception_handler(ExternalServiceError, external_service_error_handler)
     app.add_exception_handler(CircuitOpenError, circuit_open_error_handler)
     app.add_exception_handler(ValidationError, validation_error_handler)
     app.add_exception_handler(ConfigurationError, configuration_error_handler)
+    app.add_exception_handler(
+        AutomaticManagementHoldError, automatic_management_hold_handler
+    )
     app.add_exception_handler(PermissionDeniedError, permission_denied_handler)
     app.add_exception_handler(ConflictError, conflict_error_handler)
     app.add_exception_handler(StaleRevisionError, stale_revision_error_handler)
@@ -108,6 +116,23 @@ def add_production_exception_handlers(app: FastAPI) -> FastAPI:
 def build_test_client(app: FastAPI) -> TestClient:
     add_production_exception_handlers(app)
     return TestClient(app, raise_server_exceptions=False)
+
+
+def openapi_method_paths(app: FastAPI) -> list[tuple[str, str]]:
+    """(METHOD, path) pairs from the app's OpenAPI paths.
+
+    Route-allowlist lens: FastAPI flattens the route tree (including router
+    prefixes) into the schema, which keeps working across the eager (<=0.118)
+    and lazy-include (>=0.140) route-storage layouts. Note the schema omits
+    routes marked ``include_in_schema=False``.
+    """
+    return [
+        (method.upper(), path)
+        for path, operations in app.openapi()["paths"].items()
+        for method in operations
+        if method.upper()
+        in {"GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"}
+    ]
 
 
 def make_test_import_publisher(library_manager, roots: dict[str, Path]):  # noqa: ANN001
@@ -238,9 +263,9 @@ def assert_log_fields(
         Minimum number of matching records expected (default 1).
     """
     matching = [r.message for r in records if r.message.startswith(prefix)]
-    assert (
-        len(matching) >= min_count
-    ), f"Expected >= {min_count} log(s) starting with '{prefix}', found {len(matching)}"
+    assert len(matching) >= min_count, (
+        f"Expected >= {min_count} log(s) starting with '{prefix}', found {len(matching)}"
+    )
     for msg in matching:
         for field in required_fields:
             assert f"{field}=" in msg, f"Field '{field}=' missing in log: {msg}"

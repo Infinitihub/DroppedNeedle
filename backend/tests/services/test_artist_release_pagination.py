@@ -1,7 +1,10 @@
 """Service-level tests for filter-aware artist release pagination."""
 
+import asyncio
 import os
 import tempfile
+import time
+from types import SimpleNamespace
 from typing import Any
 
 os.environ.setdefault("ROOT_APP_DIR", tempfile.mkdtemp())
@@ -11,10 +14,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 from core.exceptions import ClientDisconnectedError
 from infrastructure.cache.cache_keys import mb_artist_release_groups_key
+from infrastructure.cache.memory_cache import InMemoryCache
+from infrastructure.queue.priority_queue import RequestPriority
+from repositories.musicbrainz_artist import MusicBrainzArtistMixin
+from repositories.musicbrainz_base import capture_mb_source_context
 from services.artist_service import ArtistService
 
 
 ARTIST_MBID = "f4a31f0a-51dd-4fa7-986d-3095c40c5ed9"
+# Valid-UUID artist for the embedded-seed test: the repo D6 gate returns
+# absence for non-UUID ids, so the "artist-id" placeholder never reaches
+# the seeding path. Distinct from ARTIST_MBID to avoid TaskRegistry coupling.
+SEEDED_ARTIST_MBID = "8a2b4c6d-9e0f-4a1b-8c3d-5e6f7a8b9c0d"
 
 
 def _make_release_group(
@@ -48,13 +59,43 @@ def _make_prefs(
     return p
 
 
+def _namespaced(key: str) -> str:
+    # Mirror InMemoryCache._source_key: the real cache namespaces every key
+    # with the ambient MusicBrainz operation context. A fake that skips this
+    # can never round-trip, because production reads pre-namespace while
+    # writes go through un-namespaced.
+    from repositories.musicbrainz_base import namespace_mb_cache_key
+
+    return namespace_mb_cache_key(key)
+
+
 def _make_dict_cache() -> tuple[AsyncMock, dict[str, Any]]:
-    """AsyncMock cache backed by a real dict, for multi-request tests."""
+    """AsyncMock cache backed by a real dict, for multi-request tests.
+
+    Speaks the freshness cache contract (``get_with_metadata`` /
+    ``set_if_token``) with real-cache key namespacing; clear-token fencing
+    is not modeled here because these pagination tests never clear
+    mid-flight (dedicated fence tests use real caches).
+    """
     store: dict[str, Any] = {}
     cache = AsyncMock()
-    cache.get = AsyncMock(side_effect=store.get)
+    # capture_clear_token is sync on real caches; AsyncMock children default
+    # to async, which yields un-awaited coroutines that never compare equal.
+    cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
+    cache.get = AsyncMock(side_effect=lambda key: store.get(_namespaced(key)))
+    cache.get_with_metadata = AsyncMock(
+        side_effect=lambda key: (store.get(_namespaced(key)), None)
+    )
+
+    async def _set_if_token(token, key, value, ttl_seconds=60, *, metadata=None):
+        store[_namespaced(key)] = value
+        return True
+
+    cache.set_if_token = AsyncMock(side_effect=_set_if_token)
     cache.set = AsyncMock(
-        side_effect=lambda key, value, ttl_seconds: store.__setitem__(key, value)
+        side_effect=lambda key, value, ttl_seconds: store.__setitem__(
+            _namespaced(key), value
+        )
     )
     return cache, store
 
@@ -71,9 +112,19 @@ def _make_service(
     else:
         mb_repo.get_artist_release_groups = AsyncMock(return_value=([], 0))
 
+    async def get_artist_release_groups_with_context(*args, **kwargs):
+        kwargs.pop("preserve_fetch_width", None)
+        groups, total = await mb_repo.get_artist_release_groups(*args, **kwargs)
+        return groups, total, capture_mb_source_context()
+
+    mb_repo.get_artist_release_groups_with_context = AsyncMock(
+        side_effect=get_artist_release_groups_with_context
+    )
     library_repo = MagicMock()
     library_repo.is_configured.return_value = False
     library_repo.get_library_mbids = AsyncMock(return_value=set())
+    library_repo.existing_album_mbids = AsyncMock(return_value=set())
+    library_repo.existing_artist_mbids = AsyncMock(return_value=set())
     library_repo.get_requested_mbids = AsyncMock(return_value=set())
     library_repo.get_artist_mbids = AsyncMock(return_value=set())
 
@@ -81,14 +132,18 @@ def _make_service(
 
     if memory_cache is None:
         memory_cache = AsyncMock()
+        memory_cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
         memory_cache.get = AsyncMock(return_value=None)
+        memory_cache.get_with_metadata = AsyncMock(return_value=(None, None))
+        memory_cache.set_if_token = AsyncMock(return_value=True)
         memory_cache.set = AsyncMock()
 
     disk_cache = AsyncMock()
+    disk_cache.capture_clear_token = MagicMock(return_value=("test-disk", 0))
     disk_cache.get_artist = AsyncMock(return_value=None)
     disk_cache.set_artist = AsyncMock()
 
-    return ArtistService(
+    service = ArtistService(
         mb_repo=mb_repo,
         library_repo=library_repo,
         wikidata_repo=wikidata_repo,
@@ -96,6 +151,365 @@ def _make_service(
         memory_cache=memory_cache,
         disk_cache=disk_cache,
     )
+    service.test_mb_repo = mb_repo
+    return service
+
+
+def _collected_list(collected):
+    return list(collected.values())
+
+
+async def _cancel_artist_warm_tasks() -> None:
+    from core.task_registry import TaskRegistry
+
+    registry = TaskRegistry.get_instance()
+    names = [
+        name
+        for name in registry.get_all()
+        if name.startswith(f"mb-rg-warm-{ARTIST_MBID.casefold()}:")
+    ]
+    for name in names:
+        await registry.cancel(name)
+
+
+@pytest.mark.asyncio
+async def test_warm_seed_cancel_writes_cooldown(monkeypatch):
+    await _cancel_artist_warm_tasks()
+    page = [
+        _make_release_group(f"rg-{i}", f"Album {i}", "Album")
+        for i in range(100)
+    ]
+    cache, store = _make_dict_cache()
+    svc = _make_service(memory_cache=cache)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[int] = []
+
+    async def fetch(_artist, offset, _limit, **_kwargs):
+        calls.append(offset)
+        if offset == 0:
+            return page, 200
+        started.set()
+        await release.wait()
+        return page, 200
+
+    svc.test_mb_repo.get_artist_release_groups = AsyncMock(side_effect=fetch)
+    try:
+        first = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert first.warming is True
+        await started.wait()
+
+        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert second.warming is True
+        assert calls == [0, 100]
+
+        await _cancel_artist_warm_tasks()
+        await asyncio.sleep(0)
+        # A cancelled walker leaves a 60 s cooldown seed (never cleared
+        # while fresh); the shared complete-catalog key stays unwritten.
+        assert len(svc._release_group_warm_seeds) == 1
+        seed = next(iter(svc._release_group_warm_seeds.values()))
+        assert seed.metadata is not None
+        assert seed.metadata.fresh_until == pytest.approx(time.time() + 60, abs=5)
+        assert _namespaced(mb_artist_release_groups_key(ARTIST_MBID)) not in store
+
+        third = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert third.warming is True
+        assert calls == [0, 100]
+
+        # Past 60 s the cooldown expires and a re-walk is allowed.
+        base = time.time()
+        monkeypatch.setattr(time, "time", lambda: base + 61)
+        release.set()
+        fourth = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert fourth.warming is True
+        assert calls.count(0) == 2
+    finally:
+        release.set()
+        await _cancel_artist_warm_tasks()
+
+
+@pytest.mark.asyncio
+async def test_warm_seed_failure_cooldown_suppresses_rewalk(monkeypatch):
+    await _cancel_artist_warm_tasks()
+    page = [
+        _make_release_group(f"rg-{i}", f"Album {i}", "Album")
+        for i in range(100)
+    ]
+    cache, store = _make_dict_cache()
+    svc = _make_service(memory_cache=cache)
+    calls: list[int] = []
+
+    async def fail_warm(_artist, offset, _limit, **_kwargs):
+        calls.append(offset)
+        if offset == 0:
+            return page, 200
+        raise RuntimeError("warm failed")
+
+    svc.test_mb_repo.get_artist_release_groups = AsyncMock(side_effect=fail_warm)
+    spawn_count = 0
+    orig_spawn = svc._spawn_release_group_warm
+
+    def counting_spawn(*args, **kwargs):
+        nonlocal spawn_count
+        spawn_count += 1
+        return orig_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_spawn_release_group_warm", counting_spawn)
+    try:
+        first = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert first.warming is True
+        assert spawn_count == 1
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # A failed walker leaves a 60 s cooldown seed (never cleared
+        # while fresh); the shared complete-catalog key stays unwritten.
+        assert len(svc._release_group_warm_seeds) == 1
+        seed = next(iter(svc._release_group_warm_seeds.values()))
+        assert seed.metadata is not None
+        assert seed.metadata.fresh_until == pytest.approx(time.time() + 60, abs=5)
+        assert _namespaced(mb_artist_release_groups_key(ARTIST_MBID)) not in store
+
+        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert second.warming is True
+        assert calls == [0, 100]
+        assert spawn_count == 1
+
+        # Past 60 s the cooldown expires and a respawn is allowed.
+        base = time.time()
+        monkeypatch.setattr(time, "time", lambda: base + 61)
+        third = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert third.warming is True
+        assert calls.count(0) == 2
+        assert spawn_count == 2
+    finally:
+        await _cancel_artist_warm_tasks()
+
+
+@pytest.mark.asyncio
+async def test_cap_exit_partial_seed_serves_without_rewire(monkeypatch):
+    await _cancel_artist_warm_tasks()
+    from core.task_registry import TaskRegistry
+    from repositories import musicbrainz_base as mb_base
+
+    total = 1500
+    cache, store = _make_dict_cache()
+    svc = _make_service(memory_cache=cache)
+    calls: list[int] = []
+
+    async def fetch(_artist, offset, _limit, **_kwargs):
+        calls.append(offset)
+        return (
+            [
+                _make_release_group(f"rg-{i}", f"Album {i}", "Album")
+                for i in range(offset, min(offset + 100, total))
+            ],
+            total,
+        )
+
+    svc.test_mb_repo.get_artist_release_groups = AsyncMock(side_effect=fetch)
+    source_context = mb_base.capture_mb_source_context()
+    task_name = f"mb-rg-warm-{ARTIST_MBID.casefold()}:{source_context.generation}"
+    try:
+        first = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert first.warming is True
+        assert first.returned_count == 50
+
+        registry = TaskRegistry.get_instance()
+        for _ in range(100):
+            if not registry.is_running(task_name):
+                break
+            await asyncio.sleep(0)
+        assert not registry.is_running(task_name)
+
+        # Cap exit: one 10-page walk (offset 0 + 100..900), then the
+        # 1000-item partial seed is kept for 600 s - never the shared key.
+        assert calls == [0, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+        assert len(svc._release_group_warm_seeds) == 1
+        seed = next(iter(svc._release_group_warm_seeds.values()))
+        assert len(seed.items) == 1000
+        assert seed.metadata is not None
+        assert seed.metadata.fresh_until == pytest.approx(time.time() + 600, abs=10)
+        assert _namespaced(mb_artist_release_groups_key(ARTIST_MBID)) not in store
+
+        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert second.warming is True
+        assert second.source_total_count is None
+        assert second.returned_count == 50
+        assert [a.title for a in second.albums] == [f"Album {i}" for i in range(50)]
+        assert calls == [0, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+
+        # The partial seed carries walked pages, not just the spawn slice.
+        deep = await svc.get_artist_releases(ARTIST_MBID, offset=950, limit=50)
+        assert [a.title for a in deep.albums] == [f"Album {i}" for i in range(950, 1000)]
+        assert calls == [0, 100, 200, 300, 400, 500, 600, 700, 800, 900]
+
+        # Past 600 s the partial expires and a re-walk is allowed.
+        base = time.time()
+        monkeypatch.setattr(time, "time", lambda: base + 601)
+        third = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert third.warming is True
+        assert calls.count(0) == 2
+    finally:
+        await _cancel_artist_warm_tasks()
+
+
+@pytest.mark.asyncio
+async def test_warm_seed_source_change_rejects_late_write(monkeypatch):
+    await _cancel_artist_warm_tasks()
+    from repositories import musicbrainz_base as mb_base
+
+    page = [
+        _make_release_group(f"rg-{i}", f"Album {i}", "Album")
+        for i in range(100)
+    ]
+    cache, store = _make_dict_cache()
+    svc = _make_service(memory_cache=cache)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(_artist, offset, _limit, **_kwargs):
+        if offset == 0:
+            return page, 200
+        started.set()
+        await release.wait()
+        return page, 200
+
+    svc.test_mb_repo.get_artist_release_groups = AsyncMock(side_effect=fetch)
+    old_generation = mb_base.get_mb_source_generation()
+    try:
+        first = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert first.warming is True
+        await started.wait()
+
+        monkeypatch.setattr(mb_base, "_mb_api_base", "https://new.example/ws/2")
+        monkeypatch.setattr(mb_base, "_mb_source_generation", old_generation + 1)
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not svc._release_group_warm_seeds
+        assert mb_artist_release_groups_key(ARTIST_MBID) not in store
+    finally:
+        release.set()
+        await _cancel_artist_warm_tasks()
+
+
+
+@pytest.mark.asyncio
+async def test_delayed_release_page_drops_old_source_groups(monkeypatch):
+    await _cancel_artist_warm_tasks()
+    from repositories import musicbrainz_base as mb_base
+
+    cache, store = _make_dict_cache()
+    svc = _make_service(memory_cache=cache)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    old_group = _make_release_group("rg-old", "Old Source Album", "Album")
+
+    async def fetch(_artist, _offset, _limit, **_kwargs):
+        started.set()
+        await release.wait()
+        return [old_group], 1
+
+    svc.test_mb_repo.get_artist_release_groups = AsyncMock(side_effect=fetch)
+    old_generation = mb_base.get_mb_source_generation()
+    try:
+        task = asyncio.create_task(
+            svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        )
+        await started.wait()
+        monkeypatch.setattr(mb_base, "_mb_api_base", "https://new.example/ws/2")
+        monkeypatch.setattr(mb_base, "_mb_source_generation", old_generation + 1)
+        release.set()
+        result = await task
+
+        assert result.albums == []
+        assert result.singles == []
+        assert result.eps == []
+        assert "Old Source Album" not in str(result)
+        assert mb_artist_release_groups_key(ARTIST_MBID) not in store
+        assert not svc._release_group_warm_seeds
+    finally:
+        release.set()
+        await _cancel_artist_warm_tasks()
+
+
+@pytest.mark.asyncio
+async def test_full_artist_profile_seeds_warm_from_fetched_width(monkeypatch):
+    await _cancel_artist_warm_tasks()
+    import repositories.musicbrainz_artist as artist_module
+
+    repository = MusicBrainzArtistMixin.__new__(MusicBrainzArtistMixin)
+    repository._cache = InMemoryCache(max_entries=100)
+    repository._preferences_service = _make_prefs()
+    repository._warm_release_group_cache = AsyncMock()
+    library_repo = MagicMock()
+    library_repo.get_artist_mbids = AsyncMock(return_value=set())
+    library_repo.get_library_mbids = AsyncMock(return_value=set())
+    library_repo.existing_album_mbids = AsyncMock(return_value=set())
+    library_repo.existing_artist_mbids = AsyncMock(return_value=set())
+    library_repo.get_requested_mbids = AsyncMock(return_value=set())
+    disk_cache = AsyncMock()
+    disk_cache.capture_clear_token = MagicMock(return_value=("test-disk", 0))
+    disk_cache.get_artist = AsyncMock(return_value=None)
+    disk_cache.set_artist = AsyncMock()
+    service = ArtistService(
+        mb_repo=repository,
+        library_repo=library_repo,
+        wikidata_repo=AsyncMock(),
+        preferences_service=_make_prefs(),
+        memory_cache=repository._cache,
+        disk_cache=disk_cache,
+    )
+    source_context = capture_mb_source_context()
+    initial_groups = [
+        _make_release_group(f"rg-{index}", f"Album {index}", "Album")
+        for index in range(100)
+    ]
+    continuation_groups = [
+        _make_release_group(f"rg-{index}", f"Album {index}", "Album")
+        for index in range(100, 200)
+    ]
+    offsets: list[int] = []
+    continuation_done = asyncio.Event()
+
+    async def provider(path, params=None, **_kwargs):
+        if path == f"/artist/{SEEDED_ARTIST_MBID}":
+            return {
+                "id": SEEDED_ARTIST_MBID,
+                "name": "Test Artist",
+                "release-group-count": 200,
+            }
+        offsets.append(int((params or {}).get("offset", 0)))
+        if offsets[-1] == 100:
+            continuation_done.set()
+            return SimpleNamespace(
+                release_groups=continuation_groups,
+                release_group_count=200,
+            )
+        return SimpleNamespace(
+            release_groups=initial_groups,
+            release_group_count=200,
+        )
+
+    monkeypatch.setattr(artist_module, "mb_api_get", provider)
+    monkeypatch.setattr(
+        artist_module,
+        "get_mb_response_context",
+        lambda: source_context,
+    )
+
+    result, _library, _albums, _requested = await service._fetch_artist_data(
+        SEEDED_ARTIST_MBID,
+        include_releases=True,
+        source_context=source_context,
+    )
+    await continuation_done.wait()
+    await _cancel_artist_warm_tasks()
+
+    assert len(result["release-group-list"]) == 50
+    assert offsets == [0, 100]
 
 
 class TestFilterAwarePagination:
@@ -122,19 +536,39 @@ class TestFilterAwarePagination:
             _make_release_group(f"rg-{i}", f"Broadcast {i}", "Broadcast")
             for i in range(5)
         ]
-        batch2 = [_make_release_group("rg-album", "Real Album", "Album")]
+        _rg_album = _make_release_group("rg-album", "Real Album", "Album")
+        batch2 = [_rg_album]
+        cache, store = _make_dict_cache()
         svc = _make_service(
             mb_release_pages=[
                 (batch1, 6),
                 (batch2, 6),
-            ]
+            ],
+            memory_cache=cache,
         )
 
+        # ST4/A3: page 1 is all-Broadcast -> incomplete slice, warming=true,
+        # null total. The background walker finishes batch 2; the follow-up
+        # read then serves the real album with exact totals.
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert result.albums == []
+        assert result.warming is True
+        assert result.source_total_count is None
 
-        assert result.albums[0].title == "Real Album"
-        assert result.returned_count == 1
-        assert result.source_total_count == 1
+        collected = {f"rg-{i}": g for i, g in enumerate(batch1)}
+        collected["rg-album"] = _rg_album
+        await svc._warm_release_group_pages(
+            ARTIST_MBID,
+            collected,
+            total=6,
+            raw_offset=6,
+        )
+
+        warmed = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert [a.title for a in warmed.albums] == ["Real Album"]
+        assert warmed.warming is False
+        assert warmed.source_total_count == 1
+        assert warmed.returned_count == 1
 
     @pytest.mark.asyncio
     async def test_empty_result_set(self):
@@ -145,7 +579,10 @@ class TestFilterAwarePagination:
         assert result.returned_count == 0
         assert result.has_more is False
         assert result.next_offset is None
+        # A3: a definitive "no release groups at all" answer is complete,
+        # not warming.
         assert result.source_total_count == 0
+        assert result.warming is False
 
     @pytest.mark.asyncio
     async def test_offset_reflects_client_param(self):
@@ -195,8 +632,12 @@ class TestFilterAwarePagination:
 
     @pytest.mark.asyncio
     async def test_exception_returns_empty_page(self):
-        svc = _make_service()
-        svc._library_repo.get_library_mbids = AsyncMock(
+        svc = _make_service(
+            mb_release_pages=[
+                ([_make_release_group("rg-1", "Album 1", "Album")], 1)
+            ]
+        )
+        svc._library_repo.existing_album_mbids = AsyncMock(
             side_effect=RuntimeError("boom")
         )
 
@@ -242,18 +683,30 @@ class TestFilterAwarePagination:
     async def test_global_sort_across_batches(self):
         batch1 = [_make_release_group("rg-a", "Old Album", "Album", "2010-01-01")]
         batch2 = [_make_release_group("rg-b", "New Album", "Album", "2020-01-01")]
+        cache, store = _make_dict_cache()
         svc = _make_service(
             mb_release_pages=[
                 (batch1, 2),
                 (batch2, 2),
-            ]
+            ],
+            memory_cache=cache,
         )
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert result.warming is True
 
-        assert len(result.albums) == 2
-        assert result.albums[0].title == "New Album"
-        assert result.albums[1].title == "Old Album"
+        collected = {
+            "rg-a": batch1[0],
+            "rg-b": batch2[0],
+        }
+        await svc._warm_release_group_pages(
+            ARTIST_MBID, collected, total=2, raw_offset=2
+        )
+
+        warmed = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert len(warmed.albums) == 2
+        assert warmed.albums[0].title == "New Album"
+        assert warmed.albums[1].title == "Old Album"
 
     @pytest.mark.asyncio
     async def test_next_offset_is_arithmetic(self):
@@ -300,7 +753,9 @@ class TestFilterAwarePagination:
             for i in range(5)
         ]
         svc = _make_service(mb_release_pages=[(batch1, 200), (batch2, 200)])
-        is_disconnected = AsyncMock(side_effect=[False, False, True])
+        # A3 contract: disconnects are checked before the page-1 fetch; once
+        # page 1 succeeds the request returns (warming) and never checks again.
+        is_disconnected = AsyncMock(return_value=True)
 
         with pytest.raises(ClientDisconnectedError):
             await svc.get_artist_releases(
@@ -328,16 +783,34 @@ class TestFilterAwarePagination:
         )
 
         first = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
-        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
 
-        assert first.returned_count == 50
-        assert first.source_total_count == 109
+        # A3: first view serves page 1 with warming=true / null total...
+        assert first.warming is True
+        assert first.source_total_count is None
+
+        # ...the background walker completes the remaining pages...
+        collected = {
+            str(g["id"]).casefold(): g for page in (batch1, batch2) for g in page
+        }
+        # The spawned walker (registry name mb-rg-warm-*) is still pending;
+        # cancel it so only our explicit completion write lands.
+
+        await _cancel_artist_warm_tasks()
+
+        # ...then complete the walk deterministically ourselves.
+        await svc._warm_release_group_pages(
+            ARTIST_MBID, collected, total=109, raw_offset=109
+        )
+
+        # ...and the second view is served from the shared cache with exact
+        # totals, byte-for-byte the old full-walk contract.
+        second = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert second.warming is False
         assert second.returned_count == 50
         assert second.source_total_count == 109
-        assert svc._mb_repo.get_artist_release_groups.await_count == 2
-        svc._cache.set.assert_awaited_once()
-        cached = store[mb_artist_release_groups_key(ARTIST_MBID)]
-        assert len(cached) == 109
+        assert store[_namespaced(mb_artist_release_groups_key(ARTIST_MBID))] == (
+            _collected_list(collected)
+        )
 
     @pytest.mark.asyncio
     async def test_partial_fetch_not_cached(self):
@@ -348,9 +821,18 @@ class TestFilterAwarePagination:
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
 
-        assert result.returned_count == 50
-        assert result.source_total_count == 100
-        svc._cache.set.assert_not_awaited()
+        # A3: partial slice served with warming=true / null total; the shared
+        # key stays unwritten (outage-safety rule).
+        assert result.warming is True
+        assert result.source_total_count is None
+        store_writes = [
+            call.args[1]
+            for call in svc._cache.set_if_token.await_args_list
+            if len(call.args) > 1
+            and isinstance(call.args[1], str)
+            and call.args[1].startswith("mb:artist_rgs:")
+        ]
+        assert store_writes == []
 
     @pytest.mark.asyncio
     async def test_gid_sorted_pages_no_drop_regression(self):
@@ -359,7 +841,9 @@ class TestFilterAwarePagination:
         # anywhere in a page, and scan-position pagination dropped it.
         negative_spaces_id = "fe83cc29-01a9-4650-95ca-d3e135c07278"
         page1 = [
-            _make_release_group(f"aaaaaaaa-0000-4000-8000-{i:012d}", f"Album {i}", "Album")
+            _make_release_group(
+                f"aaaaaaaa-0000-4000-8000-{i:012d}", f"Album {i}", "Album"
+            )
             for i in range(99)
         ] + [
             _make_release_group(
@@ -367,7 +851,9 @@ class TestFilterAwarePagination:
             )
         ]
         page2 = [
-            _make_release_group(f"bbbbbbbb-0000-4000-8000-{i:012d}", f"Album B{i}", "Album")
+            _make_release_group(
+                f"bbbbbbbb-0000-4000-8000-{i:012d}", f"Album B{i}", "Album"
+            )
             for i in range(9)
         ]
         cache, _ = _make_dict_cache()
@@ -391,10 +877,25 @@ class TestFilterAwarePagination:
         rgs = [_make_release_group(f"rg-{i}", f"Album {i}", "Album") for i in range(15)]
         page1 = rgs[:10]
         page2 = rgs[5:]  # overlaps page1 by 50%
-        svc = _make_service(mb_release_pages=[(page1, 15), (page2, 15)])
+        cache, store = _make_dict_cache()
+        svc = _make_service(
+            mb_release_pages=[(page1, 15), (page2, 15)], memory_cache=cache
+        )
 
         result = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        assert result.warming is True
 
-        ids = [item.id for item in result.albums]
+        collected = {}
+        raw = 0
+        for page in (page1, page2):
+            for g in page:
+                collected.setdefault(str(g["id"]).casefold(), g)
+            raw += len(page)
+        await svc._warm_release_group_pages(
+            ARTIST_MBID, collected, total=15, raw_offset=raw
+        )
+
+        warmed = await svc.get_artist_releases(ARTIST_MBID, offset=0, limit=50)
+        ids = [item.id for item in warmed.albums]
         assert len(ids) == 15
         assert len(ids) == len(set(ids))

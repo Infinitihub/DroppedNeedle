@@ -1,11 +1,13 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import {
+		ChevronDown,
 		ChevronLeft,
 		Disc3,
 		ExternalLink,
 		FileUp,
 		ListMusic,
+		Pin,
 		Play,
 		Shuffle
 	} from 'lucide-svelte';
@@ -15,15 +17,34 @@
 	import AlbumIdentificationPanel from '$lib/components/library/AlbumIdentificationPanel.svelte';
 	import AlbumOrganizationDialog from '$lib/components/library/AlbumOrganizationDialog.svelte';
 	import LocalAlbumTrackList from '$lib/components/library/LocalAlbumTrackList.svelte';
+	import AlbumDownloadButton from './AlbumDownloadButton.svelte';
+	import AddToPlaylistModal from '$lib/components/AddToPlaylistModal.svelte';
+	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
+	import { getTrackContextMenuItems } from './albumPlaybackHandlers';
+	import type { QueueItem } from '$lib/player/types';
 	import { authStore } from '$lib/stores/authStore.svelte';
+	import { toastStore } from '$lib/stores/toast';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';
 	import {
 		getLibraryAlbumDetailQuery,
 		getLibraryAlbumTracksQuery
 	} from '$lib/queries/library/LibraryQueries.svelte';
-	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
+	import {
+		clearLocalAlbumEditionPin,
+		getAlbumEditionsQuery,
+		getLocalAlbumEditionPinQuery,
+		setLocalAlbumEditionPin
+	} from '$lib/queries/albums/EditionQueries.svelte';
+	import type {
+		AlbumBasicInfo,
+		AlbumEditionItem,
+		LocalTrackInfo,
+		NativePickBasis,
+		NativeTrackListItem
+	} from '$lib/types';
 	import { createLibraryContributionMutation } from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { artistHref } from '$lib/utils/entityRoutes';
 
 	interface Props {
@@ -37,10 +58,34 @@
 	const album = $derived(albumQuery.data);
 	const tracks = $derived(tracksQuery.data?.items ?? []);
 	const editionsQuery = getAlbumEditionsQuery(
+		() => authStore.user?.id,
 		() => album?.musicbrainz_release_group_id ?? '',
 		() => Boolean(album?.musicbrainz_release_group_id)
 	);
 	const editions = $derived(editionsQuery.data?.items ?? []);
+	const rgMbid = $derived(album?.musicbrainz_release_group_id ?? '');
+	const localPinQuery = getLocalAlbumEditionPinQuery(
+		() => authStore.user?.id,
+		() => album?.id ?? '',
+		() => authStore.isTrusted && Boolean(rgMbid)
+	);
+	// the per-copy pin wins; the RG pin is the shared fallback (null on ambiguity)
+	const pinnedMbid = $derived(
+		localPinQuery.data?.pinned_release_mbid ?? editionsQuery.data?.pinned_release_mbid ?? null
+	);
+	const pinnedEdition = $derived(
+		editions.find((edition) => edition.release_mbid === pinnedMbid) ?? null
+	);
+	const currentEdition = $derived(
+		pinnedEdition ??
+			editions.find(
+				(edition) => edition.release_mbid === editionsQuery.data?.selected_release_mbid
+			) ??
+			null
+	);
+	const hasEffectivePin = $derived(pinnedEdition !== null);
+	const setLocalPin = setLocalAlbumEditionPin();
+	const clearLocalPin = clearLocalAlbumEditionPin();
 	const contributionMutation = createLibraryContributionMutation();
 
 	const reviewLabel = $derived(
@@ -51,6 +96,18 @@
 				: album?.identification_status === 'manual_identity_needs_review'
 					? 'Manual identity needs review'
 					: null
+	);
+	// Per-basis qualifier copy; an unknown future basis shows no qualifier
+	// (fail-closed, mirroring LocalIdentityBadge).
+	const pickBasisQualifier: Record<NativePickBasis, string> = {
+		pin: 'Year and cover shown from your pinned pressing.',
+		owned: 'Year and cover shown from your identified edition.',
+		embedded_tags: 'Year and cover shown from the best-fit pressing until the edition is verified.'
+	};
+	const qualifierText = $derived(
+		album?.album_identity_state === 'release_group_linked' && album.pick_basis
+			? (pickBasisQualifier[album.pick_basis] ?? null)
+			: null
 	);
 	const managementIdentityAttention = $derived(
 		album?.management_identity_readiness === 'exact_release_required'
@@ -78,20 +135,100 @@
 		playerStore.playQueue(queue, 0, shuffle);
 	}
 
+	let playlistModal = $state<{ open: (tracks: QueueItem[]) => void } | null>(null);
+
+	// Same 4-item menu as provider rows, via the shared builder: the native
+	// track adapts to the provider shapes (the backend download param is the
+	// file id, which is track.id on this path).
+	function getLocalTrackMenuItems(track: NativeTrackListItem): MenuItem[] {
+		const albumForMenu: AlbumBasicInfo = {
+			title: track.album_title,
+			musicbrainz_id: track.musicbrainz_release_group_id ?? track.album_id,
+			artist_name: track.artist_name,
+			artist_id: track.artist_id,
+			in_library: true
+		};
+		const resolvedLocal: LocalTrackInfo = {
+			track_file_id: track.id,
+			title: track.title,
+			track_number: track.track_number,
+			disc_number: track.disc_number,
+			duration_seconds: track.duration_seconds,
+			size_bytes: track.file_size_bytes,
+			format: track.format
+		};
+		return getTrackContextMenuItems(
+			{ position: track.track_number, disc_number: track.disc_number, title: track.title },
+			albumForMenu,
+			resolvedLocal,
+			null,
+			null,
+			null,
+			playlistModal,
+			album?.download_allowed !== false
+		);
+	}
+
 	function openContribution(): void {
 		if (!album) return;
 		if (album.contribution_id) {
-			void goto(`/library/contributions/${album.contribution_id}`);
+			void goto(withBasePath(`/library/contributions/${album.contribution_id}`));
 			return;
 		}
 		contributionMutation.mutate(album.id);
+	}
+
+	function editionLabel(e: AlbumEditionItem): string {
+		const bits = [
+			e.disambiguation,
+			e.date?.slice(0, 4),
+			e.country,
+			`${e.track_count} tracks`
+		].filter(Boolean);
+		return bits.join(' · ') || e.release_mbid.slice(0, 8);
+	}
+
+	async function handlePickLocalEdition(releaseMbid: string | null) {
+		// Per-album pins address one library-local copy: album.id is that id,
+		// never the RG MBID (unowned RGs never reach this page's picker).
+		const localId = album?.id;
+		if (!localId) return;
+		(document.activeElement as HTMLElement | null)?.blur();
+		try {
+			if (releaseMbid === null) {
+				await clearLocalPin.mutateAsync({
+					userId: authStore.user?.id,
+					localId,
+					rgMbid
+				});
+				toastStore.show({ message: 'Edition back to automatic.', type: 'success' });
+			} else {
+				await setLocalPin.mutateAsync({
+					userId: authStore.user?.id,
+					localId,
+					rgMbid,
+					releaseMbid
+				});
+				toastStore.show({ message: 'Edition pinned.', type: 'success' });
+			}
+			// No manual refetch: the pin mutations already invalidate this
+			// page's album-detail key on success.
+		} catch (e) {
+			toastStore.show({
+				message: e instanceof Error ? e.message : 'Could not change the edition',
+				type: 'error'
+			});
+		}
 	}
 </script>
 
 <svelte:head><title>{album?.title ?? 'Album'} · Library</title></svelte:head>
 
 <main class="container mx-auto p-4 md:p-6 lg:p-8">
-	<button class="btn btn-ghost btn-sm mb-5 gap-2" onclick={() => goto('/library/albums')}>
+	<button
+		class="btn btn-ghost btn-sm mb-5 gap-2"
+		onclick={() => goto(withBasePath('/library/albums'))}
+	>
 		<ChevronLeft class="h-4 w-4" /> Albums
 	</button>
 
@@ -138,10 +275,18 @@
 					subject="album"
 					showDescription
 					className="mt-3"
+					pickBasis={album.pick_basis ?? null}
 				/>
 				<p class="mt-2 text-sm text-base-content/50">
 					{album.year ?? 'Year unknown'} · {album.track_count}
 					{album.track_count === 1 ? 'track' : 'tracks'}
+					{#if qualifierText}
+						<span
+							class="ml-1 align-middle text-xs text-base-content/45"
+							title={qualifierText}
+							aria-label={qualifierText}>· best-fit edition</span
+						>
+					{/if}
 				</p>
 				<div class="mt-5 flex flex-wrap items-center gap-2">
 					<button
@@ -152,6 +297,13 @@
 					<button class="btn btn-ghost gap-2" disabled={!tracks.length} onclick={() => play(true)}
 						><Shuffle class="h-4 w-4" /> Shuffle</button
 					>
+					<AlbumDownloadButton
+						albumId={album.id}
+						mbid={null}
+						totalSizeBytes={album.total_size_bytes}
+						trackCount={tracks.length}
+						downloadAllowed={album.download_allowed !== false}
+					/>
 					{#if authStore.isTrusted && album.album_identity_state === 'local_only'}
 						<button
 							class="btn btn-ghost gap-2"
@@ -175,7 +327,8 @@
 				{#if album.review_id && authStore.isAdmin}
 					<a
 						class="link link-warning mt-3 inline-block text-sm"
-						href={`/library/review?review=${album.review_id}`}>Open identification review</a
+						href={withBasePath(`/library/review?review=${album.review_id}`)}
+						>Open identification review</a
 					>
 				{/if}
 			</div>
@@ -198,7 +351,7 @@
 					<p class="mt-2">No playable tracks are attached to this album.</p>
 				</div>
 			{:else}
-				<LocalAlbumTrackList {tracks} />
+				<LocalAlbumTrackList {tracks} getTrackMenuItems={getLocalTrackMenuItems} />
 			{/if}
 		</section>
 
@@ -217,6 +370,59 @@
 					>
 				{/if}
 			</div>
+			{#if album.musicbrainz_release_group_id && authStore.isTrusted && editions.length > 0}
+				<div class="dropdown mt-3">
+					<button type="button" class="btn btn-ghost btn-xs gap-1" tabindex="0">
+						{#if hasEffectivePin}
+							<Pin class="h-3 w-3 text-primary" />
+						{/if}
+						Edition: {hasEffectivePin
+							? currentEdition
+								? editionLabel(currentEdition)
+								: 'Automatic'
+							: currentEdition
+								? `Automatic · ${editionLabel(currentEdition)}`
+								: 'Automatic'}
+						<ChevronDown class="h-3 w-3" />
+					</button>
+					<ul
+						class="dropdown-content menu menu-sm z-50 mt-1 max-h-72 w-80 flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 shadow-lg"
+					>
+						<li>
+							<button
+								type="button"
+								class:font-semibold={!hasEffectivePin}
+								onclick={() => void handlePickLocalEdition(null)}
+							>
+								Automatic (best match for this library)
+							</button>
+						</li>
+						{#each editions as edition (edition.release_mbid)}
+							<li>
+								<button
+									type="button"
+									class="justify-between gap-2"
+									class:font-semibold={edition.release_mbid === pinnedMbid}
+									onclick={() => void handlePickLocalEdition(edition.release_mbid)}
+								>
+									<span class="truncate">{editionLabel(edition)}</span>
+									<span class="flex shrink-0 gap-1">
+										{#if edition.is_owned}
+											<span class="badge badge-success badge-xs">owned</span>
+										{/if}
+										{#if !hasEffectivePin && edition.release_mbid === editionsQuery.data?.selected_release_mbid}
+											<span class="badge badge-info badge-xs">automatic</span>
+										{/if}
+										{#if edition.release_mbid === pinnedMbid}
+											<span class="badge badge-primary badge-xs">pinned</span>
+										{/if}
+									</span>
+								</button>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
 			{#if album.musicbrainz_release_group_id}
 				{#if editionsQuery.isLoading}
 					<div class="mt-3 grid gap-2 sm:grid-cols-2">
@@ -257,5 +463,6 @@
 				</p>
 			{/if}
 		</section>
+		<AddToPlaylistModal bind:this={playlistModal} />
 	{/if}
 </main>

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowRight, CheckCircle2, FileClock, ShieldAlert } from 'lucide-svelte';
+	import { ArrowRight, CircleCheckBig, FileClock, ShieldAlert } from 'lucide-svelte';
 
 	import type { LibraryManagementResultItem } from '$lib/queries/library-management/types';
 	import {
@@ -8,6 +8,7 @@
 		managementPlanAlbum,
 		managementPlanArtist,
 		managementPlanTitle,
+		managementReasonLabel,
 		titleManagementValue
 	} from './LibraryManagementDisplay';
 	import LibraryManagementLyricsEvidence from './LibraryManagementLyricsEvidence.svelte';
@@ -52,7 +53,9 @@
 						? 'badge-success'
 						: 'badge-outline'}"
 			>
-				{titleManagementValue(status)}
+				{item.failure_code
+					? managementReasonLabel(item.failure_code)
+					: titleManagementValue(status)}
 			</span>
 		</div>
 	</header>
@@ -79,7 +82,7 @@
 			<ol class="management-journal-chain">
 				{#each item.journal_states as state, index (state)}
 					<li>
-						<CheckCircle2 class="h-3.5 w-3.5" />
+						<CircleCheckBig class="h-3.5 w-3.5" />
 						<span>{titleManagementValue(state)}</span>
 						{#if index < item.journal_states.length - 1}<ArrowRight
 								class="h-3 w-3 text-base-content/25"
@@ -100,7 +103,7 @@
 			<div class="flex items-start gap-2 rounded-xl border border-error/25 bg-error/5 p-3 text-sm">
 				<ShieldAlert class="mt-0.5 h-4 w-4 shrink-0 text-error" />
 				<div>
-					<strong>{titleManagementValue(item.failure_code)}</strong>
+					<strong>{managementReasonLabel(item.failure_code)}</strong>
 					<p class="mt-1 text-base-content/55">
 						{failureReason ??
 							'Check the journal and recovery details above to diagnose the failure.'}

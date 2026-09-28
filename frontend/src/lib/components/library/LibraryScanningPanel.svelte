@@ -3,7 +3,7 @@
 		CirclePause,
 		CirclePlay,
 		FolderSync,
-		Fingerprint,
+		FingerprintPattern,
 		ListChecks,
 		OctagonX,
 		RefreshCw,
@@ -26,6 +26,7 @@
 	import { getLibraryReviewsQuery } from '$lib/queries/library/LibraryReviewQueries.svelte';
 	import { getArtistReconciliationProgressQuery } from '$lib/queries/artist-reconciliation/ArtistReconciliationQueries.svelte';
 	import { getLibraryScanScheduleQuery } from '$lib/queries/library/LibraryQueries.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import LibraryWorkLane from './LibraryWorkLane.svelte';
 	import LibraryWorkDialog from './LibraryWorkDialog.svelte';
 	import LibraryRunHistory from './LibraryRunHistory.svelte';
@@ -90,10 +91,16 @@
 			.map(([code, count]) => `${deferredReasonLabel(code)}: ${count.toLocaleString()}`)
 			.join(', ')
 	);
+	const deferredJobs = $derived((identification?.deferred_jobs ?? []).slice(0, 5));
+	const hiddenDeferredJobs = $derived(
+		Math.max(0, (identification?.deferred_jobs?.length ?? 0) - 5)
+	);
 
 	function deferredReasonLabel(code: string): string {
 		const labels: Record<string, string> = {
 			PROVIDER_TEMPORARILY_UNAVAILABLE: 'provider temporarily unavailable',
+			UNMAPPABLE_PROVIDER_PAYLOAD:
+				'provider response could not be mapped (data problem, not an outage)',
 			SUBJECT_NOT_AVAILABLE: 'album no longer available',
 			MAX_DEFERRALS_EXCEEDED: 'retry limit reached'
 		};
@@ -159,10 +166,10 @@
 					{#if scheduleQuery.data?.scan_frequency === 'daily'}Next scan: {scheduleQuery.data
 							.daily_scan_time}
 						{scheduleQuery.data.server_timezone ??
-							''}{:else if scheduleQuery.data?.scan_frequency === 'manual'}Automatic scanning off{:else}Schedule:
+							''}{:else if scheduleQuery.data?.scan_frequency === 'manual'}Scheduled scans off (file watcher still active){:else}Schedule:
 						{scheduleQuery.data?.scan_frequency?.replace('_', ' ') ?? 'loading'}{/if}
 				</p>
-				<a href="/settings?tab=library" class="btn btn-ghost btn-sm">
+				<a href={withBasePath('/settings?tab=library')} class="btn btn-ghost btn-sm">
 					<Settings2 class="h-4 w-4" /> Settings
 				</a>
 			</div>
@@ -175,7 +182,8 @@
 					<p class="text-sm">
 						Scanning and identification are paused. Existing catalog data and playback keep working.
 						Enable the library in
-						<a class="link link-primary" href="/settings?tab=library">Settings</a> to start new work.
+						<a class="link link-primary" href={withBasePath('/settings?tab=library')}>Settings</a> to
+						start new work.
 					</p>
 				</div>
 			</div>
@@ -424,6 +432,7 @@
 							<span class="block text-xs text-base-content/50">Waiting</span><strong
 								>{(identification?.waiting_count ?? 0).toLocaleString()}</strong
 							>
+							<span class="block text-xs text-base-content/50">will auto-retry</span>
 						</div>
 						<div>
 							<span class="block text-xs text-base-content/50">Kept local</span><strong
@@ -436,9 +445,10 @@
 							>
 						</div>
 						<div>
-							<span class="block text-xs text-base-content/50">Needs review</span><strong
+							<span class="block text-xs text-base-content/50">Needs decision</span><strong
 								>{(identification?.needs_review_count ?? reviewCount).toLocaleString()}</strong
 							>
+							<span class="block text-xs text-base-content/50">will not auto-resolve</span>
 						</div>
 						<div>
 							<span class="block text-xs text-base-content/50">Deferred</span><strong
@@ -468,12 +478,32 @@
 							{(identification?.deferred_count ?? 0) === 1 ? 'check is' : 'checks are'} deferred{deferredReasonBreakdown
 								? ` (${deferredReasonBreakdown})`
 								: ''}. They retry automatically.
+							{#if deferredJobs.length > 0}
+								<ul class="mt-1 space-y-0.5">
+									{#each deferredJobs as job (job.job_id)}
+										<li class="text-xs">
+											<span class="font-medium">{job.album_title ?? 'Track-level work'}</span
+											>{#if job.artist_name}<span class="text-base-content/55">
+													- {job.artist_name}</span
+												>{/if}
+											<span class="text-base-content/50">
+												· {deferredReasonLabel(job.last_failure_code)} · attempt {job.attempt_count.toLocaleString()}</span
+											>
+										</li>
+									{/each}
+									{#if hiddenDeferredJobs > 0}
+										<li class="text-xs text-base-content/50">
+											and {hiddenDeferredJobs.toLocaleString()} more
+										</li>
+									{/if}
+								</ul>
+							{/if}
 						</div>
 					{/if}
 					<div class="flex flex-wrap items-center justify-between gap-2 text-sm">
 						<span class="text-base-content/55"
 							>Provider work runs in the background without delaying local playback.</span
-						><a class="link link-primary" href="/library/review?state=needs_review"
+						><a class="link link-primary" href={withBasePath('/library/review?state=needs_review')}
 							>Review identification</a
 						>
 					</div>
@@ -481,13 +511,13 @@
 			</article>
 
 			<a
-				href="/library/management/artists"
+				href={withBasePath('/library/management/artists')}
 				class="flex flex-wrap items-center gap-4 rounded-box border border-base-content/15 bg-base-200/40 p-4 hover:bg-base-200"
 			>
 				<div
 					class="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary"
 				>
-					<Fingerprint class="h-5 w-5" />
+					<FingerprintPattern class="h-5 w-5" />
 				</div>
 				<div class="min-w-0 flex-1">
 					<h3 class="font-semibold">Artist identity desk</h3>

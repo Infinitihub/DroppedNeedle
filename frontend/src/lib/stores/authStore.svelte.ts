@@ -1,6 +1,19 @@
+import { setDownloadScope } from '$lib/queries/downloads/downloadScope.svelte';
+import {
+	resetMusicBrainzSourceScope,
+	setMusicBrainzSourceScope
+} from '$lib/queries/musicbrainz/sourceScope.svelte';
+import type { MusicBrainzSourceMode } from '$lib/queries/musicbrainz/types';
+
 /** localStorage key holding the last hydrated user id, so a page load as a
- *  different user (shared browser) can clear the persisted query cache (AMU-5). */
+ * different user (shared browser) can clear the persisted query cache (AMU-5). */
 export const LAST_USER_ID_KEY = 'msr:last_user_id';
+
+export interface MusicBrainzSourceIdentity {
+	source_mode: MusicBrainzSourceMode;
+	source_id: string;
+	generation: number;
+}
 
 export interface AuthUser {
 	id: string;
@@ -11,6 +24,7 @@ export interface AuthUser {
 	username: string | null;
 	username_display: string | null;
 	providers: string[];
+	musicbrainz_source?: MusicBrainzSourceIdentity | null;
 }
 
 function createAuthStore() {
@@ -39,11 +53,20 @@ function createAuthStore() {
 		},
 
 		setUser(newUser: AuthUser) {
+			const previousUserId = user?.id ?? null;
+			setDownloadScope(newUser.id, newUser.role);
 			user = newUser;
+			if (newUser.musicbrainz_source) {
+				setMusicBrainzSourceScope(newUser.musicbrainz_source, newUser.id);
+			} else if (previousUserId !== newUser.id) {
+				resetMusicBrainzSourceScope();
+			}
 		},
 
 		clear() {
+			setDownloadScope(null);
 			user = null;
+			resetMusicBrainzSourceScope();
 		},
 
 		markInitialized() {

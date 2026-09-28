@@ -7,6 +7,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query, Response
 
 from api.v1.schemas.library_management import (
+    LibraryManagementActivationHealthResponse,
     LibraryManagementChangeImpact,
     LibraryManagementPresetDiff,
     LibraryManagementProfile,
@@ -28,6 +29,8 @@ from api.v1.schemas.library_management_preview import (
     LibraryManagementPreviewCreateRequest,
     LibraryManagementPreviewCreatedResponse,
     LibraryManagementPreviewDetailResponse,
+    LibraryManagementPreviewReissueResponse,
+    LibraryManagementImportBundleResolveResponse,
     LibraryManagementProfileCopyRequest,
     LibraryManagementProfileCreateRequest,
     LibraryManagementProfileDeleteRequest,
@@ -91,6 +94,16 @@ async def get_library_management_settings(
     service: LibraryManagementProfileServiceDep,
 ) -> LibraryManagementSettingsResponse:
     return service.get_settings()
+
+
+@router.get(
+    "/settings/library-management/activation-health",
+    response_model=LibraryManagementActivationHealthResponse,
+)
+async def get_library_management_activation_health(
+    service: LibraryManagementProfileServiceDep,
+) -> LibraryManagementActivationHealthResponse:
+    return service.activation_health()
 
 
 @router.put(
@@ -529,6 +542,18 @@ async def apply_library_management_preview(
     return await service.apply(job_id, request)
 
 
+@router.post(
+    "/library/management/previews/{job_id}/reissue",
+    response_model=LibraryManagementPreviewReissueResponse,
+)
+async def reissue_library_management_preview_token(
+    job_id: str,
+    admin: CurrentAdminDep,
+    service: LibraryManagementPreviewServiceDep,
+) -> LibraryManagementPreviewReissueResponse:
+    return await service.reissue_preview_token(job_id, admin.id)
+
+
 @router.get(
     "/library/management/recovery/diagnostics",
     response_model=LibraryManagementRecoveryDiagnosticsResponse,
@@ -537,6 +562,19 @@ async def get_library_management_recovery_diagnostics(
     service: LibraryManagementRecoveryServiceDep,
 ) -> LibraryManagementRecoveryDiagnosticsResponse:
     return LibraryManagementRecoveryDiagnosticsResponse(**await service.diagnostics())
+
+
+@router.post(
+    "/library/management/recovery/import-bundles/{bundle_id}/resolve",
+    response_model=LibraryManagementImportBundleResolveResponse,
+)
+async def resolve_library_management_import_bundle(
+    bundle_id: str,
+    service: LibraryManagementRecoveryServiceDep,
+) -> LibraryManagementImportBundleResolveResponse:
+    return LibraryManagementImportBundleResolveResponse(
+        **await service.resolve_import_bundle(bundle_id)
+    )
 
 
 @router.get(

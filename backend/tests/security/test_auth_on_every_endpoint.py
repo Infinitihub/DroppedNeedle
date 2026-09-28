@@ -11,25 +11,33 @@ auth-passed. This test owns the auth posture; route unit tests own body behaviou
 
 Service providers are overridden with non-raising mocks so dependency resolution
 never 500s before the auth dependency is evaluated (which would mask a 401).
-SSE stream endpoints are covered separately in ``test_sse_auth.py`` (their infinite
-generators can't be driven through ``TestClient`` for the admitted case).
+The multiplexed SSE stream endpoint IS inventoried: an autouse fixture
+swaps its generator for a one-event fake, so admitted requests end after the
+status/headers instead of hanging TestClient on the infinite stream.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 
-from api.v1.routes import connect_apps_routes
+from api.v1.routes import requests as requests_routes
 from api.v1.routes import auth as auth_routes
+from api.v1.routes import cache_status as cache_status_routes
+from api.v1.routes import connect_apps_routes
 from api.v1.routes import download_client as download_client_routes
 from api.v1.routes import download_clients as download_clients_routes
+from api.v1.routes import download as download_routes
+from api.v1.routes import indexers as indexers_routes
+from api.v1.routes import lastfm as lastfm_routes
 from api.v1.routes import downloads as downloads_routes
 from api.v1.routes import downloads_search as downloads_search_routes
+from api.v1.routes import events as events_routes
 from api.v1.routes import following as following_routes
 from api.v1.routes import free_music as free_music_routes
 from api.v1.routes import import_drop as import_drop_routes
 from api.v1.routes import plugins as plugins_routes
-from api.v1.routes import library as library_routes
+from api.v1.routes import prowlarr as prowlarr_routes
 from api.v1.routes import library_contributions as library_contribution_routes
 from api.v1.routes import library_management as library_management_routes
 from api.v1.routes import library_operations_target as library_operations_target_routes
@@ -39,7 +47,7 @@ from api.v1.routes import library_scan_target as target_library_scan_routes
 from api.v1.routes import library_target as target_library_routes
 from api.v1.routes import lidarr_import as lidarr_import_routes
 from api.v1.routes import discovery_batches as discovery_batches_routes
-from api.v1.routes import library_scan as library_scan_routes
+from api.v1.routes import discover as discover_routes
 from api.v1.routes import me_connections as me_routes
 from api.v1.routes import navidrome_preferences as navidrome_preferences_routes
 from api.v1.routes import playlists as playlists_routes
@@ -55,7 +63,10 @@ from core.dependencies import (
     get_auth_service,
     get_auth_store,
     get_cache,
+    get_cache_status_service,
     get_discovery_batch_service,
+    get_discover_service,
+    get_youtube_repo,
     get_download_client_repository,
     get_download_service,
     get_download_store,
@@ -70,7 +81,6 @@ from core.dependencies import (
     get_library_management_profile_service,
     get_library_contribution_service,
     get_library_policy_service,
-    get_library_scanner,
     get_library_service,
     get_local_files_service,
     get_drop_import_service,
@@ -90,7 +100,6 @@ from core.dependencies import (
     get_preferences_service,
     get_request_service,
     get_requests_page_service,
-    get_scan_state_store,
     get_settings_service,
     get_spotify_import_service,
     get_sse_publisher,
@@ -113,7 +122,7 @@ from core.dependencies import (
     get_target_reidentification_service,
     get_library_policy_resolver,
 )
-from core.dependencies.service_providers import get_target_library_policy_service
+from core.dependencies.service_providers import get_discovery_demand_service, get_target_library_policy_service
 from middleware import _get_current_admin, _get_current_curator, _get_current_user
 from tests.helpers import build_test_client, mock_admin_user, mock_user
 
@@ -122,7 +131,11 @@ _SERVICE_PROVIDERS = (
     get_auth_service,
     get_auth_store,
     get_cache,
+    get_cache_status_service,
     get_discovery_batch_service,
+    get_discover_service,
+    get_youtube_repo,
+    get_discovery_demand_service,
     get_download_client_repository,
     get_download_service,
     get_download_store,
@@ -137,7 +150,6 @@ _SERVICE_PROVIDERS = (
     get_library_management_profile_service,
     get_library_policy_service,
     get_target_library_policy_service,
-    get_library_scanner,
     get_library_service,
     get_local_files_service,
     get_drop_import_service,
@@ -157,7 +169,6 @@ _SERVICE_PROVIDERS = (
     get_preferences_service,
     get_request_service,
     get_requests_page_service,
-    get_scan_state_store,
     get_settings_service,
     get_spotify_import_service,
     get_sse_publisher,
@@ -255,9 +266,6 @@ _ADMIN_ENDPOINTS = [
     # Connect Apps admin oversight: see/revoke every user's app-passwords.
     ("GET", "/api/v1/connect-apps/admin/app-passwords", None),
     ("DELETE", "/api/v1/connect-apps/admin/app-passwords/ap-1", None),
-    ("POST", "/api/v1/library/scan/start", None),
-    ("POST", "/api/v1/library/scan/cancel", None),
-    ("GET", "/api/v1/library/scan/unmatched", None),
     ("GET", "/api/v1/settings/library/roots", None),
     ("PUT", "/api/v1/settings/library/roots", {"library_roots": []}),
     ("GET", "/api/v1/settings/library/policy-tree", None),
@@ -370,6 +378,11 @@ _ADMIN_ENDPOINTS = [
         },
     ),
     (
+        "GET",
+        "/api/v1/settings/library-management/activation-health",
+        None,
+    ),
+    (
         "POST",
         "/api/v1/library/management/previews",
         {
@@ -393,16 +406,16 @@ _ADMIN_ENDPOINTS = [
     ),
     ("GET", "/api/v1/library/management/previews/job-1", None),
     ("GET", "/api/v1/library/management/previews/job-1/items", None),
+    ("POST", "/api/v1/library/management/previews/job-1/reissue", None),
+    (
+        "POST",
+        "/api/v1/library/management/recovery/import-bundles/bundle-1/resolve",
+        None,
+    ),
     (
         "POST",
         "/api/v1/settings/library/policy-apply-preview",
         {"scope_ids": [], "expected_policy_revision": "policy"},
-    ),
-    ("POST", "/api/v1/library/scan/unmatched/1/resolve", {"resolution": "reject"}),
-    (
-        "POST",
-        "/api/v1/library/scan/unmatched/resolve-batch",
-        {"release_group_mbid": "rg-1", "items": []},
     ),
     ("GET", "/api/v1/download-client/config", None),
     ("PUT", "/api/v1/download-client/config", {}),
@@ -412,6 +425,8 @@ _ADMIN_ENDPOINTS = [
     ("POST", "/api/v1/downloads/task-1/reimport", None),
     ("GET", "/api/v1/library/tracks/file-1/tags", None),
     ("POST", "/api/v1/library/albums/rg-1/rescan", None),
+    ("PUT", "/api/v1/library/albums/album-1/edition", {"release_mbid": "11111111-1111-4111-8111-111111111111"}),
+    ("DELETE", "/api/v1/library/albums/album-1/edition", None),
     # Spotify app credentials + home settings (admin-gated at the /settings router level).
     ("GET", "/api/v1/settings/spotify", None),
     ("PUT", "/api/v1/settings/spotify", {}),
@@ -420,6 +435,8 @@ _ADMIN_ENDPOINTS = [
     # Wanted watcher settings (admin, download-clients router)
     ("GET", "/api/v1/download-clients/wanted", None),
     ("PUT", "/api/v1/download-clients/wanted", {}),
+    # Acquisition-quality policy routes (Acquisition plan) - admin preview
+    ("POST", "/api/v1/download-clients/policy/impact", {}),
     # Free Music settings (admin, settings router)
     ("GET", "/api/v1/settings/free-music", None),
     (
@@ -439,16 +456,25 @@ _ADMIN_ENDPOINTS = [
     ("PUT", "/api/v1/settings/events", {}),
     ("POST", "/api/v1/settings/events/test-ticketmaster", {}),
     ("POST", "/api/v1/settings/events/test-skiddle", {}),
-    # Lidarr import: connection config + Test are admin-only (LidarrImport).
+    # Lidarr import: admin-only (owner decision 2026-09-07) - connection
+    # config + Test + candidates + import.
     ("GET", "/api/v1/lidarr-import/config", None),
     ("PUT", "/api/v1/lidarr-import/config", {}),
     ("POST", "/api/v1/lidarr-import/test", {}),
-    # Plugin API (phase 01b): admin-only. No source surfaces exist (D22).
-    # (both reject a plain user with 403, so they live in the admin list).
+    ("GET", "/api/v1/lidarr-import/artists", None),
+    ("POST", "/api/v1/lidarr-import/import", {"selected_mbids": []}),
+    # Prowlarr: connection config + Test are admin-only (same shape).
+    ("GET", "/api/v1/prowlarr/config", None),
+    ("PUT", "/api/v1/prowlarr/config", {}),
+    ("POST", "/api/v1/prowlarr/test", {}),
+    # Plugin API (phase 01b): management + the panel bundle are admin-only
+    # (a plain user sees 403, so they live in the admin list).
     ("GET", "/api/v1/plugins", None),
     ("POST", "/api/v1/plugins/install", {"repository_url": "https://github.com/o/r"}),
     ("PUT", "/api/v1/plugins/demo", {"enabled": False, "settings": {}}),
     ("DELETE", "/api/v1/plugins/demo", None),
+    ("GET", "/api/v1/plugins/ext/demo/admin-thing", None),
+    ("GET", "/api/v1/plugins/demo/ui/panel.js", None),
     # Drop importer (phase 01c): curator-gated (admin + trusted) - a plain user
     # must see 403. POST /import/uploads is multipart and can't be driven here;
     # its auth posture is covered in tests/routes/test_import_drop_routes.py.
@@ -463,6 +489,28 @@ _ADMIN_ENDPOINTS = [
     ("GET", "/api/v1/requests/auto-download-approval-batches", None),
     ("POST", "/api/v1/requests/auto-download-approval-batches/batch-1/approve", None),
     ("POST", "/api/v1/requests/auto-download-approval-batches/batch-1/reject", None),
+    ("GET", "/api/v1/requests/pending-approvals", None),
+    ("GET", "/api/v1/requests/pending-approvals/count", None),
+    (
+        "POST",
+        "/api/v1/requests/approve/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa?request_kind=album",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/approve/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/reject/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa?request_kind=album",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/reject/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
     # Feedback Fixes target-only surfaces. The router remains unmounted in production
     # until the separately authorized offline replacement, but its auth contract is
     # complete and testable in isolation.
@@ -526,6 +574,11 @@ _ADMIN_ENDPOINTS = [
     ("POST", "/api/v1/library/operations/job-1/pause", {"expected_row_revision": 1}),
     ("POST", "/api/v1/library/operations/job-1/resume", {"expected_row_revision": 1}),
     ("POST", "/api/v1/library/operations/job-1/stop", {"expected_row_revision": 1}),
+    (
+        "POST",
+        "/api/v1/library/albums/album-1/undo-automatic-edition",
+        {"expected_album_revision": 1, "expected_identity_revision": 2},
+    ),
     (
         "POST",
         "/api/v1/library/albums/album-1/reidentify",
@@ -759,9 +812,93 @@ _ADMIN_ENDPOINTS = [
     ),
     ("POST", "/api/v1/downloads/held/management/task-1/retry", None),
     ("POST", "/api/v1/downloads/held/management/task-1/discard", None),
+    # F-16: global Last.fm linking is admin-only (per-user flow lives at /me).
+    ("POST", "/api/v1/lastfm/auth/token", None),
+    ("POST", "/api/v1/lastfm/auth/session", {"token": "tok-123"}),
+    # F-17: precache cancel is curator-gated (status and the mux stream stay user-open).
+    ("POST", "/api/v1/cache/sync/cancel", None),
+    # F-18: indexer management is admin-only.
+    ("GET", "/api/v1/indexers", None),
+    ("POST", "/api/v1/indexers", {}),
+    ("GET", "/api/v1/indexers/search-backend", None),
+    ("PUT", "/api/v1/indexers/search-backend", {}),
+    ("PUT", "/api/v1/indexers/idx-1", {}),
+    ("DELETE", "/api/v1/indexers/idx-1", None),
+    ("POST", "/api/v1/indexers/reorder", {}),
+    ("POST", "/api/v1/indexers/test", {}),
 ]
-
 _USER_ENDPOINTS = [
+    # Local file downloads: authenticated users admitted by default; the E5
+    # setting can narrow this to trusted/admin (covered per-role in
+    # tests/routes/test_download_routes.py).
+    ("GET", "/api/v1/download/local/track/file-1", None),
+    ("GET", "/api/v1/download/local/album/album-1", None),
+    ("GET", "/api/v1/download/local/album/mbid/mbid-1", None),
+    ("GET", "/api/v1/download/access", None),
+    ("POST", "/api/v1/discover/activity", {"feature": "queue"}),
+    ("POST", "/api/v1/discover/queue/preview/074aa5b0-712e-4d6c-8d14-8aedc43e84fd", None),
+    # Request submission surfaces: both album and exact-track asks are user
+    # scoped and must remain behind the CurrentUser dependency.
+    (
+        "POST",
+        "/api/v1/requests/new",
+        {
+            "musicbrainz_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "artist": "A",
+            "album": "B",
+        },
+    ),
+    (
+        "POST",
+        "/api/v1/requests/batch",
+        {
+            "items": [
+                {
+                    "musicbrainz_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "artist_name": "A",
+                    "album_title": "B",
+                }
+            ]
+        },
+    ),
+    (
+        "POST",
+        "/api/v1/requests/batch/cancel",
+        {"musicbrainz_ids": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]},
+    ),
+    ("GET", "/api/v1/requests/active", None),
+    ("GET", "/api/v1/requests/active/count", None),
+    ("GET", "/api/v1/requests/history", None),
+    (
+        "DELETE",
+        "/api/v1/requests/active/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/active/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/retry/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "POST",
+        "/api/v1/requests/retry/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/history/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        None,
+    ),
+    (
+        "DELETE",
+        "/api/v1/requests/history/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb?request_kind=track",
+        None,
+    ),
     ("GET", "/api/v1/library/contributions/contribution-1", None),
     ("GET", "/api/v1/me/navidrome/music-folder-preferences", None),
     (
@@ -769,9 +906,14 @@ _USER_ENDPOINTS = [
         "/api/v1/me/navidrome/music-folder-preferences",
         {"mode": "all", "selected_folder_ids": []},
     ),
-    ("GET", "/api/v1/library/scan/status", None),
     ("GET", "/api/v1/download-client/status", None),
     ("GET", "/api/v1/downloads", None),
+    # Acquisition-quality user surfaces (Acquisition plan): safe summary for any
+    # signed-in user; owner-or-admin restart (non-owner gets 404/403, never 500).
+    ("GET", "/api/v1/download-clients/policy-summary", None),
+    ("POST",
+     "/api/v1/downloads/task-1/restart-with-current-policy",
+     {"expected_snapshot_hash": None}),
     ("GET", "/api/v1/downloads/activity-summary", None),
     ("GET", "/api/v1/downloads/task-1/files", None),
     ("POST", "/api/v1/downloads/task-1/cancel", None),
@@ -782,6 +924,8 @@ _USER_ENDPOINTS = [
     ),
     ("POST", "/api/v1/downloads/task-1/retry", None),
     ("GET", "/api/v1/downloads/task-1", None),
+    ("POST", "/api/v1/downloads/held/1/reverify", None),
+    ("POST", "/api/v1/downloads/held/reverify", {}),
     (
         "POST",
         "/api/v1/downloads/search/album",
@@ -791,9 +935,14 @@ _USER_ENDPOINTS = [
     ("POST", "/api/v1/downloads/search/job-1/pick", {"candidate_index": 0}),
     ("POST", "/api/v1/downloads/search/job-1/dismiss", None),
     ("POST", "/api/v1/downloads/search/job-1/cancel", None),
-    ("POST", "/api/v1/tracks/rec-1/request", {"artist_name": "A", "track_title": "T"}),
-    ("GET", "/api/v1/library/artists", None),
+    (
+        "POST",
+        "/api/v1/tracks/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/request",
+        {"artist_name": "A", "track_title": "T"},
+    ),
     ("GET", "/api/v1/library/albums", None),
+    ("GET", "/api/v1/library/full-albums", None),
+    ("PUT", "/api/v1/library/albums/album-1/full", {"marked_full": True}),
     ("GET", "/api/v1/library/tracks", None),
     ("GET", "/api/v1/library/stats", None),
     ("GET", "/api/v1/library/albums/rg-1/tracks", None),
@@ -801,13 +950,14 @@ _USER_ENDPOINTS = [
     ("GET", "/api/v1/library/mbids", None),
     ("GET", "/api/v1/library/recently-added", None),
     ("GET", "/api/v1/library/artists/artist-1", None),
+    ("GET", "/api/v1/library/artists", None),
     ("GET", "/api/v1/library/artists/artist-1/albums", None),
     ("GET", "/api/v1/library/artists/artist-1/appearances", None),
     ("GET", "/api/v1/library/albums/album-1", None),
     ("GET", "/api/v1/library/albums/album-1/artwork/cached?v=1", None),
+    ("GET", "/api/v1/library/albums/album-1/edition", None),
     ("POST", "/api/v1/library/resolve-tracks", {"items": []}),
     ("GET", "/api/v1/library/activity", None),
-    ("GET", "/api/v1/me/section-prefs", None),
     ("POST", "/api/v1/me/personal-mix/refresh", None),
     ("PUT", "/api/v1/me/section-prefs", {"page": "home", "sections": []}),
     ("GET", "/api/v1/discover/batches", None),
@@ -819,6 +969,11 @@ _USER_ENDPOINTS = [
     ("GET", "/api/v1/discover/batches/b-1", None),
     ("DELETE", "/api/v1/discover/batches/b-1", None),
     ("GET", "/api/v1/system/health", None),
+    # Plugin v1 user surfaces: the read-only sources listing plus ext routes a
+    # plugin declares with user auth. Admin-authed ext routes and the panel
+    # bundle stay admin-only (above).
+    ("GET", "/api/v1/plugins/sources", None),
+    ("GET", "/api/v1/plugins/ext/demo/lookup", None),
     # Spotify per-user linking + browsing, and request-missing on an owned playlist.
     # (POST /me/spotify/playlists/{id}/import is intentionally omitted: it spawns a real
     # background task through the DI getters that can't be driven by the mock harness; it
@@ -826,8 +981,9 @@ _USER_ENDPOINTS = [
     ("GET", "/api/v1/me/connections/spotify/auth/url", None),
     ("GET", "/api/v1/me/spotify/playlists", None),
     ("POST", "/api/v1/playlists/pl-1/request-missing", None),
-    # Following hub. GET /following/events is omitted: it's an SSE stream whose
-    # infinite generator can't be driven through TestClient for the admitted case.
+    # Following hub. The old per-feed GET /following/events stream was removed;
+    # the mux replacement below is inventoried via the one-event fixture.
+    ("GET", "/api/v1/events/stream", None),
     ("GET", "/api/v1/following/artists", None),
     ("GET", "/api/v1/following/new-releases", None),
     ("GET", "/api/v1/following/new-releases/recent", None),
@@ -850,16 +1006,11 @@ _USER_ENDPOINTS = [
         None,
     ),
     ("POST", "/api/v1/requests/wanted/22222222-2222-2222-2222-222222222222/seen", None),
-    # Lidarr import: any authenticated user reads candidates + imports into their OWN
-    # follows (no target-user param - the caller can only ever import to themselves).
     # Free Music: reading your own downloads is a user surface.
     ("GET", "/api/v1/free-music/tasks", None),
     ("GET", "/api/v1/free-music/tasks/t-1", None),
     ("DELETE", "/api/v1/free-music/tasks", None),
     ("DELETE", "/api/v1/free-music/tasks/t-1", None),
-    ("GET", "/api/v1/lidarr-import/status", None),
-    ("GET", "/api/v1/lidarr-import/artists", None),
-    ("POST", "/api/v1/lidarr-import/import", {"selected_mbids": []}),
     # Media-server playback attribution (issue #138): the POST reporting routes
     # carry CurrentUserDep so scrobbles/sessions land on the caller's own
     # upstream account. GET/HEAD stream proxies stay dependency-free (guarded by
@@ -891,6 +1042,57 @@ _USER_ENDPOINTS = [
 _ALL_ENDPOINTS = _ADMIN_ENDPOINTS + _USER_ENDPOINTS
 
 
+@pytest.fixture(autouse=True)
+def finite_sse_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Swap the infinite mux SSE generator for a one-event fake.
+
+    The real generator never ends; TestClient buffers a response to
+    completion, so admitted requests must end after the status/headers for the
+    inventory loops above to assert on them.
+    """
+
+    async def one_mux_frame(*args, **kwargs):
+        yield "retry: 5000\n\n"
+
+    monkeypatch.setattr(events_routes, "mux_events", one_mux_frame)
+
+
+@pytest.fixture(autouse=True)
+def _fake_plugin_ext_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Canned publisher plugin for the ext auth rows.
+
+    The ext surface calls get_plugin_host() directly instead of via Depends,
+    so the dependency_overrides in _client never reach it. Without this the
+    admin ext row would 404 (no plugin) instead of exercising the 403 gate.
+    """
+    from infrastructure.plugins.host import LoadedPlugin, PluginRouteResult
+    from infrastructure.plugins.manifest import PluginManifest, PluginRouteSpec
+
+    plugin = LoadedPlugin(
+        manifest=PluginManifest(
+            name="demo",
+            version="1.0.0",
+            api_version=1,
+            entrypoint="plugin:Demo",
+            capabilities=["publisher"],
+            display_name="Demo",
+            routes=[
+                PluginRouteSpec(path="lookup", method="GET", auth="user"),
+                PluginRouteSpec(path="admin-thing", method="GET", auth="admin"),
+            ],
+        ),
+        enabled=True,
+        active_capabilities=["publisher"],
+    )
+    plugin.instance = object()
+    host = MagicMock()
+    host.get = MagicMock(side_effect=lambda name: plugin if name == "demo" else None)
+    host.handle_plugin_route = AsyncMock(
+        return_value=PluginRouteResult(status=200, body={"ok": True})
+    )
+    monkeypatch.setattr(plugins_routes, "get_plugin_host", lambda: host)
+
+
 def _deny_admin():
     raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -903,19 +1105,22 @@ def _client(scenario: str):
     # routers MUST precede the /downloads/{task_id} catch-all.
     for router in (
         auth_routes.router,
-        library_scan_routes.router,
+        cache_status_routes.router,
         download_client_routes.router,
         download_clients_routes.router,
+        download_routes.router,
+        indexers_routes.router,
+        lastfm_routes.router,
         quarantine_routes.router,
         downloads_search_routes.router,
         downloads_routes.router,
         following_routes.router,
+        events_routes.router,
         tracks_routes.router,
         library_operations_target_routes.router,
         target_library_routes.router,
         library_contribution_routes.router,
         target_library_scan_routes.router,
-        library_routes.router,
         target_library_policy_routes.router,
         library_management_routes.router,
         library_policy_routes.router,
@@ -923,10 +1128,13 @@ def _client(scenario: str):
         navidrome_preferences_routes.router,
         connect_apps_routes.router,
         discovery_batches_routes.router,
+        discover_routes.router,
         system_routes.router,
         playlists_routes.router,
+        requests_routes.router,
         requests_page_routes.router,
         lidarr_import_routes.router,
+        prowlarr_routes.router,
         import_drop_routes.router,
         free_music_routes.router,
         plugins_routes.router,
@@ -939,6 +1147,7 @@ def _client(scenario: str):
 
     for provider in _SERVICE_PROVIDERS:
         app.dependency_overrides[provider] = lambda: AsyncMock()
+    app.dependency_overrides[get_discovery_demand_service] = lambda: MagicMock()
     target_native = AsyncMock()
     target_native.artists.return_value = ([], 0)
     target_native.albums.return_value = ([], 0)

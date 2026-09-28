@@ -5,7 +5,9 @@
 	import Toast from '$lib/components/Toast.svelte';
 	import LastFmAlbumEnrichmentComponent from '$lib/components/LastFmAlbumEnrichment.svelte';
 	import DeleteAlbumModal from '$lib/components/DeleteAlbumModal.svelte';
+	import RemoveTrackFileDialog from './RemoveTrackFileDialog.svelte';
 	import AddToPlaylistModal from '$lib/components/AddToPlaylistModal.svelte';
+	import { ApiError } from '$lib/api/client';
 	import { createAlbumPageState } from './albumPageState.svelte';
 	import AlbumHeader from './AlbumHeader.svelte';
 	import UnmatchedFilesSection from './UnmatchedFilesSection.svelte';
@@ -17,12 +19,15 @@
 	import { albumHref } from '$lib/utils/entityRoutes';
 	import LibraryAlbumCard from '$lib/components/library/LibraryAlbumCard.svelte';
 	import { getLibraryAlbumCopiesQuery } from '$lib/queries/library/LibraryQueries.svelte';
+	import LocalAlbumPage from './LocalAlbumPage.svelte';
+	import type { LibraryAlbumDetail } from '$lib/types';
 
 	interface Props {
 		data: { albumId: string };
+		localAlbum?: LibraryAlbumDetail;
 	}
 
-	let { data }: Props = $props();
+	let { data, localAlbum }: Props = $props();
 
 	const pageState = createAlbumPageState(() => data.albumId);
 	const localCopiesQuery = getLibraryAlbumCopiesQuery(() => data.albumId);
@@ -30,6 +35,12 @@
 	let copyDialog: HTMLDialogElement;
 	let mergeSourceId = $state<string | null>(null);
 	let mergeTargetId = $state<string | null>(null);
+	const primaryError = $derived(pageState.primaryError);
+	const albumNotFound = $derived(primaryError instanceof ApiError && primaryError.status === 404);
+	const providerUnavailable = $derived.by(() => {
+		if (!(primaryError instanceof ApiError)) return false;
+		return primaryError.status === 0 || primaryError.status === 429 || primaryError.status >= 500;
+	});
 
 	function showCopies(): void {
 		mergeSourceId = null;
@@ -56,10 +67,35 @@
 		<BackButton />
 	</div>
 
-	{#if pageState.error}
+	{#if albumNotFound}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
-				<span>{pageState.error}</span>
+				<span>Album not found.</span>
+			</div>
+		</div>
+	{:else if providerUnavailable && localAlbum}
+		<div class="mb-4 flex justify-center">
+			<div class="alert alert-info text-sm">
+				<span
+					>MusicBrainz is unreachable right now, so this page is built from your local files. Some
+					extras are hidden until it returns.</span
+				>
+			</div>
+		</div>
+		<LocalAlbumPage albumId={localAlbum.id} />
+	{:else if providerUnavailable}
+		<div class="flex items-center justify-center min-h-[50vh]">
+			<div class="alert alert-error">
+				<span>MusicBrainz is temporarily unavailable.</span>
+				<button class="btn btn-sm btn-ghost" onclick={() => void pageState.refreshAll()}>
+					Retry
+				</button>
+			</div>
+		</div>
+	{:else if pageState.error || primaryError}
+		<div class="flex items-center justify-center min-h-[50vh]">
+			<div class="alert alert-error">
+				<span>{pageState.error ?? 'Error loading album'}</span>
 			</div>
 		</div>
 	{:else if pageState.loadingBasic || !pageState.album}
@@ -106,6 +142,7 @@
 				mbTrackCount={pageState.tracksInfo?.total_tracks ?? 0}
 				releaseGroupMbid={album.musicbrainz_id}
 				{localCopies}
+				downloadAllowed={pageState.localMatch?.download_allowed !== false}
 				onrequest={pageState.handleRequest}
 				ondelete={pageState.handleDeleteClick}
 				onrefresh={pageState.refreshAll}
@@ -224,6 +261,7 @@
 						heldByPosition={pageState.heldByPosition}
 						trackDownloadTasks={pageState.trackDownloadTasks}
 						releaseGroupMbid={album.musicbrainz_id}
+						releaseMbid={pageState.tracksInfo?.selected_release_mbid}
 						onPlaySourceTrack={pageState.playSourceTrack}
 						onTrackGenerated={pageState.handleTrackGenerated}
 						onQuotaUpdate={pageState.handleQuotaUpdate}
@@ -342,6 +380,16 @@
 </dialog>
 
 <Toast bind:show={pageState.showToast} message={pageState.toastMessage} type={pageState.toastType} />
+
+{#if pageState.removeFileTarget}
+	<RemoveTrackFileDialog
+		trackTitle={pageState.removeFileTarget.title}
+		removing={pageState.removeFilePending}
+		error={pageState.removeFileError}
+		onconfirm={pageState.confirmRemoveFile}
+		onclose={pageState.closeRemoveFileDialog}
+	/>
+{/if}
 
 {#if pageState.showDeleteModal && pageState.album}
 	<DeleteAlbumModal

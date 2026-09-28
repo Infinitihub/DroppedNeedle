@@ -4,23 +4,34 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 	import AlbumCardSkeleton from '$lib/components/AlbumCardSkeleton.svelte';
 	import SearchTopResult from '$lib/components/SearchTopResult.svelte';
-	import type { Album, EnrichmentSource } from '$lib/types';
+	import type {
+		Album,
+		EnrichmentSource,
+		SearchBucketResponse,
+		SearchRemoteStatus
+	} from '$lib/types';
 	import { colors } from '$lib/colors';
 	import { searchStore } from '$lib/stores/search';
 	import { fetchEnrichmentBatch, applyAlbumEnrichment } from '$lib/utils/enrichment';
 	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
 	import { isAbortError } from '$lib/utils/errorHandling';
 	import { api } from '$lib/api/client';
-	import { Check } from 'lucide-svelte';
+	import { Check, RefreshCw } from 'lucide-svelte';
+	import { API } from '$lib/constants';
+	import { getSearchStatusNotice } from '$lib/utils/searchStatus';
+	import { updatePaginatedSearchResults } from '$lib/utils/paginatedSearchResults';
 
 	interface Props {
 		data: { query: string };
 	}
 
 	let { data }: Props = $props();
+
+	let normalizedQuery = $derived(data.query.trim());
 
 	let albums: Album[] = $state([]);
 	let topAlbum: Album | null = $state(null);
@@ -34,17 +45,27 @@
 	let observer: IntersectionObserver | null = null;
 	let enrichmentSource: EnrichmentSource = $state('none');
 	let lastQuery = $state('');
+	let remoteStatus: SearchRemoteStatus = $state('ok');
+	let replaceOnNextLoad = false;
+	let statusNotice = $derived(getSearchStatusNotice(remoteStatus, 'albums', false));
 
 	function navigateBack() {
-		if (data.query) {
-			goto(`/search?q=${encodeURIComponent(data.query)}`);
+		if (normalizedQuery) {
+			goto(withBasePath(`/search?q=${encodeURIComponent(normalizedQuery)}`));
 		}
 	}
 
 	function navigateToBucket(bucket: 'artists') {
-		if (data.query) {
-			goto(`/search/${bucket}?q=${encodeURIComponent(data.query)}`);
+		if (normalizedQuery) {
+			goto(withBasePath(`/search/${bucket}?q=${encodeURIComponent(normalizedQuery)}`));
 		}
+	}
+	function retryRemoteSearch() {
+		if (loading || !normalizedQuery) return;
+		replaceOnNextLoad = true;
+		offset = 0;
+		hasMore = true;
+		void loadMore();
 	}
 
 	function handleAlbumAdded() {
@@ -64,51 +85,64 @@
 	});
 
 	async function loadMore() {
-		if (loading || !hasMore || !data.query) return;
+		if (loading || !hasMore || !normalizedQuery) return;
 
 		loading = true;
+		const requestOffset = offset;
+		const replaceResults = replaceOnNextLoad && requestOffset === 0;
 
 		if (abortController) {
 			abortController.abort();
 		}
 		abortController = new AbortController();
-
 		try {
-			const responseData = await api.get<{ results?: Album[]; top_result?: Album | null }>(
-				`/api/v1/search/albums?q=${encodeURIComponent(data.query)}&limit=${limit}&offset=${offset}`,
+			const responseData = await api.global.get<SearchBucketResponse<Album>>(
+				API.search.albums(normalizedQuery, limit, requestOffset),
 				{ signal: abortController.signal }
 			);
 
 			const newAlbums: Album[] = responseData.results || [];
-			if (offset === 0) {
-				topAlbum = responseData.top_result ?? null;
-			}
-			if (newAlbums.length < limit) {
-				hasMore = false;
-			}
+			const failedWithoutResults =
+				replaceResults &&
+				newAlbums.length === 0 &&
+				(responseData.status === 'error' || responseData.status === 'timeout');
 
-			if (offset === 0 && albums.length > 0) {
-				const existingIds = new Set(albums.map((a) => a.musicbrainz_id));
-				const uniqueNewAlbums = newAlbums.filter((a: Album) => !existingIds.has(a.musicbrainz_id));
-				albums = [...albums, ...uniqueNewAlbums];
-				offset = albums.length;
+			if (failedWithoutResults) {
+				remoteStatus = albums.length > 0 ? 'stale' : responseData.status;
+				hasMore = false;
 			} else {
-				albums = [...albums, ...newAlbums];
-				offset += newAlbums.length;
+				remoteStatus = responseData.status;
+				if (requestOffset === 0) {
+					topAlbum = responseData.top_result ?? null;
+				}
+				hasMore = newAlbums.length >= limit;
+
+				const update = updatePaginatedSearchResults(
+					albums,
+					newAlbums,
+					requestOffset,
+					replaceResults
+				);
+				albums = update.items;
+				offset = update.nextOffset;
+				searchStore.updateAlbums(albums);
 			}
-			searchStore.updateAlbums(albums);
 		} catch (error) {
 			if (isAbortError(error)) {
 				return;
 			}
+			remoteStatus = albums.length > 0 ? 'stale' : 'error';
 			hasMore = false;
 		} finally {
+			replaceOnNextLoad = false;
 			loading = false;
 		}
 	}
 
 	function resetAndLoad() {
 		enrichmentBatcher.reset();
+		remoteStatus = 'ok';
+		replaceOnNextLoad = false;
 		if (abortController) {
 			abortController.abort();
 			abortController = null;
@@ -118,7 +152,7 @@
 			observer = null;
 		}
 
-		const cache = searchStore.getCache(data.query, { allowStale: true });
+		const cache = searchStore.getCache(normalizedQuery, { allowStale: true });
 		if (cache && cache.albums.length > 0) {
 			albums = cache.albums;
 			topAlbum = cache.topAlbum ?? null;
@@ -126,6 +160,7 @@
 			offset = cache.albums.length;
 			hasMore = cache.albums.length >= limit;
 			if (searchStore.isStale(cache.timestamp)) {
+				replaceOnNextLoad = true;
 				offset = 0;
 				hasMore = true;
 				void loadMore();
@@ -139,10 +174,9 @@
 			void loadMore();
 		}
 	}
-
 	run(() => {
-		if (browser && data.query && data.query !== lastQuery) {
-			lastQuery = data.query;
+		if (browser && normalizedQuery && normalizedQuery !== lastQuery) {
+			lastQuery = normalizedQuery;
 			resetAndLoad();
 		}
 	});
@@ -210,9 +244,16 @@
 		</button>
 	</div>
 </div>
-
 <section class="px-8 py-4">
-	{#if !data.query}
+	{#if normalizedQuery && statusNotice}
+		<div class="alert {statusNotice.className} mb-3" role="status">
+			<span>{statusNotice.message}</span>
+			<button class="btn btn-sm" onclick={retryRemoteSearch}>
+				<RefreshCw class="h-4 w-4" /> Retry
+			</button>
+		</div>
+	{/if}
+	{#if !normalizedQuery}
 		<p class="text-center mt-32 text-gray-400">Enter a search query to get started.</p>
 	{:else if loading && albums.length === 0}
 		<div class="bg-base-200 rounded-box p-4">

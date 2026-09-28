@@ -1,9 +1,11 @@
 <script lang="ts">
-	import { Download, X, Disc3, Check, Loader2, Library } from 'lucide-svelte';
+	import { Download, X, Disc3, Check, LoaderCircle, Library } from 'lucide-svelte';
 	import { discographyDownloadStore } from '$lib/stores/discographyDownload.svelte';
 	import { batchDownloadStore } from '$lib/stores/batchDownloadStatus.svelte';
-	import { requestBatch, type BatchAlbumItem } from '$lib/utils/albumRequest';
-	import { toastStore } from '$lib/stores/toast';
+	import {
+		requestBatch,
+		type BatchAlbumItem
+	} from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 
@@ -15,6 +17,7 @@
 	let monitorArtist = $state(false);
 	let autoDownload = $state(false);
 
+	const batchRequest = requestBatch();
 	$effect(() => {
 		if (discographyDownloadStore.open) {
 			includeAlbums = true;
@@ -67,10 +70,9 @@
 
 	async function handleDownload() {
 		if (filteredReleases.length === 0) return;
-		const initiatingUserId = authStore.user?.id;
-		if (!initiatingUserId) return;
 		const artistName = discographyDownloadStore.artistName;
 		const artistId = discographyDownloadStore.artistId;
+		const initiatingUserId = authStore.user?.id;
 		submitting = true;
 
 		const items: BatchAlbumItem[] = filteredReleases.map((r) => ({
@@ -81,24 +83,21 @@
 			artist_mbid: artistId
 		}));
 
-		const result = await requestBatch(items, {
-			monitorArtist,
-			autoDownloadArtist: autoDownload
-		});
-		if (authStore.user?.id !== initiatingUserId) {
-			return;
-		}
-
-		if (result.success) {
+		const result = await batchRequest
+			.mutateAsync({
+				items,
+				monitorArtist,
+				autoDownloadArtist: autoDownload
+			})
+			.catch(() => null);
+		// an in-flight batch that resolves after an account switch belongs to the prior
+		// session - the shell already cleared the stores, do not re-add the old job (#155)
+		if (result?.success && authStore.user?.id === initiatingUserId) {
 			batchDownloadStore.addJob(
 				artistName,
 				artistId,
 				items.map((i) => i.musicbrainz_id)
 			);
-			toastStore.show({
-				message: `Requested ${result.requested} album${result.requested !== 1 ? 's' : ''} for ${artistName}`,
-				type: 'success'
-			});
 			handleClose();
 		}
 
@@ -137,7 +136,7 @@
 				{/if}
 				{#if requestedCount > 0}
 					<div class="badge badge-info gap-1">
-						<Loader2 class="h-3 w-3" />
+						<LoaderCircle class="h-3 w-3" />
 						{requestedCount} requested
 					</div>
 				{/if}

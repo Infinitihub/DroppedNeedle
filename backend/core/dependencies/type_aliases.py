@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Annotated
 
@@ -61,6 +62,9 @@ from services.native.library_management_override_service import (
 from services.native.genre_projection_service import GenreProjectionService
 from services.native.artwork_projection_service import ArtworkProjectionService
 from services.native.audio_write_planning_service import AudioWritePlanningService
+from services.native.library_policy_reconciliation_service import (
+    LibraryPolicyReconciliationService,
+)
 from services.native.target_library_policy_service import TargetLibraryPolicyService
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.library_scan_coordinator import LibraryScanCoordinator
@@ -120,6 +124,7 @@ from services.scrobble_service import ScrobbleService
 from services.cache_status_service import CacheStatusService
 from services.version_service import VersionService
 from services.home.cached_local_artwork_service import CachedLocalArtworkService
+from services.plugin_sources import PluginSourceRegistry
 
 from .cache_providers import (
     get_cache,
@@ -148,6 +153,7 @@ from .repo_providers import (
 )
 from .service_providers import (
     get_library_policy_service,
+    get_target_library_policy_reconciliation_service,
     get_legacy_pending_migration_service,
     get_library_management_profile_service,
     get_library_management_preview_service,
@@ -197,6 +203,7 @@ from .service_providers import (
     get_home_service,
     get_home_charts_service,
     get_settings_service,
+    get_release_type_policy_transition_lock,
     get_artist_discovery_service,
     get_album_discovery_service,
     get_discover_service,
@@ -212,6 +219,8 @@ from .service_providers import (
     get_plex_library_service,
     get_plex_playback_service,
     get_version_service,
+    get_plugin_host,
+    get_plugin_source_registry,
 )
 from .compat_providers import get_native_lyrics_service
 
@@ -227,6 +236,9 @@ CachedLocalArtworkServiceDep = Annotated[
     CachedLocalArtworkService, Depends(get_cached_local_artwork_service)
 ]
 PreferencesServiceDep = Annotated[PreferencesService, Depends(get_preferences_service)]
+ReleaseTypePolicyTransitionLockDep = Annotated[
+    asyncio.Lock, Depends(get_release_type_policy_transition_lock)
+]
 LibraryPolicyServiceDep = Annotated[
     LibraryPolicyService, Depends(get_library_policy_service)
 ]
@@ -290,6 +302,10 @@ LibraryPolicyResolverDep = Annotated[
 ]
 TargetLibraryScanCoordinatorDep = Annotated[
     LibraryScanCoordinator, Depends(get_target_library_scan_coordinator)
+]
+LibraryPolicyReconciliationServiceDep = Annotated[
+    LibraryPolicyReconciliationService,
+    Depends(get_target_library_policy_reconciliation_service),
 ]
 TargetLibraryOwnershipServiceDep = Annotated[
     LibraryOwnershipService, Depends(get_target_library_ownership_service)
@@ -430,3 +446,6 @@ PlexPlaybackServiceDep = Annotated[
 CacheStatusServiceDep = Annotated[CacheStatusService, Depends(get_cache_status_service)]
 GitHubRepositoryDep = Annotated[GitHubRepository, Depends(get_github_repository)]
 VersionServiceDep = Annotated[VersionService, Depends(get_version_service)]
+PluginSourceRegistryDep = Annotated[
+    PluginSourceRegistry, Depends(get_plugin_source_registry)
+]

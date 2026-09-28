@@ -1,14 +1,16 @@
 <script lang="ts">
-	import { Headphones, ArrowRight, Sparkles, AlertTriangle } from 'lucide-svelte';
+	import { Headphones, ArrowRight, Sparkles, TriangleAlert } from 'lucide-svelte';
 	import type { ComponentType } from 'svelte';
 	import { fromStore } from 'svelte/store';
 	import DropImportZone from '$lib/components/import/DropImportZone.svelte';
 	import { integrationStore } from '$lib/stores/integration';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getLocalStatsQuery } from '$lib/queries/local/LocalQueries.svelte';
+	import { getLibraryActivityQuery } from '$lib/queries/library/LibraryActivityQueries.svelte';
 	import { getLibraryStatsQuery } from '$lib/queries/library/LibraryQueries.svelte';
 	import { formatLastUpdated } from '$lib/utils/formatting';
 	import type { FormatInfo } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	type CardState = 'loading' | 'prompt' | 'error' | 'stats';
 	interface Stat {
@@ -42,10 +44,16 @@
 
 	const localStatsQuery = getLocalStatsQuery(() => localEnabled);
 	const libraryStatsQuery = getLibraryStatsQuery();
+	const libraryActivityQuery = getLibraryActivityQuery(() => authStore.user?.id);
 
 	const localStats = $derived(localStatsQuery.data);
 	const libraryStats = $derived(libraryStatsQuery.data);
-
+	const identificationActivity = $derived(
+		libraryActivityQuery.data?.items.find((item) => item.kind === 'identification')
+	);
+	const stillMatching = $derived(
+		(identificationActivity?.waiting_count ?? 0) + (identificationActivity?.deferred_count ?? 0)
+	);
 	function topFormats(breakdown: Record<string, FormatInfo>): string {
 		return Object.entries(breakdown)
 			.sort((a, b) => b[1].count - a[1].count)
@@ -75,18 +83,26 @@
 					: 'loading'
 	);
 
+	const needsDecision = $derived(stillMatching === 0 && libUnmatched > 0);
+	const canReview = $derived(needsDecision && authStore.isAdmin);
 	const musicFooter = $derived(
-		libUnmatched > 0
-			? `${libUnmatched} album${libUnmatched === 1 ? '' : 's'} need review`
-			: localStats && localStats.total_tracks > 0
-				? `${localStats.total_size_human}${localFormats ? ' · ' + localFormats : ''}`
-				: libLastScan
-					? `Scanned ${formatLastUpdated(libLastScan)}`
-					: 'Not scanned yet'
+		stillMatching > 0 && libUnmatched > 0
+			? `${stillMatching.toLocaleString()} still matching — ${libUnmatched.toLocaleString()} need a decision`
+			: stillMatching > 0
+				? `${stillMatching.toLocaleString()} still matching`
+				: libUnmatched > 0
+					? `${libUnmatched.toLocaleString()} need review`
+					: localStats && localStats.total_tracks > 0
+						? `${localStats.total_size_human}${localFormats ? ' · ' + localFormats : ''}`
+						: libLastScan
+							? `Scanned ${formatLastUpdated(libLastScan)}`
+							: 'Not scanned yet'
 	);
-
+	const musicHref = $derived(
+		canReview ? '/library/review' : localEnabled ? '/library/local' : '/library'
+	);
 	const musicCard: EntryCard = $derived({
-		href: localEnabled ? '/library/local' : '/library',
+		href: musicHref,
 		icon: Headphones,
 		title: 'Your Music',
 		subtitle: 'Listen, browse & organise',
@@ -99,9 +115,15 @@
 				]
 			: [],
 		footer: musicFooter,
-		footerWarning: libUnmatched > 0,
+		footerWarning: needsDecision,
 		ctaLabel:
-			musicState === 'prompt' ? 'Open library' : localEnabled ? 'Enter the room' : 'Manage library',
+			musicState === 'prompt'
+				? 'Open library'
+				: canReview
+					? 'Review queue'
+					: localEnabled
+						? 'Enter the room'
+						: 'Manage library',
 		promptText: authStore.isAdmin
 			? 'Add a library path and run a scan to fill your library.'
 			: 'Your library is being prepared by an admin.',
@@ -118,7 +140,7 @@
 {#snippet entryCard(card: EntryCard)}
 	{@const Icon = card.icon}
 	<a
-		href={card.href}
+		href={withBasePath(card.href)}
 		class="group card relative overflow-hidden border border-base-content/10 bg-gradient-to-br {card.gradient} shadow-lg transition-all duration-300 hover:-translate-y-1 hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-base-100 focus-visible:outline-none"
 	>
 		<div
@@ -192,7 +214,7 @@
 						: 'bg-base-100/40 text-base-content/70'}"
 				>
 					{#if isError}
-						<AlertTriangle class="h-4 w-4 shrink-0" />
+						<TriangleAlert class="h-4 w-4 shrink-0" />
 						<span>Couldn't load stats - open to retry.</span>
 					{:else}
 						<Sparkles class="h-4 w-4 shrink-0 {card.iconColor}" />
@@ -215,7 +237,7 @@
 		<div class="flex flex-col">
 			<DropImportZone className="flex-1 [&>button]:h-full" />
 			<a
-				href="/downloads?tab=import"
+				href={withBasePath('/downloads?tab=import')}
 				class="mt-2 self-end text-xs font-semibold text-primary hover:underline"
 			>
 				View import history

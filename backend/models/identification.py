@@ -11,6 +11,7 @@ from infrastructure.msgspec_fastapi import AppStruct
 EvidenceClass = Literal["supported", "unknown", "contradictory"]
 IdentificationOutcome = Literal[
     "identified",
+    "edition_uncertain",
     "no_candidate",
     "ambiguous",
     "contradictory",
@@ -108,6 +109,12 @@ class IdentificationDecision(AppStruct):
     reason_code: str
     selected_candidate_key: str | None = None
     candidates: list[CandidateEvidence] = msgspec.field(default_factory=list)
+    edition_uncertain: bool = False
+    release_group_mbid: str | None = None
+    ranked_edition_keys: list[str] = msgspec.field(default_factory=list)
+
+
+TrackProvenance = Literal["tag", "parsed", "placeholder", "absent"]
 
 
 class GroupingTrack(AppStruct):
@@ -118,12 +125,17 @@ class GroupingTrack(AppStruct):
     artist_name: str = ""
     album_title: str = ""
     album_artist_name: str = ""
+    title_provenance: TrackProvenance = "absent"
+    album_title_provenance: TrackProvenance = "absent"
+    album_artist_provenance: TrackProvenance = "absent"
     artist_sort_name: str | None = None
     album_artist_sort_name: str | None = None
     track_number: int = 0
     disc_number: int = 1
     duration_seconds: float | None = None
     recording_mbid: str | None = None
+    # Support-only AcoustID evidence, never authoritative proof.
+    fingerprint_recording_mbid: str | None = None
     release_mbid: str | None = None
     release_group_mbid: str | None = None
     release_track_mbid: str | None = None
@@ -200,6 +212,7 @@ class FingerprintOutcome(AppStruct):
     last_attempt_at: float = 0.0
     retry_after: float | None = None
     row_revision: int = 1
+    partial_decode: bool = False
 
 
 class AlbumCoverage(AppStruct):

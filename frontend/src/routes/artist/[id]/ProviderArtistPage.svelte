@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { ApiError } from '$lib/api/client';
+	import { useDiscoverActivity } from '$lib/queries/discover/DiscoverDemand.svelte';
 	import { colors } from '$lib/colors';
 	import ArtistHeaderSkeleton from '$lib/components/ArtistHeaderSkeleton.svelte';
 	import AlbumGridSkeleton from '$lib/components/AlbumGridSkeleton.svelte';
@@ -13,8 +15,11 @@
 	import LastFmEnrichment from '$lib/components/LastFmEnrichment.svelte';
 	import LibraryAlbumsCarousel from '$lib/components/LibraryAlbumsCarousel.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
+	import LocalArtistPage from './LocalArtistPage.svelte';
+	import type { LibraryArtistSummary } from '$lib/types';
 	import PageSectionToc from '$lib/components/PageSectionToc.svelte';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { libraryStore } from '$lib/stores/library';
 	import { type MusicSource, isMusicSource } from '$lib/stores/musicSource';
 	import {
@@ -27,6 +32,7 @@
 		getSimilarArtistsQuery,
 		updateArtistReleaseInCache
 	} from '$lib/queries/artist/ArtistQueries.svelte';
+	import { getConnectionsQuery } from '$lib/queries/connections/ConnectionsQuery.svelte';
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import { ArtistQueryKeyFactory } from '$lib/queries/artist/ArtistQueryKeyFactory';
 	import { PAGE_SOURCE_KEYS } from '$lib/constants';
@@ -43,19 +49,89 @@
 
 	interface Props {
 		data: { artistId: string; primarySource: MusicSource };
+		localArtist?: LibraryArtistSummary;
 	}
 
-	let { data }: Props = $props();
+	let { data, localArtist }: Props = $props();
 
 	// svelte-ignore state_referenced_locally
 	let activeSource = new PersistedState<MusicSource>(
 		PAGE_SOURCE_KEYS['artist'],
 		data.primarySource
 	);
-
-	let validSource = $derived(
+	let selectedSource = $derived(
 		isMusicSource(activeSource.current) ? activeSource.current : data.primarySource
 	);
+
+	const connectionsQuery = getConnectionsQuery();
+	const connectionsSettled = $derived(connectionsQuery.isPending !== true);
+	const connectionsUsable = $derived(
+		connectionsSettled &&
+			connectionsQuery.data !== undefined &&
+			connectionsQuery.isError !== true &&
+			connectionsQuery.isSuccess !== false
+	);
+	const linkedSources = $derived.by<MusicSource[]>(() => {
+		if (!connectionsUsable) return [];
+
+		const services = connectionsQuery.data?.connections ?? [];
+		return (['listenbrainz', 'lastfm'] as const).filter((source) =>
+			services.some((connection) => connection.service === source)
+		);
+	});
+	const resolvedSource = $derived.by<MusicSource>(() => {
+		if (!connectionsUsable || linkedSources.length === 0) return selectedSource;
+		if (linkedSources.includes(selectedSource)) return selectedSource;
+		if (linkedSources.includes(data.primarySource)) return data.primarySource;
+		return linkedSources.includes('listenbrainz') ? 'listenbrainz' : 'lastfm';
+	});
+	const discoveryEnabled = $derived(connectionsSettled);
+	let albumsDemandEl = $state<HTMLElement>();
+	let songsDemandEl = $state<HTMLElement>();
+	let similarDemandEl = $state<HTMLElement>();
+	useDiscoverActivity(
+		() =>
+			discoveryEnabled
+				? {
+						feature: 'artist',
+						artist_mbid: data.artistId,
+						section: 'top_albums',
+						provider: resolvedSource
+					}
+				: null,
+		() => albumsDemandEl
+	);
+	useDiscoverActivity(
+		() =>
+			discoveryEnabled
+				? {
+						feature: 'artist',
+						artist_mbid: data.artistId,
+						section: 'top_songs',
+						provider: resolvedSource
+					}
+				: null,
+		() => songsDemandEl
+	);
+	useDiscoverActivity(
+		() =>
+			discoveryEnabled
+				? {
+						feature: 'artist',
+						artist_mbid: data.artistId,
+						section: 'similar',
+						provider: resolvedSource
+					}
+				: null,
+		() => similarDemandEl
+	);
+
+	$effect(() => {
+		if (!connectionsUsable || linkedSources.length === 0) return;
+		if (linkedSources.includes(selectedSource)) return;
+
+		activeSource.current = resolvedSource;
+	});
 
 	let showToast = $state(false);
 	let toastMessage = 'Added to Library';
@@ -72,6 +148,14 @@
 	const artistBasicQuery = getBasicArtistQuery(() => data.artistId);
 	const artistBasic = $derived(artistBasicQuery.data);
 	const loadingBasic = $derived(artistBasicQuery.isLoading);
+	const artistBasicApiError = $derived(
+		artistBasicQuery.error instanceof ApiError ? artistBasicQuery.error : null
+	);
+	const artistNotFound = $derived(artistBasicApiError?.status === 404);
+	const providerUnavailable = $derived.by(() => {
+		const status = artistBasicApiError?.status;
+		return status === 0 || status === 429 || (status !== undefined && status >= 500);
+	});
 
 	const artistExtendedQuery = getExtendedArtistQuery(() => data.artistId);
 	const artistExtended = $derived(artistExtendedQuery.data);
@@ -79,24 +163,27 @@
 
 	const similarArtistsQuery = getSimilarArtistsQuery(() => ({
 		artistId: data.artistId,
-		source: validSource
+		source: resolvedSource,
+		enabled: discoveryEnabled
 	}));
-	const similarArtists = $derived(similarArtistsQuery.data);
-	const loadingSimilar = $derived(similarArtistsQuery.isLoading);
+	const similarArtists = $derived(discoveryEnabled ? similarArtistsQuery.data : undefined);
+	const loadingSimilar = $derived(!discoveryEnabled || similarArtistsQuery.isLoading);
 
 	const topSongsQuery = getArtistTopSongsQuery(() => ({
 		artistId: data.artistId,
-		source: validSource
+		source: resolvedSource,
+		enabled: discoveryEnabled
 	}));
-	const topSongs = $derived(topSongsQuery.data);
-	const loadingTopSongs = $derived(topSongsQuery.isLoading);
+	const topSongs = $derived(discoveryEnabled ? topSongsQuery.data : undefined);
+	const loadingTopSongs = $derived(!discoveryEnabled || topSongsQuery.isLoading);
 
 	const topAlbumsQuery = getArtistTopAlbumsQuery(() => ({
 		artistId: data.artistId,
-		source: validSource
+		source: resolvedSource,
+		enabled: discoveryEnabled
 	}));
-	const topAlbums = $derived(topAlbumsQuery.data);
-	const loadingTopAlbums = $derived(topAlbumsQuery.isLoading);
+	const topAlbums = $derived(discoveryEnabled ? topAlbumsQuery.data : undefined);
+	const loadingTopAlbums = $derived(!discoveryEnabled || topAlbumsQuery.isLoading);
 
 	const lastFmEnrichmentQuery = getArtistLastFmEnrichmentQuery(() => ({
 		artistId: data.artistId,
@@ -106,7 +193,8 @@
 	const loadingLastfm = $derived(lastFmEnrichmentQuery.isLoading);
 
 	let error: string | null = $derived.by(() => {
-		if (artistBasicQuery.error) {
+		if (artistNotFound) return 'Artist not found.';
+		if (artistBasicQuery.error && !providerUnavailable) {
 			return 'Failed to load artist information.';
 		}
 		if (artistExtendedQuery.error) {
@@ -114,7 +202,6 @@
 		}
 		return null;
 	});
-
 	const artist = $derived.by(() => {
 		if (!artistBasic) return null;
 		return {
@@ -142,17 +229,22 @@
 		invalidateQueriesWithPersister({ queryKey: ArtistQueryKeyFactory.basic(data.artistId) });
 	}
 
+	const providerReleaseRequest = requestAlbum();
+
 	async function handleRequest(releaseId: string, releaseTitle?: string) {
 		requestedReleaseIds.add(releaseId);
 		requestedReleaseIds = requestedReleaseIds;
 
 		try {
-			const result = await requestAlbum(releaseId, {
-				artist: artist?.name,
-				album: releaseTitle
-			});
+			const result = await providerReleaseRequest
+				.mutateAsync({
+					release_group_mbid: releaseId,
+					artist_name: artist?.name,
+					album_title: releaseTitle
+				})
+				.catch(() => null);
 
-			if (result.success && artist) {
+			if (result?.success && artist) {
 				await updateArtistReleaseInCache(data.artistId, {
 					id: releaseId,
 					requested: true
@@ -231,7 +323,32 @@
 </script>
 
 <div class="w-full px-2 sm:px-4 lg:px-8 py-4 sm:py-8 max-w-7xl mx-auto">
-	{#if error}
+	{#if artistNotFound}
+		<div class="flex items-center justify-center min-h-[50vh]">
+			<div class="alert alert-error">
+				<span>Artist not found.</span>
+			</div>
+		</div>
+	{:else if providerUnavailable && localArtist}
+		<div class="mb-4 flex justify-center">
+			<div class="alert alert-info text-sm">
+				<span
+					>MusicBrainz is unreachable right now, so this page is built from your local files. Some
+					extras are hidden until it returns.</span
+				>
+			</div>
+		</div>
+		<LocalArtistPage artistId={localArtist.id} />
+	{:else if providerUnavailable}
+		<div class="flex items-center justify-center min-h-[50vh]">
+			<div class="alert alert-error">
+				<span>MusicBrainz is temporarily unavailable.</span>
+				<button class="btn btn-sm btn-ghost" onclick={() => void artistBasicQuery.refetch()}>
+					Retry
+				</button>
+			</div>
+		</div>
+	{:else if error}
 		<div class="flex items-center justify-center min-h-[50vh]">
 			<div class="alert alert-error">
 				<span>{error}</span>
@@ -284,7 +401,7 @@
 						<div class="flex flex-wrap gap-2 justify-center sm:justify-start -mt-2">
 							{#each [...new Set(artist.tags)].slice(0, 10) as tag (tag)}
 								<a
-									href="/genre?name={encodeURIComponent(tag)}"
+									href={withBasePath(`/genre?name=${encodeURIComponent(tag)}`)}
 									class="badge badge-lg cursor-pointer hover:opacity-80 transition-opacity"
 									style="background-color: {colors.primary}; color: {colors.secondary};">{tag}</a
 								>
@@ -334,17 +451,19 @@
 					loading={loadingBasic}
 				/>
 
-				<div class="flex items-center justify-end mt-8 mb-4">
-					<SimpleSourceSwitcher
-						currentSource={validSource}
-						onSourceChange={(newSource) => {
-							activeSource.current = newSource;
-						}}
-					/>
-				</div>
+				{#if linkedSources.length === 2}
+					<div class="flex items-center justify-end mt-8 mb-4">
+						<SimpleSourceSwitcher
+							currentSource={resolvedSource}
+							onSourceChange={(newSource) => {
+								activeSource.current = newSource;
+							}}
+						/>
+					</div>
+				{/if}
 
 				<div class="flex flex-col md:flex-row gap-6 md:items-stretch">
-					<div class="flex-1 min-w-0">
+					<div bind:this={albumsDemandEl} class="flex-1 min-w-0">
 						<TopAlbumsList
 							albums={topAlbums?.albums || []}
 							loading={loadingTopAlbums}
@@ -356,7 +475,7 @@
 						class="shrink-0 bg-base-content/25 h-px w-full md:w-px md:h-auto md:self-stretch"
 						aria-hidden="true"
 					></div>
-					<div class="flex-1 min-w-0">
+					<div bind:this={songsDemandEl} class="flex-1 min-w-0">
 						<TopSongsList
 							songs={topSongs?.songs || []}
 							loading={loadingTopSongs}
@@ -366,7 +485,7 @@
 					</div>
 				</div>
 
-				<section id="section-similar" class="mt-8 scroll-mt-24">
+				<section bind:this={similarDemandEl} id="section-similar" class="mt-8 scroll-mt-24">
 					<SimilarArtistsCarousel
 						artists={similarArtists?.similar_artists || []}
 						loading={loadingSimilar}

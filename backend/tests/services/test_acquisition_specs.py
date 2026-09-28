@@ -1,6 +1,6 @@
 """Acquisition spec-core tests (ArrRebuild step 1).
 
-The headline design win over Lidarr: every spec is a PURE function, so these run
+Unlike Lidarr, every spec is a PURE function, so these run
 with ZERO mocks - ``DecisionContext`` is constructed directly. ``build_context``
 (the single I/O step) gets one small fake-store test. The scorer suites
 (``test_album_preflight_scorer`` / ``test_newznab_release_scorer``) remain the
@@ -39,7 +39,7 @@ _POLICY = SpecPolicy(quality_min="mp3_320", quality_max="lossless")
 _EMPTY = DecisionContext()
 
 
-# --- quarantine spec ---------------------------------------------------------
+# quarantine spec
 
 def test_quarantine_rejects_blocklisted_identity():
     ident = usenet_identity("Radiohead - OK Computer", 600_000_000)
@@ -73,7 +73,7 @@ def test_quarantine_namespaced_by_source():
     assert isinstance(quarantine(cand, _TARGET, ctx, _POLICY), Accept)
 
 
-# --- quality_range spec ------------------------------------------------------
+# quality_range spec
 
 def test_quality_range_unknown_passes():
     # Usenet noisy titles: 'unknown' tier passes (import tag-match is the real truth).
@@ -101,7 +101,7 @@ def test_quality_range_above_ceiling_rejected():
     assert decision.code is RejectCode.QUALITY_REJECTED
 
 
-# --- wrong_album spec --------------------------------------------------------
+# wrong_album spec
 
 def test_wrong_album_rejects_different_album_same_artist():
     cand = Candidate(source="usenet", match_text="Radiohead - In Rainbows [FLAC]")
@@ -121,7 +121,7 @@ def test_wrong_album_accepts_obfuscated_title():
     assert isinstance(wrong_album(cand, _TARGET, _EMPTY, _POLICY), Accept)
 
 
-# --- pipeline ordering -------------------------------------------------------
+# pipeline ordering
 
 def test_pipeline_accepts_when_all_specs_pass():
     cand = Candidate(source="soulseek", match_text="Radiohead OK Computer", tier="lossless")
@@ -148,19 +148,26 @@ def test_pipeline_wrong_album_before_quality():
     assert decision.code is RejectCode.WRONG_ALBUM
 
 
-# --- password spec (step 2) --------------------------------------------------
+# password spec (step 2)
 
-def test_password_rejects_protected():
-    decision = password(Candidate(source="usenet", password=1), _TARGET, _EMPTY, _POLICY)
+@pytest.mark.parametrize("password_value", [1, 2])
+def test_password_rejects_protected(password_value):
+    decision = password(
+        Candidate(source="usenet", password=password_value), _TARGET, _EMPTY, _POLICY
+    )
     assert isinstance(decision, Reject)
     assert decision.code is RejectCode.PASSWORD_PROTECTED
 
 
-def test_password_accepts_unprotected():
-    assert isinstance(password(Candidate(source="usenet"), _TARGET, _EMPTY, _POLICY), Accept)
+@pytest.mark.parametrize("password_value", [-1, 0])
+def test_password_accepts_unprotected_or_unknown(password_value):
+    decision = password(
+        Candidate(source="usenet", password=password_value), _TARGET, _EMPTY, _POLICY
+    )
+    assert isinstance(decision, Accept)
 
 
-# --- wrong_edition spec (step 2, M3) -----------------------------------------
+# wrong_edition spec (step 2, M3)
 
 _LZ = TargetAlbum(artist_name="Led Zeppelin", album_title="Led Zeppelin", year=1969, track_count=9)
 
@@ -202,7 +209,7 @@ def test_wrong_edition_still_rejects_complete_albums_discography():
     assert isinstance(wrong_edition(cand, target, _EMPTY, _POLICY), Reject)
 
 
-# --- sample spec (step 2) ----------------------------------------------------
+# sample spec (step 2)
 
 def test_sample_rejects_sample_marker():
     cand = Candidate(source="usenet", match_text="Radiohead - OK Computer (Sample)")
@@ -223,7 +230,7 @@ def test_sample_kept_when_requested_album_contains_sample():
     assert isinstance(sample(cand, target, _EMPTY, _POLICY), Accept)
 
 
-# --- terms specs (step 2) ----------------------------------------------------
+# terms specs (step 2)
 
 def test_ignored_terms_substring():
     policy = SpecPolicy(ignored_terms=("bootleg",))
@@ -269,7 +276,7 @@ def test_required_terms_empty_is_noop():
     assert isinstance(required_terms(cand, _TARGET, _EMPTY, _POLICY), Accept)
 
 
-# --- max_size spec (step 2) --------------------------------------------------
+# max_size spec (step 2)
 
 _MB = 1024 * 1024
 
@@ -293,7 +300,7 @@ def test_max_size_zero_is_unbounded():
     assert isinstance(max_size(cand, _TARGET, _EMPTY, _POLICY), Accept)
 
 
-# --- retention + min_age specs (step 2, Usenet age) --------------------------
+# retention + min_age specs (step 2, Usenet age)
 
 _NOW = 1_700_000_000.0
 _TIMED = DecisionContext(now=_NOW)
@@ -343,7 +350,7 @@ def test_min_age_off_by_default_and_undated_pass():
     assert isinstance(min_age(undated, _TARGET, _TIMED, SpecPolicy(usenet_min_age_minutes=30)), Accept)
 
 
-# --- free_space spec (step 2) ------------------------------------------------
+# free_space spec (step 2)
 
 def test_free_space_unknown_passes():
     cand = Candidate(source="usenet", size_bytes=5_000 * _MB)
@@ -365,7 +372,7 @@ def test_free_space_accepts_ample():
     assert isinstance(free_space(cand, _TARGET, ctx, _POLICY), Accept)
 
 
-# --- upgrade_floor spec (CollectionManagement D12) ----------------------------
+# upgrade_floor spec (CollectionManagement D12)
 
 def test_upgrade_floor_passes_when_not_an_upgrade_run():
     # held_tier None = not an upgrade run (or target not held): everything passes,
@@ -413,7 +420,7 @@ def test_upgrade_floor_registered_in_pipeline():
     assert decision.code is RejectCode.NOT_AN_UPGRADE
 
 
-# --- build_context (the single I/O step) -------------------------------------
+# build_context (the single I/O step)
 
 @pytest.mark.asyncio
 async def test_build_context_snapshots_quarantine_set():
@@ -425,3 +432,94 @@ async def test_build_context_snapshots_quarantine_set():
     assert isinstance(ctx.quarantine_set, frozenset)
     assert ("usenet", "id-1") in ctx.quarantine_set
     assert ("soulseek", "id-2") in ctx.quarantine_set
+
+
+# F-EDITION-03: dotted box-set coverage
+
+@pytest.mark.parametrize("spelling", ["Box.Set", "Box-Set", "Box_Set", "box set"])
+def test_wrong_edition_rejects_every_box_set_spelling_for_studio(spelling):
+    cand = Candidate(source="usenet", match_text=f"Led Zeppelin {spelling} (FLAC)")
+    decision = wrong_edition(cand, _LZ, _EMPTY, _POLICY)
+    assert isinstance(decision, Reject)
+    assert decision.code is RejectCode.WRONG_EDITION
+    assert decision.disposition is Disposition.PERMANENT
+
+
+def test_wrong_edition_box_set_requested_stays_eligible():
+    requested = TargetAlbum(
+        artist_name="Led Zeppelin", album_title="Led Zeppelin Box Set",
+        year=1969, track_count=9,
+    )
+    cand = Candidate(source="usenet", match_text="Led Zeppelin Box.Set (FLAC)")
+    assert isinstance(wrong_edition(cand, requested, _EMPTY, _POLICY), Accept)
+
+
+def test_wrong_album_ignores_fedition03_descriptors():
+    from services.native.acquisition.specs.wrong_album import wrong_album
+    for candidate_title in (
+        "Led Zeppelin (OKNOTOK)",
+        "Led Zeppelin - Immersion.Box.Set",
+        "Led Zeppelin Half Speed Master",
+    ):
+        cand = Candidate(source="soulseek", match_text=candidate_title)
+        assert isinstance(wrong_album(cand, _LZ, _EMPTY, _POLICY), Accept), candidate_title
+
+
+def test_wrong_album_still_rejects_different_album_same_artist():
+    from services.native.acquisition.specs.wrong_album import wrong_album
+    cand = Candidate(source="soulseek", match_text="Led Zeppelin - Physical Graffiti")
+    decision = wrong_album(cand, _LZ, _EMPTY, _POLICY)
+    assert isinstance(decision, Reject)
+
+
+# GH #259 (scorer leg) + GH #307: canonical MusicBrainz punctuation vs scene-named
+# releases, through the shared spec pipeline so the guard surface itself is pinned.
+
+_MBF_TARGET = TargetAlbum(
+    artist_name="Sabrina Carpenter", album_title="Man's Best Friend", year=2025, track_count=12,
+)
+
+
+@pytest.mark.parametrize(
+    "candidate_title",
+    [
+        "Sabrina_Carpenter-Mans_Best_Friend-CD-FLAC-2025-GROUP",
+        "Sabrina Carpenter - Mans Best Friend (2025) [MP3-320]",
+        '[002/95] "Sabrina_Carpenter-Mans_Best_Friend-2025.part001.rar"',
+    ],
+)
+def test_wrong_album_accepts_apostropheless_scene_named_release(candidate_title):
+    # The shape of psykix's `dropped_wrong_album=4`: every release the indexer returned
+    # was rejected WRONG_ALBUM/PERMANENT because `_SEP_RE` split ``man's`` asymmetrically.
+    cand = Candidate(source="usenet", match_text=candidate_title)
+    assert isinstance(wrong_album(cand, _MBF_TARGET, _EMPTY, _POLICY), Accept), candidate_title
+
+
+@pytest.mark.parametrize("album_title", ["Man's Best Friend", "Man’s Best Friend"])
+def test_wrong_album_accepts_typographic_apostrophe_target(album_title):
+    # MusicBrainz carries the typographic apostrophe; either spelling of the target
+    # must accept the scene-named release.
+    target = TargetAlbum(
+        artist_name="Sabrina Carpenter", album_title=album_title, year=2025, track_count=12,
+    )
+    cand = Candidate(source="usenet", match_text="Sabrina_Carpenter-Mans_Best_Friend-CD-FLAC-2025-GROUP")
+    assert isinstance(wrong_album(cand, target, _EMPTY, _POLICY), Accept), album_title
+
+
+def test_wrong_album_accepts_paren_obfuscated_title():
+    # GH #307: "O(verly) D(edicated)" used to split to o + verly with the 1-char
+    # fragment dropped, leaving 'verly' reading as a foreign album word.
+    target = TargetAlbum(
+        artist_name="ScHoolboy Q", album_title="Overly Dedicated", year=2010, track_count=15,
+    )
+    cand = Candidate(source="usenet", match_text="Schoolboy_Q-O(verly)_D(edicated)-2010")
+    assert isinstance(wrong_album(cand, target, _EMPTY, _POLICY), Accept)
+
+
+def test_wrong_album_still_rejects_genuinely_different_album_with_apostrophes():
+    # Negative control: "Emails I Can't Send" is a different Sabrina Carpenter album -
+    # the apostrophe relaxation must not open a wrong-album floodgate.
+    cand = Candidate(source="usenet", match_text="Sabrina Carpenter - Emails I Can’t Send")
+    decision = wrong_album(cand, _MBF_TARGET, _EMPTY, _POLICY)
+    assert isinstance(decision, Reject)
+    assert decision.code is RejectCode.WRONG_ALBUM

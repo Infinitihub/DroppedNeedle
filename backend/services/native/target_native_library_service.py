@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -50,7 +51,7 @@ class TargetNativeLibraryService:
             search=search,
             file_format=file_format,
         )
-        return [self._album(row) for row in rows], total
+        return await self._stamp_full_marks([self._album(row) for row in rows]), total
 
     async def artists(
         self,
@@ -91,7 +92,7 @@ class TargetNativeLibraryService:
         rows, _ = await self._store.list_target_albums(
             limit=10_000, offset=0, sort="name", artist_id=canonical
         )
-        return [self._album(row) for row in rows]
+        return await self._stamp_full_marks([self._album(row) for row in rows])
 
     async def artist_appearances(
         self, artist_id: str, *, limit: int, offset: int
@@ -102,13 +103,16 @@ class TargetNativeLibraryService:
         rows, total, total_tracks = await self._store.list_target_artist_appearances(
             canonical, limit=limit, offset=offset
         )
+        albums = await self._stamp_full_marks(
+            [self._album(row["album"]) for row in rows]
+        )
         return (
             [
                 TargetNativeArtistAppearance(
-                    album=self._album(row["album"]),
+                    album=album,
                     tracks=[self._track(track) for track in row["tracks"]],
                 )
-                for row in rows
+                for album, row in zip(albums, rows, strict=True)
             ],
             total,
             total_tracks,
@@ -140,13 +144,75 @@ class TargetNativeLibraryService:
         rows, _ = await self._store.list_target_albums(
             limit=1, offset=0, sort="name", album_ids=[canonical]
         )
-        return self._album(rows[0]) if rows else None
+        album = self._album(rows[0]) if rows else None
+        if album is None:
+            return None
+        stamped = await self._stamp_full_marks([album])
+        return stamped[0]
+
+    async def set_marked_full(self, album_id: str, marked: bool) -> TargetNativeAlbum:
+        resolved = await self._store.set_target_album_marked_full(album_id, marked)
+        album = await self.album(resolved)
+        if album is None:
+            raise ResourceNotFoundError(f"Album {album_id} is not in the local library")
+        return album
 
     async def album_copies(self, album_id: str) -> list[TargetNativeAlbum]:
         rows, _ = await self._store.list_target_albums(
             limit=1_000, offset=0, sort="name", album_ids=[album_id]
         )
-        return [self._album(row) for row in rows]
+        return await self._stamp_full_marks([self._album(row) for row in rows])
+
+    @staticmethod
+    def _display_pick(
+        identity: dict[str, Any] | None,
+        tracks: list[dict[str, Any]],
+        pin: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Best-fit display pick: per-copy pin, owned identity, unanimous tags.
+
+        Display only - the result must never feed identity or management
+        gates. Unanimous embedded tags require full coverage: every indexed
+        track must carry the same valid release MBID. Unlike the provider
+        album lane there is no file-count/ranked fallback here (no cached
+        provider data on this path), so unproven albums without tags get
+        no pick rather than a ranked guess.
+        """
+        if pin:
+            # Pins validate as MBIDs at set time, but a stale row must never
+            # render as a confident pick: fall through to owned/tags instead.
+            try:
+                uuid.UUID(str(pin))
+            except ValueError:
+                pass
+            else:
+                return str(pin), "pin"
+        if identity is not None and identity.get("release_mbid"):
+            owned = str(identity["release_mbid"])
+            try:
+                uuid.UUID(owned)
+            except ValueError:
+                pass
+            else:
+                return owned, "owned"
+        if tracks:
+            embedded = {
+                str(track["embedded_release_mbid"]).casefold(): str(
+                    track["embedded_release_mbid"]
+                )
+                for track in tracks
+                if track.get("embedded_release_mbid")
+            }
+            if len(embedded) == 1 and all(
+                track.get("embedded_release_mbid") for track in tracks
+            ):
+                candidate = next(iter(embedded.values()))
+                try:
+                    uuid.UUID(candidate)
+                except ValueError:
+                    return None, None
+                return candidate, "embedded_tags"
+        return None, None
 
     async def album_detail(self, album_id: str) -> TargetNativeAlbumDetail | None:
         album = await self.album(album_id)
@@ -160,12 +226,25 @@ class TargetNativeLibraryService:
         tracks = [
             track for track in context["tracks"] if track["availability"] == "indexed"
         ]
-        contribution, custom, exclusion, conversion = await asyncio.gather(
-            self._store.get_active_album_contribution(album.id),
-            self._store.get_custom_edition_state(album.id),
-            self._store.get_management_exclusion(album.id),
-            self._store.get_active_edition_conversion(album.id),
+        contribution, custom, exclusion, conversion, (pin, pin_group) = (
+            await asyncio.gather(
+                self._store.get_active_album_contribution(album.id),
+                self._store.get_custom_edition_state(album.id),
+                self._store.get_management_exclusion(album.id),
+                self._store.get_active_edition_conversion(album.id),
+                self._store.get_target_album_release_pin_with_group(album.id),
+            )
         )
+        if pin is not None and (
+            pin_group is None
+            or pin_group.casefold()
+            != str((identity or {}).get("release_group_mbid") or "").casefold()
+        ):
+            # Pinned under another group (or identity since detached): a
+            # well-formed UUID for the wrong album must not render as a
+            # confident pick. The row stays for re-pinning; display falls
+            # through to owned/tags.
+            pin = None
         if (
             identity is not None
             and review is not None
@@ -188,8 +267,15 @@ class TargetNativeLibraryService:
         if custom is not None:
             album_values["album_identity_state"] = "custom_edition"
             album_values["musicbrainz_release_id"] = None
+        display_release_mbid, pick_basis = (
+            (None, None)
+            if custom is not None
+            else self._display_pick(identity, tracks, pin)
+        )
         return TargetNativeAlbumDetail(
             **album_values,
+            display_release_mbid=display_release_mbid,
+            pick_basis=pick_basis,
             row_revision=int(context["album"]["row_revision"]),
             input_revision=":".join(album_input_revisions(tracks)),
             identification_status=status,
@@ -265,52 +351,80 @@ class TargetNativeLibraryService:
     async def resolve_tracks(
         self, items: list[TrackResolveItem]
     ) -> TrackResolveResponse:
-        resolved: list[ResolvedTrack] = []
-        album_cache: dict[str, dict[tuple[int, int], TargetNativeTrack]] = {}
-        for item in items[:200]:
+        bounded = items[:200]
+        resolved: list[ResolvedTrack] = [
+            ResolvedTrack(
+                release_group_mbid=item.release_group_mbid,
+                disc_number=item.disc_number,
+                track_number=item.track_number,
+            )
+            for item in bounded
+        ]
+
+        # F-TARGETCATALOG-06: one provider-aware canonical batch lookup and
+        # one batch album-track read serve the whole request. Items without a
+        # release-group ID / track number keep their base result and never
+        # trigger a lookup.
+        pending_indices: list[int] = []
+        unique_album_ids: list[str] = []
+        seen_album_ids: set[str] = set()
+        for index, item in enumerate(bounded):
             album_id = item.release_group_mbid
             if album_id is None or item.track_number is None:
-                resolved.append(
-                    ResolvedTrack(
-                        release_group_mbid=album_id,
-                        disc_number=item.disc_number,
-                        track_number=item.track_number,
-                    )
-                )
                 continue
-            canonical = await self.canonical_id("album", album_id)
+            pending_indices.append(index)
+            if album_id not in seen_album_ids:
+                seen_album_ids.add(album_id)
+                unique_album_ids.append(album_id)
+
+        if not unique_album_ids:
+            return TrackResolveResponse(items=resolved)
+
+        canonical_map = await self._store.resolve_canonical_target_ids(
+            "album", unique_album_ids
+        )
+        canonical_by_item: dict[int, str] = {}
+        unique_canonical: list[str] = []
+        seen_canonical: set[str] = set()
+        for index in pending_indices:
+            canonical = canonical_map.get(bounded[index].release_group_mbid or "")
             if canonical is None:
-                resolved.append(
-                    ResolvedTrack(
-                        release_group_mbid=album_id,
-                        disc_number=item.disc_number,
-                        track_number=item.track_number,
-                    )
-                )
                 continue
-            if canonical not in album_cache:
-                album_cache[canonical] = {
-                    (track.disc_number, track.track_number): track
-                    for track in await self.album_tracks(canonical)
-                }
-            match = album_cache[canonical].get(
-                (item.disc_number or 1, item.track_number)
-            )
-            resolved.append(
-                ResolvedTrack(
-                    release_group_mbid=album_id,
-                    disc_number=item.disc_number,
-                    track_number=item.track_number,
-                    source="local" if match is not None else None,
-                    track_source_id=match.id if match is not None else None,
-                    stream_url=(
-                        f"/api/v1/stream/local/{match.id}"
-                        if match is not None
-                        else None
-                    ),
-                    format=match.format if match is not None else None,
-                    duration=(match.duration_seconds if match is not None else None),
-                )
+            canonical_by_item[index] = canonical
+            if canonical not in seen_canonical:
+                seen_canonical.add(canonical)
+                unique_canonical.append(canonical)
+
+        if not unique_canonical:
+            return TrackResolveResponse(items=resolved)
+
+        track_rows = await self._store.get_target_album_tracks_batch(
+            unique_canonical
+        )
+        album_maps: dict[str, dict[tuple[int, int], TargetNativeTrack]] = {}
+        for canonical in unique_canonical:
+            tracks = [self._track(row) for row in track_rows.get(canonical, [])]
+            album_maps[canonical] = {
+                (track.disc_number, track.track_number): track
+                for track in tracks
+            }
+        for index in pending_indices:
+            canonical = canonical_by_item.get(index)
+            if canonical is None:
+                continue
+            item = bounded[index]
+            match = album_maps[canonical].get((item.disc_number or 1, item.track_number))
+            if match is None:
+                continue
+            resolved[index] = ResolvedTrack(
+                release_group_mbid=item.release_group_mbid,
+                disc_number=item.disc_number,
+                track_number=item.track_number,
+                source="local",
+                track_source_id=match.id,
+                stream_url=f"/api/v1/stream/local/{match.id}",
+                format=match.format,
+                duration=match.duration_seconds,
             )
         return TrackResolveResponse(items=resolved)
 
@@ -353,7 +467,7 @@ class TargetNativeLibraryService:
             else (await self.canonical_id("album", album_id) or album_id)
         )
         for track in tracks:
-            track.current_tier = tier_for(track.format, track.bit_rate)
+            track.current_tier = tier_for(track.format, track.bit_rate, track.bit_depth)
             track.below_cutoff = bool(
                 upgrade_allowed
                 and quality_cutoff
@@ -454,6 +568,19 @@ class TargetNativeLibraryService:
             and track["release_track_position"] is not None
         }
         return len(release_track_ids)
+
+    async def _stamp_full_marks(
+        self, albums: list[TargetNativeAlbum]
+    ) -> list[TargetNativeAlbum]:
+        if not albums:
+            return albums
+        marked = await self._store.target_albums_marked_full([album.id for album in albums])
+        if not marked:
+            return albums
+        for album in albums:
+            if album.id in marked:
+                album.marked_full = True
+        return albums
 
     @staticmethod
     def _album(row: dict[str, Any]) -> TargetNativeAlbum:

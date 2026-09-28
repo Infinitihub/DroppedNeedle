@@ -59,6 +59,7 @@ from core.exceptions import (
     AuthenticationError,
     ConfigurationError,
     ExternalServiceError,
+    RateLimitedError,
     TokenNotAuthorizedError,
 )
 from core.task_registry import TaskRegistry
@@ -286,16 +287,24 @@ async def connect_listenbrainz(
     # account yields silently-empty discovery
     if not body.username.strip():
         raise HTTPException(status_code=400, detail="A ListenBrainz username is required")
-    result = await settings_service.verify_listenbrainz(
-        ListenBrainzConnectionSettings(
-            username=body.username, user_token=body.user_token, enabled=True
+    try:
+        result = await settings_service.verify_listenbrainz(
+            ListenBrainzConnectionSettings(
+                username=body.username, user_token=body.user_token, enabled=True
+            )
         )
-    )
+    except RateLimitedError:
+        raise HTTPException(
+            status_code=429,
+            detail="ListenBrainz is temporarily rate-limiting this server. Try again shortly.",
+        ) from None
     if not result.valid:
         raise HTTPException(status_code=400, detail=result.message)
     await store.upsert(
         current_user.id, "listenbrainz", {"user_token": body.user_token, "username": body.username}
     )
+    await settings_service.on_listenbrainz_connection_changed()
+
     return ConnectionStatus(service="listenbrainz", enabled=True, username=body.username)
 
 
@@ -311,7 +320,7 @@ async def spotify_auth_url(
         raise HTTPException(status_code=400, detail="Spotify is not configured by the administrator")
     state = secrets.token_urlsafe(32)
     await auth_store.store_spotify_state(state, current_user.id)
-    redirect_uri = str(request.base_url).rstrip("/") + "/api/v1/me/connections/spotify/auth/callback"
+    redirect_uri = preferences_service.spotify_redirect_uri(str(request.base_url))
     auth_url = "https://accounts.spotify.com/authorize?" + urlencode({
         "client_id": settings.client_id,
         "response_type": "code",
@@ -333,14 +342,18 @@ async def spotify_auth_callback(
     error: str | None = None,
 ) -> fastapi_responses.RedirectResponse:
     if error or not code or not state:
-        return fastapi_responses.RedirectResponse("/profile?spotify=error")
+        return fastapi_responses.RedirectResponse(
+            preferences_service.with_base_path("/profile?spotify=error")
+        )
 
     user_id = await auth_store.consume_spotify_state(state)
     if not user_id:
-        return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=state")
+        return fastapi_responses.RedirectResponse(
+            preferences_service.with_base_path("/profile?spotify=error&reason=state")
+        )
 
     settings = preferences_service.get_spotify_settings_raw()
-    redirect_uri = str(request.base_url).rstrip("/") + "/api/v1/me/connections/spotify/auth/callback"
+    redirect_uri = preferences_service.spotify_redirect_uri(str(request.base_url))
     basic = base64.b64encode(f"{settings.client_id}:{settings.client_secret}".encode()).decode()
 
     try:
@@ -352,7 +365,9 @@ async def spotify_auth_callback(
             )
             if token_resp.status_code != 200:
                 logger.warning(f"Spotify token exchange failed: status={token_resp.status_code}")
-                return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=token")
+                return fastapi_responses.RedirectResponse(
+                    preferences_service.with_base_path("/profile?spotify=error&reason=token")
+                )
             token_data = token_resp.json()
 
             me_resp = await client.get(
@@ -361,7 +376,9 @@ async def spotify_auth_callback(
             )
     except Exception:  # noqa: BLE001
         logger.exception("Spotify OAuth callback failed")
-        return fastapi_responses.RedirectResponse("/profile?spotify=error&reason=network")
+        return fastapi_responses.RedirectResponse(
+            preferences_service.with_base_path("/profile?spotify=error&reason=network")
+        )
 
     spotify_user = me_resp.json() if me_resp.status_code == 200 else {}
     expires_at = (
@@ -375,7 +392,9 @@ async def spotify_auth_callback(
         "username": spotify_user.get("display_name") or spotify_user.get("id") or "Spotify",
         "spotify_user_id": spotify_user.get("id", ""),
     })
-    return fastapi_responses.RedirectResponse("/profile?spotify=connected")
+    return fastapi_responses.RedirectResponse(
+        preferences_service.with_base_path("/profile?spotify=connected")
+    )
 
 
 @router.put("/connections/navidrome", response_model=ConnectionStatus)
@@ -487,12 +506,15 @@ async def disconnect(
     service: str,
     store: UserConnectionsStore = Depends(get_user_connections_store),
     client_factory: PerUserClientFactory = Depends(get_per_user_client_factory),
+    settings_service: SettingsService = Depends(get_settings_service),
 ) -> ConnectionActionResponse:
     if service not in _SUPPORTED_SERVICES:
         raise HTTPException(status_code=404, detail="Unknown service")
     deleted = await store.delete(current_user.id, service)
     if deleted:
         await client_factory.invalidate_playlist_cache(current_user.id, service)
+        if service == "listenbrainz":
+            await settings_service.on_listenbrainz_connection_changed()
     return ConnectionActionResponse(service=service, deleted=deleted)
 
 

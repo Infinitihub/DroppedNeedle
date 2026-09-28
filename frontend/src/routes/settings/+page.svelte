@@ -5,38 +5,40 @@
 	import { fromStore } from 'svelte/store';
 	import { integrationStore } from '$lib/stores/integration';
 	import SettingsTabContent from '$lib/components/settings/SettingsTabContent.svelte';
+	import { isSettingsTabVisible } from '$lib/components/settings/settingsTabs';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getUpdateCheckQuery } from '$lib/queries/VersionQuery.svelte';
 	import {
 		Settings2,
 		Music,
-		Youtube,
 		Database,
 		Settings,
 		Radio,
 		Search,
-		BarChart3,
+		ChartColumn,
 		Info,
-		ArrowUpCircle,
+		CircleArrowUp,
 		Globe,
-		Home,
+		House,
 		Compass,
 		Users,
 		ShieldCheck,
 		HardDriveDownload,
 		Waypoints,
 		CalendarClock,
-		DownloadCloud,
+		CloudDownload,
 		Gift,
 		ShoppingBag,
 		Landmark,
 		Blocks,
-		PanelLeft
+		PanelLeft,
+		Activity
 	} from 'lucide-svelte';
 	import JellyfinIcon from '$lib/components/JellyfinIcon.svelte';
 	import NavidromeIcon from '$lib/components/NavidromeIcon.svelte';
 	import PlexIcon from '$lib/components/PlexIcon.svelte';
 	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
+	import YouTubeIcon from '$lib/components/YouTubeIcon.svelte';
 
 	const integration = fromStore(integrationStore);
 
@@ -72,15 +74,15 @@
 						tier: 'setup',
 						icon: HardDriveDownload
 					},
-					{ id: 'indexers', label: 'Indexers', tier: 'setup', icon: Search },
-					{ id: 'lidarr-import', label: 'Lidarr Import', tier: 'setup', icon: DownloadCloud }
+					{ id: 'indexers', label: 'Indexers / Prowlarr', tier: 'setup', icon: Search },
+					{ id: 'lidarr-import', label: 'Lidarr Import', tier: 'setup', icon: CloudDownload }
 				]
 			: []),
 		{ id: 'connect-apps', label: 'Connect Apps', tier: 'setup', icon: Waypoints },
 		{ id: 'jellyfin', label: 'Jellyfin', tier: 'setup', icon: JellyfinIcon },
 		{ id: 'navidrome', label: 'Navidrome', tier: 'setup', icon: NavidromeIcon },
 		{ id: 'plex', label: 'Plex', tier: 'setup', icon: PlexIcon },
-		{ id: 'youtube', label: 'YouTube', tier: 'setup', icon: Youtube },
+		{ id: 'youtube', label: 'YouTube', tier: 'setup', icon: YouTubeIcon },
 		...(authStore.isAdmin ? [{ id: 'lastfm', label: 'Last.fm', tier: 'setup', icon: Radio }] : []),
 		...(authStore.isAdmin
 			? [{ id: 'spotify', label: 'Spotify', tier: 'setup', icon: SpotifyIcon }]
@@ -92,18 +94,21 @@
 			? [{ id: 'get-it', label: 'Get it', tier: 'setup', icon: ShoppingBag }]
 			: []),
 		{ id: 'settings', label: 'Release Types', tier: 'personalize', icon: Settings2 },
-		{ id: 'home', label: 'Home', tier: 'personalize', icon: Home },
+		{ id: 'home', label: 'Home', tier: 'personalize', icon: House },
 		{ id: 'discover', label: 'Discover', tier: 'personalize', icon: Compass },
 		{ id: 'sidebar', label: 'Sidebar', tier: 'personalize', icon: PanelLeft },
-		{ id: 'music-source', label: 'Music Source', tier: 'personalize', icon: BarChart3 },
+		{ id: 'music-source', label: 'Music Source', tier: 'personalize', icon: ChartColumn },
 		{ id: 'cache', label: 'Cache', tier: 'system', icon: Database },
-		{ id: 'musicbrainz', label: 'MusicBrainz', tier: 'system', icon: Globe },
+		...(isSettingsTabVisible('musicbrainz', authStore.isAdmin)
+			? [{ id: 'musicbrainz', label: 'MusicBrainz', tier: 'system', icon: Globe }]
+			: []),
 		...(authStore.isAdmin
 			? [
 					{ id: 'users', label: 'Users', tier: 'system', icon: Users },
 					{ id: 'security', label: 'Security', tier: 'system', icon: ShieldCheck },
 					{ id: 'plugins', label: 'Plugins', tier: 'system', icon: Blocks },
-					{ id: 'wrapped', label: 'Wrapped API', tier: 'system', icon: Gift }
+					{ id: 'wrapped', label: 'Wrapped API', tier: 'system', icon: Gift },
+					{ id: 'diagnostics', label: 'Diagnostics', tier: 'system', icon: Activity }
 				]
 			: []),
 		{ id: 'advanced', label: 'Advanced', tier: 'system', icon: Settings },
@@ -144,21 +149,20 @@
 	});
 </script>
 
-<div class="min-h-screen bg-base-100">
-	<!-- Desktop is an app-style two-pane layout: the page itself doesn't scroll;
-	     the tab rail and the content pane each scroll independently. This is what
-	     keeps the wheel from being trapped by a hidden sidebar scroller when the
-	     tab list grows taller than the viewport. Mobile keeps natural page flow. -->
-	<div class="container mx-auto p-4 max-w-7xl lg:flex lg:h-[calc(100vh-4rem)] lg:flex-col">
+<div class="flex min-h-screen flex-col bg-base-100 lg:h-full lg:min-h-0">
+	<!-- Desktop is an app-style two-pane layout inside the shell's locked
+	     viewport column: the page itself doesn't scroll; the tab rail and the
+	     content pane each scroll independently, so the wheel isn't trapped by a
+	     hidden sidebar scroller when the tab list grows taller than the
+	     viewport. Mobile keeps natural page flow. -->
+	<div class="container mx-auto p-4 max-w-7xl lg:flex lg:h-full lg:min-h-0 lg:flex-col">
 		<div class="mb-6 lg:shrink-0">
 			<h1 class="text-3xl font-bold">Settings</h1>
 			<p class="text-base-content/70 mt-2">Manage your preferences and app settings.</p>
 		</div>
 
 		<div class="flex flex-col lg:flex-row gap-6 lg:min-h-0 lg:flex-1">
-			<aside
-				class="scrollbar-hide w-full lg:w-80 lg:shrink-0 space-y-3 lg:min-h-0 lg:overflow-y-auto lg:pb-4"
-			>
+			<aside class="w-full lg:w-80 lg:shrink-0 space-y-3 lg:min-h-0 lg:overflow-y-auto lg:pb-4">
 				<label class="relative block">
 					<Search class="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-base-content/40" />
 					<input
@@ -223,7 +227,7 @@
 												<span
 													class="ml-auto flex items-center gap-1 rounded-full bg-accent/15 px-2 py-0.5 text-xs font-semibold text-accent"
 												>
-													<ArrowUpCircle class="h-3 w-3" />
+													<CircleArrowUp class="h-3 w-3" />
 													Update
 												</span>
 											{/if}

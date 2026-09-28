@@ -7,6 +7,7 @@ from typing import Literal
 import msgspec
 
 from infrastructure.msgspec_fastapi import AppStruct
+from models.identification import TrackProvenance
 
 ArtistKind = Literal["person", "group", "various_artists", "unknown"]
 Availability = Literal["indexed", "excluded", "missing"]
@@ -86,6 +87,9 @@ class LocalTrack(AppStruct):
     album_artist_name: str | None = None
     tag_album_title: str | None = None
     tag_album_artist_name: str | None = None
+    title_provenance: TrackProvenance = "absent"
+    album_title_provenance: TrackProvenance = "absent"
+    album_artist_provenance: TrackProvenance = "absent"
     year: int | None = None
     genre: str | None = None
     title_sort: str | None = None
@@ -93,6 +97,8 @@ class LocalTrack(AppStruct):
     album_sort: str | None = None
     album_artist_sort: str | None = None
     disc_subtitle: str | None = None
+    # Raw file-tag release type (RELEASETYPE/MUSICBRAINZ_ALBUMTYPE); display mapping lives in compat.
+    release_type: str | None = None
     is_compilation: bool = False
     embedded_release_group_mbid: str | None = None
     embedded_release_mbid: str | None = None
@@ -139,6 +145,9 @@ class LocalAlbumExternalIdentity(AppStruct):
     selected_by_user_id: str | None = None
     selected_at: float = 0.0
     row_revision: int = 1
+    provider_source_mode: str | None = None
+    provider_source_id: str | None = None
+    provider_source_generation: int | None = None
 
 
 class LocalArtistExternalIdentity(AppStruct):
@@ -149,6 +158,9 @@ class LocalArtistExternalIdentity(AppStruct):
     selected_by_user_id: str | None = None
     selected_at: float = 0.0
     row_revision: int = 1
+    provider_source_mode: str | None = None
+    provider_source_id: str | None = None
+    provider_source_generation: int | None = None
 
 
 class LocalTrackExternalIdentity(AppStruct):
@@ -162,6 +174,9 @@ class LocalTrackExternalIdentity(AppStruct):
     attempt_id: str | None = None
     selected_at: float = 0.0
     row_revision: int = 1
+    provider_source_mode: str | None = None
+    provider_source_id: str | None = None
+    provider_source_generation: int | None = None
 
 
 class LocalArtistAlias(AppStruct):

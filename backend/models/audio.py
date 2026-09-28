@@ -46,6 +46,7 @@ class AudioTag(AppStruct):
     musicbrainz_album_artist_id: str | None = None
     acoustid_id: str | None = None
     compilation: bool = False
+    release_type: str | None = None  # raw RELEASETYPE/MUSICBRAINZ_ALBUMTYPE value
     title_sort: str | None = None
     artist_sort: str | None = None
     album_sort: str | None = None
@@ -78,9 +79,11 @@ class AudioInfo(AppStruct):
 class FingerprintResult(AppStruct):
     """Outcome of a Tier-3 AcoustID fingerprint lookup.
 
-    ``status`` drives the scanner's decision; the recording fields carry the best
-    match only when ``status == 'pass'``. Failures are signalled via ``status``
-    (+ ``error``) and never by raising, so fingerprinting fails open:
+    ``status`` drives the scanner's decision; the selected recording fields carry the
+    best match while ``recording_ids`` preserves every valid candidate attached to that
+    AcoustID result. All are populated only when ``status == 'pass'``. Failures are
+    signalled via ``status`` (+ ``error``) and never by raising, so fingerprinting fails
+    open:
 
     - ``pass``     - confident recording match (AcoustID score >= 0.70).
     - ``skip``     - no result, or best score below the confidence floor.
@@ -101,3 +104,13 @@ class FingerprintResult(AppStruct):
     # download-verify release-group check (D15/B2) compares the requested
     # release group against this set.
     release_group_ids: list[str] = msgspec.field(default_factory=list)
+    # All valid MusicBrainz recording MBIDs attached to the selected highest-ranked
+    # AcoustID result, in upstream order with case-insensitive duplicates removed.
+    # Populated only on ``pass``; ``recording_id`` remains the first valid candidate
+    # and is retained for consumers that need the selected/top match.
+    recording_ids: list[str] = msgspec.field(default_factory=list)
+    # F-044: True when fpcalc exited non-zero yet still emitted a fingerprint
+    # (a truncated/corrupt decode produced a PREFIX fingerprint). Callers that
+    # act on a confident match may require corroboration; genuine short
+    # tracks keep the historical tolerance.
+    partial_decode: bool = False

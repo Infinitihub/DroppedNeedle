@@ -10,6 +10,8 @@ from fastapi.responses import StreamingResponse
 from api.v1.schemas.library_operations import (
     ArtistMergeApplyRequest,
     ArtistMergePreviewRequest,
+    AutomaticEditionUndoRequest,
+    AutomaticEditionUndoResponse,
     BulkReviewApplyRequest,
     BulkReviewPreviewRequest,
     BulkReviewPreviewResponse,
@@ -135,6 +137,7 @@ async def list_reviews(
     metadata_incomplete: bool | None = None,
     candidate_available: bool | None = None,
     job_state: str | None = None,
+    exclude_active_jobs: bool = False,
     sort: str = "newest",
     created_from: float | None = None,
     created_to: float | None = None,
@@ -152,6 +155,7 @@ async def list_reviews(
         metadata_incomplete=metadata_incomplete,
         candidate_available=candidate_available,
         job_state=job_state,
+        exclude_active_jobs=exclude_active_jobs,
         sort=sort,
         created_from=created_from,
         created_to=created_to,
@@ -358,6 +362,19 @@ async def reidentify_album(
         **{key: row[key] for key in OperationResponse.__struct_fields__ if key in row}
     )
 
+
+@router.post(
+    "/albums/{album_id}/undo-automatic-edition",
+    response_model=AutomaticEditionUndoResponse,
+)
+async def undo_automatic_edition(
+    admin: CurrentAdminDep,
+    album_id: str,
+    service: IdentityRepairServiceDep,
+    body: AutomaticEditionUndoRequest = MsgSpecBody(AutomaticEditionUndoRequest),
+) -> AutomaticEditionUndoResponse:
+    """S-2: revisioned catalog-identity undo of one auto-accepted edition."""
+    return await service.undo_automatic_edition(album_id, body, admin.id)
 
 @router.post(
     "/operations/{job_id}/candidate",

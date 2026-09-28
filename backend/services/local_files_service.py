@@ -88,6 +88,12 @@ class LocalFilesService:
         self._preferences = preferences_service
         self._cache = cache
 
+    def is_configured(self) -> bool:
+        try:
+            return bool(self._library_repo.is_configured())
+        except Exception:  # noqa: BLE001
+            return True
+
     def _get_library_roots(self) -> list[Path]:
         """Configured native-library scan roots (Settings -> Library).
 
@@ -234,7 +240,7 @@ class LocalFilesService:
                 extra={"path": str(path), "error": str(exc)},
             )
 
-    async def get_album_track_files(self, album_id: int) -> list[dict[str, Any]]:
+    async def get_album_track_files(self, album_id: str) -> list[dict[str, Any]]:
         data = await self._library_repo.get_track_files_by_album(album_id)
         if not data:
             return []
@@ -260,7 +266,7 @@ class LocalFilesService:
         return track_files
 
     async def _build_track_list(
-        self, album_id: int
+        self, album_id: str
     ) -> tuple[list[LocalTrackInfo], int, dict[str, int]]:
         tracks = await self._library_repo.get_album_tracks(album_id)
         track_files = await self.get_album_track_files(album_id)
@@ -347,7 +353,7 @@ class LocalFilesService:
         filename = file_path.name
         return file_path, filename, media_type
 
-    async def create_album_zip(self, album_id: int) -> tuple[Path, str]:
+    async def create_album_zip(self, album_id: str) -> tuple[Path, str]:
         """Build a ZIP of all tracks in an album. Returns (zip_path, zip_filename)."""
         album_data = await self._library_repo.get_album_by_id(album_id)
         if not album_data:

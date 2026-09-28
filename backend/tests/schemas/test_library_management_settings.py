@@ -6,6 +6,7 @@ import pytest
 
 from api.v1.schemas.library_management import (
     COMPLETE_LIBRARY_ORGANIZER_PROFILE_ID,
+    DEFAULT_SIDECAR_PATTERNS,
     LEGACY_NAMING_PROFILE_ID,
     LEGACY_NAMING_SCRIPT_ID,
     MANAGED_FIELD_NAMES,
@@ -16,10 +17,12 @@ from api.v1.schemas.library_management import (
     LibraryManagementRootOverrides,
     LibraryManagementSettings,
     ManagedFieldSettings,
+    NamingScriptSettings,
     build_initial_library_management_settings,
     normalize_library_management_settings,
     profile_revision,
     settings_revision,
+    _remove_default_identity_section,
 )
 
 
@@ -135,6 +138,59 @@ def test_legacy_template_is_copied_into_an_unassigned_path_only_profile() -> Non
     assert settings.root_assignments == []
 
 
+def test_legacy_initial_template_is_accepted_by_settings_builder() -> None:
+    source = "{initial}/{albumartist}/{album}/{title}.{ext}"
+    settings = build_initial_library_management_settings(source)
+
+    script = next(
+        value
+        for value in settings.naming_scripts
+        if value.id == LEGACY_NAMING_SCRIPT_ID
+    )
+
+    assert script.source == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "{initial}/{albumartist}/{title}.{ext}",
+        "{upper(initial)}/{albumartist}/{title}.{ext}",
+    ),
+)
+def test_initial_plain_and_expression_scripts_are_schema_valid(source: str) -> None:
+    settings = build_initial_library_management_settings()
+    settings.naming_scripts.append(
+        NamingScriptSettings(
+            id="55f447a4-3053-4a42-989e-669bf3d954e8",
+            name="Initial naming",
+            source=source,
+        )
+    )
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.organization.compatibility.unicode_normalization = "NFKC"
+
+    normalized = normalize_library_management_settings(settings)
+
+    script = next(
+        value
+        for value in normalized.naming_scripts
+        if value.id == "55f447a4-3053-4a42-989e-669bf3d954e8"
+    )
+    assert script.source == source
+    assert (
+        next(
+            value
+            for value in normalized.profiles
+            if value.id == PICARD_ORGANIZER_PROFILE_ID
+        )
+        .organization.compatibility.unicode_normalization
+        == "NFKC"
+    )
+
+
 def test_nested_settings_round_trip_and_revisions_are_stable() -> None:
     settings = build_initial_library_management_settings()
     first_revision = settings_revision(settings)
@@ -169,6 +225,7 @@ def test_default_lyrics_preservation_keeps_pre_field_profile_revision() -> None:
     legacy_payload = msgspec.to_builtins(profile)
     legacy_payload.pop("revision")
     legacy_payload["enrichment"]["lyrics"].pop("preserve_existing")
+    _remove_default_identity_section(legacy_payload)
     legacy_revision = hashlib.sha256(
         json.dumps(
             legacy_payload,
@@ -192,6 +249,7 @@ def test_default_lyrics_preservation_keeps_pre_field_settings_revision() -> None
         profile["enrichment"]["lyrics"].pop("preserve_existing")
         if profile["organization"].get("multi_disc_naming_script_id") is None:
             profile["organization"].pop("multi_disc_naming_script_id")
+        _remove_default_identity_section(profile)
     legacy_revision = hashlib.sha256(
         json.dumps(
             legacy_payload,
@@ -217,6 +275,7 @@ def test_null_multi_disc_field_preserves_standard_only_profile_revision() -> Non
     payload.pop("revision")
     payload["organization"].pop("multi_disc_naming_script_id")
     payload["enrichment"]["lyrics"].pop("preserve_existing")
+    _remove_default_identity_section(payload)
     legacy_revision = hashlib.sha256(
         json.dumps(
             payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
@@ -296,3 +355,30 @@ def test_duplicate_profile_ids_are_rejected() -> None:
 
     with pytest.raises(ValueError, match="unique ID"):
         normalize_library_management_settings(settings)
+
+
+def test_initial_organizer_profiles_cover_back_booklet_and_medium_sidecars() -> None:
+    settings = build_initial_library_management_settings()
+    expected = [
+        "back.jpg",
+        "back.jpeg",
+        "back.png",
+        "back.webp",
+        "booklet*.jpg",
+        "booklet*.jpeg",
+        "booklet*.png",
+        "booklet*.webp",
+        "medium*.jpg",
+        "medium*.jpeg",
+        "medium*.png",
+        "medium*.webp",
+    ]
+
+    for profile_id in (
+        PICARD_ORGANIZER_PROFILE_ID,
+        COMPLETE_LIBRARY_ORGANIZER_PROFILE_ID,
+    ):
+        profile = next(value for value in settings.profiles if value.id == profile_id)
+        assert profile.organization.sidecar_patterns == list(DEFAULT_SIDECAR_PATTERNS)
+        for pattern in expected:
+            assert pattern in profile.organization.sidecar_patterns

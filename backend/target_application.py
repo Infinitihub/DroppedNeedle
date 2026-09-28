@@ -38,6 +38,7 @@ from api.v1.routes import (
     discover,
     downloads,
     downloads_search,
+    events,
     following,
     free_music,
     home,
@@ -62,6 +63,7 @@ from api.v1.routes import (
     plex_library,
     plugins,
     profile,
+    prowlarr,
     quarantine,
     requests,
     requests_page,
@@ -156,21 +158,25 @@ from core.dependencies import (
     init_app_state,
     get_target_album_identification_service,
     get_target_identification_queue,
+    get_sse_publisher,
     get_library_contribution_verification_worker,
     get_background_workload_gate,
     get_library_policy_resolver,
     get_library_management_recovery_service,
 )
-from core.config import get_settings
+from core.base_path import BasePathMiddleware
+from core.config import Settings, get_settings
 from core.exception_handlers import (
     circuit_open_error_handler,
     client_disconnected_handler,
     configuration_error_handler,
     conflict_error_handler,
+    automatic_management_hold_handler,
     external_service_error_handler,
     general_exception_handler,
     http_exception_handler,
     permission_denied_handler,
+    rate_limited_error_handler,
     request_validation_error_handler,
     resource_not_found_handler,
     revision_overflow_error_handler,
@@ -183,8 +189,10 @@ from core.exceptions import (
     ClientDisconnectedError,
     ConfigurationError,
     ConflictError,
+    AutomaticManagementHoldError,
     ExternalServiceError,
     PermissionDeniedError,
+    RateLimitedError,
     ResourceNotFoundError,
     RevisionOverflowError,
     SourceResolutionError,
@@ -196,6 +204,7 @@ from core.task_registry import TaskRegistry
 from core.tasks import (
     start_cache_cleanup_task,
     start_disk_cache_cleanup_task,
+    start_navidrome_playlist_export_task,
     start_memory_maintenance_task,
 )
 from infrastructure.http.compression import CompressibleGZipMiddleware
@@ -205,9 +214,18 @@ from middleware import (
     DegradationMiddleware,
     HSTSMiddleware,
     PerformanceMiddleware,
+    PerUserRateLimitMiddleware,
     RateLimitMiddleware,
 )
-from services.native.library_scan_supervisor import start_target_scan_supervisor
+from services.native.library_filesystem_watcher import (
+    WATCHER_TASK_NAME,
+    start_library_filesystem_watcher,
+)
+from services.native.library_revision_poller import start_library_revision_poller
+from services.native.library_scan_supervisor import (
+    SUPERVISOR_TASK_NAME,
+    start_target_scan_supervisor,
+)
 from services.native.target_application_runtime import (
     CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME,
     IDENTIFICATION_WORKER_TASK_NAME,
@@ -223,6 +241,7 @@ from services.native.target_application_lifecycle import (
     start_target_operational_runtime,
 )
 from services.native.target_startup_validator import TargetStartupValidator
+from services.native.wal_checkpoint_service import start_target_wal_checkpoint_task
 from static_server import mount_frontend
 
 logger = logging.getLogger(__name__)
@@ -426,6 +445,7 @@ def _include_complete_target_routes(app: FastAPI) -> None:
         system.router,
         spotify.router,
         now_playing.router,
+        events.router,
         profile.router,
         playlists.router,
         version.router,
@@ -434,6 +454,7 @@ def _include_complete_target_routes(app: FastAPI) -> None:
         download_client.router,
         download_clients.router,
         indexers.router,
+        prowlarr.router,
         lidarr_import.router,
         import_drop.router,
         free_music.router,
@@ -516,10 +537,71 @@ def _server_timezone_name() -> str:
     return "UTC"
 
 
+_LAUNCHER_BYPASS_WARNING = (
+    "[upgrade] WARNING: library migration launcher was bypassed - expected "
+    "`python -m maintenance.automatic_upgrade --start-target`; catalog "
+    "migrations did not run. Restore the image CMD."
+)
+
+_UPGRADE_IN_PROGRESS_STAGES = frozenset(
+    {"running", "migrating", "promoting", "promoted_pending_startup"}
+)
+
+
+def _launcher_bypassed(settings: Settings) -> bool:
+    """Detect a container boot that skipped the migration launcher.
+
+    Mirrors the ``needs_upgrade`` decision in
+    ``maintenance.automatic_upgrade.main`` (existing live database without the
+    migration marker, or an interrupted upgrade state), gated on container
+    signals so fresh volumes and local development never match. Read-only and
+    warning-only: any error means "no warning", never an exception.
+    """
+    try:
+        from maintenance.automatic_upgrade import (
+            UPGRADE_ID,
+            _ADMISSION_TOKEN_ENV,
+            _database_has_marker,
+            _read_state,
+            _SOURCE_REVISION_PATH,
+        )
+
+        if os.getenv(_ADMISSION_TOKEN_ENV, "").strip():
+            return False
+        if not _SOURCE_REVISION_PATH.exists() and settings.root_app_dir != Path("/app"):
+            return False
+        if not settings.library_db_path.is_file():
+            return False
+        if not _database_has_marker(settings.library_db_path):
+            return True
+        state = _read_state(
+            settings.cache_dir / f"automatic-upgrade-{UPGRADE_ID}.json"
+        )
+        return state is not None and state.get("stage") in _UPGRADE_IN_PROGRESS_STAGES
+    except Exception:  # noqa: BLE001 - bypass probe must never block startup
+        return False
+
+
+def _emit_launcher_bypass_warning() -> None:
+    logger.warning(_LAUNCHER_BYPASS_WARNING)
+    print(_LAUNCHER_BYPASS_WARNING, flush=True)
+
+
+async def _warn_if_launcher_bypassed(settings: Settings) -> bool:
+    """Emit the bypass warning when the launcher was skipped. Never raises."""
+    try:
+        if await asyncio.to_thread(_launcher_bypassed, settings):
+            _emit_launcher_bypass_warning()
+            return True
+    except Exception:  # noqa: BLE001 - bypass probe must never block startup
+        logger.debug("target_startup.launcher_bypass_probe_suppressed")
+    return False
+
 @asynccontextmanager
 async def production_target_lifespan(app: FastAPI):
     settings = get_settings()
     logging.getLogger().setLevel(getattr(logging, settings.log_level, logging.INFO))
+    await _warn_if_launcher_bypassed(settings)
     from core.config import migrate_legacy_config
     from maintenance.automatic_upgrade import (
         await_target_startup_admission,
@@ -595,6 +677,7 @@ async def production_target_lifespan(app: FastAPI):
             interval=advanced.disk_cache_cleanup_interval,
             cover_disk_cache=get_target_consumer_composition().covers.disk_cache,
         )
+        start_navidrome_playlist_export_task()
 
         def root_paths() -> dict[str, Path]:
             return {
@@ -619,19 +702,26 @@ async def production_target_lifespan(app: FastAPI):
         def library_enabled() -> bool:
             return get_preferences_service().get_typed_library_settings().enabled
 
-        start_target_scan_supervisor(
-            get_target_library_scan_coordinator,
-            root_paths,
-            work_wakeups,
-            scheduler_getter=get_target_library_scan_scheduler,
-            resolver_getter=get_library_policy_resolver,
-            schedule_settings_getter=schedule_settings,
-        )
+        def start_scan_supervisor() -> asyncio.Task[None]:
+            return start_target_scan_supervisor(
+                get_target_library_scan_coordinator,
+                root_paths,
+                work_wakeups,
+                scheduler_getter=get_target_library_scan_scheduler,
+                resolver_getter=get_library_policy_resolver,
+                schedule_settings_getter=schedule_settings,
+                dirty_scopes_getter=lambda: get_preferences_service()
+                .get_library_scan_dirty_scopes()
+                .scope_ids,
+                dirty_scopes_clearer=(
+                    get_preferences_service().clear_library_scan_dirty_scopes
+                ),
+            )
 
         def mb_provider_state() -> CircuitState:
-            from repositories.musicbrainz_base import mb_circuit_breaker
+            from repositories.musicbrainz_base import get_mb_provider_circuit_breaker
 
-            return mb_circuit_breaker.state
+            return get_mb_provider_circuit_breaker().state
 
         async def probe_mb_provider() -> None:
             # Thin background-priority probe mirroring verify_musicbrainz; the
@@ -670,20 +760,47 @@ async def production_target_lifespan(app: FastAPI):
                 work_wakeups,
             )
 
+        def start_filesystem_watcher() -> asyncio.Task[None]:
+            return start_library_filesystem_watcher(
+                get_target_library_scan_coordinator,
+                root_paths,
+                work_wakeups,
+                scheduler_getter=get_target_library_scan_scheduler,
+                resolver_getter=get_library_policy_resolver,
+                watcher_settings_getter=(
+                    get_preferences_service().get_library_scan_filesystem_watcher
+                ),
+            )
+
         worker_starters = {
+            SUPERVISOR_TASK_NAME: start_scan_supervisor,
             IDENTIFICATION_WORKER_TASK_NAME: start_identification_worker,
             OPERATION_WORKER_TASK_NAME: start_operation_worker,
             CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME: start_contribution_worker,
+            WATCHER_TASK_NAME: start_filesystem_watcher,
         }
         for start_worker in worker_starters.values():
             start_worker()
         start_target_worker_watchdog(worker_starters)
+        # (GH-293) Safe PASSIVE WAL checkpoint policy with high/low-water
+        # backpressure; registered, one sleep per iteration, never TRUNCATE.
+        from core.dependencies.service_providers import get_wal_checkpoint_service
+
+        start_target_wal_checkpoint_task(get_wal_checkpoint_service())
+        # Single process-wide library-revision poll feeding the mux SSE stream;
+        # replaces the per-connection poll loop in the old activity streams.
+        start_library_revision_poller(
+            get_target_identification_queue, get_sse_publisher
+        )
         await start_target_operational_runtime(
             settings=settings,
             preferences=preferences,
             auth_store=auth_store,
         )
         if library_enabled():
+            # F6/H6 pending-migration trigger 1 of 3 (live sites): scheduled
+            # once at startup. No periodic scheduler exists by design; a row
+            # missing this window waits for the next roots save or restore.
             try:
                 await get_legacy_pending_migration_service().schedule()
             except Exception:  # noqa: BLE001
@@ -699,6 +816,14 @@ async def production_target_lifespan(app: FastAPI):
         # restart a worker mid-shutdown and orphan the task.
         await registry.cancel(TARGET_WORKER_WATCHDOG_TASK_NAME)
         await registry.cancel_all(grace_period=settings.shutdown_grace_period)
+        try:
+            coordinator = get_target_library_scan_coordinator()
+            if hasattr(coordinator, "aclose"):
+                await coordinator.aclose()
+            elif hasattr(coordinator, "close"):
+                coordinator.close()  # type: ignore[call-arg]
+        except Exception:  # noqa: BLE001 - close must not hang shutdown
+            logger.exception("Failed to close scan coordinator")
         await cleanup_app_state(
             queue_manager_getter=get_target_discover_queue_manager,
             genre_prewarm_getter=get_target_genre_cover_prewarm_service,
@@ -721,12 +846,14 @@ def create_production_target_application() -> FastAPI:
     for exception, handler in (
         (ClientDisconnectedError, client_disconnected_handler),
         (ResourceNotFoundError, resource_not_found_handler),
+        (RateLimitedError, rate_limited_error_handler),
         (ExternalServiceError, external_service_error_handler),
         (SourceResolutionError, source_resolution_error_handler),
         (ValidationError, validation_error_handler),
         (ConfigurationError, configuration_error_handler),
         (PermissionDeniedError, permission_denied_handler),
         (ConflictError, conflict_error_handler),
+        (AutomaticManagementHoldError, automatic_management_hold_handler),
         (StaleRevisionError, stale_revision_error_handler),
         (RevisionOverflowError, revision_overflow_error_handler),
         (CircuitOpenError, circuit_open_error_handler),
@@ -741,6 +868,11 @@ def create_production_target_application() -> FastAPI:
     app.add_middleware(DegradationMiddleware)
     app.add_middleware(PerformanceMiddleware)
     app.add_middleware(CompressibleGZipMiddleware, minimum_size=1000, compresslevel=6)
+    # Per-user buckets run after auth (last-added executes first): the global
+    # limiter below stays as the pre-auth backstop against unauthenticated
+    # floods and caps aggregate traffic, while authenticated users additionally
+    # get their own burst budgets.
+    app.add_middleware(PerUserRateLimitMiddleware)
     app.add_middleware(AuthMiddleware)
     app.add_middleware(
         RateLimitMiddleware,
@@ -762,10 +894,13 @@ def create_production_target_application() -> FastAPI:
             allow_origins=[
                 "http://localhost:5173",
                 "http://127.0.0.1:5173",
+                "http://[::1]:5173",
                 "http://localhost:4173",
                 "http://127.0.0.1:4173",
+                "http://[::1]:4173",
                 "http://localhost:3000",
                 "http://127.0.0.1:3000",
+                "http://[::1]:3000",
             ],
             allow_credentials=True,
             allow_methods=["*"],
@@ -774,7 +909,7 @@ def create_production_target_application() -> FastAPI:
     app.add_middleware(CompatCORSMiddleware)
 
     @app.get("/health")
-    def health_check():
+    async def health_check():
         return {"status": "ok", "message": "DroppedNeedle backend running"}
 
     _include_complete_target_routes(app)
@@ -782,6 +917,10 @@ def create_production_target_application() -> FastAPI:
     app.add_middleware(
         CompatPathCaseMiddleware,
         routes=[*subsonic_router.routes, *jellyfin_router.routes],
+    )
+    # Legacy settings doubles omit base_path; absence means unprefixed serving.
+    app.add_middleware(
+        BasePathMiddleware, base_path=getattr(get_settings(), "base_path", "")
     )
     app.add_middleware(
         ProxyHeadersMiddleware, trusted_hosts=get_settings().trusted_proxy_ips

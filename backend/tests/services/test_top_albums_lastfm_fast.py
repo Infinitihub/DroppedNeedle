@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from infrastructure.queue.priority_queue import RequestPriority
 from repositories.lastfm_models import LastFmAlbum
 from services.artist_discovery_service import ArtistDiscoveryService
 
@@ -48,6 +49,9 @@ def _make_service() -> tuple[ArtistDiscoveryService, AsyncMock]:
     memory_cache = AsyncMock()
     memory_cache.get = AsyncMock(return_value=None)
     memory_cache.set = AsyncMock()
+    memory_cache.get_with_metadata = AsyncMock(return_value=(None, None))
+    memory_cache.set_if_token = AsyncMock(return_value=True)
+    memory_cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
 
     mb_repo = AsyncMock()
     mb_repo.get_release_group_id_from_release = AsyncMock(
@@ -88,8 +92,9 @@ class TestLastFmTopAlbumsCanonicalization:
         assert len(result.albums) == 3
         mb_repo.get_release_group_id_from_release.assert_not_awaited()
         mb_repo.get_release_groups_by_artist.assert_awaited_once_with(
-            ARTIST_MBID, limit=100
+            ARTIST_MBID, limit=100, priority=RequestPriority.USER_INITIATED
         )
+        mb_repo.get_artist_release_groups_with_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_uses_canonical_discography_mbid(self):

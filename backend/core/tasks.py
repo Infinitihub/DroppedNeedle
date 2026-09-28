@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from datetime import datetime, timedelta
 from time import time, monotonic
 from typing import TYPE_CHECKING, Optional
@@ -12,19 +13,18 @@ from infrastructure.validators import is_unknown_mbid, is_valid_mbid
 from services.library_service import LibraryService
 from services.preferences_service import PreferencesService
 from core.task_registry import TaskRegistry
+from repositories.listenbrainz_repository import listenbrainz_rate_limit_cooldown_active
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from services.album_service import AlbumService
-    from services.native.library_scanner import LibraryScanner
     from services.native.download_orchestrator import DownloadOrchestrator
-    from infrastructure.persistence.scan_state_store import ScanStateStore
     from services.audiodb_image_service import AudioDBImageService
     from services.library_precache_service import LibraryPrecacheService
     from infrastructure.persistence import LibraryDB
     from infrastructure.persistence.request_history import RequestHistoryStore
     from infrastructure.persistence.mbid_store import MBIDStore
     from infrastructure.persistence.youtube_store import YouTubeStore
+    from infrastructure.persistence.native_library_store import NativeLibraryStore
     from infrastructure.persistence.wanted_store import WantedStore
     from services.requests_page_service import RequestsPageService
     from services.native.new_release_service import NewReleaseService
@@ -44,7 +44,7 @@ async def cleanup_cache_periodically(
             await cache.cleanup_expired()
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Cache cleanup task failed: %s", e, exc_info=True)
 
 
@@ -89,7 +89,7 @@ async def memory_maintenance_periodically(
             _log_memory_usage(cache, rss_before, rss_after, trimmed)
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Memory maintenance task failed: %s", e, exc_info=True)
 
 
@@ -112,8 +112,7 @@ async def cleanup_disk_cache_periodically(
     while True:
         try:
             await asyncio.sleep(interval)
-            await disk_cache.cleanup_expired_recent()
-            await disk_cache.enforce_recent_size_limits()
+            await disk_cache.cleanup_recent()
             await disk_cache.cleanup_expired_covers()
             await disk_cache.enforce_cover_size_limits()
             if cover_disk_cache:
@@ -121,7 +120,7 @@ async def cleanup_disk_cache_periodically(
                 await asyncio.to_thread(cover_disk_cache.cleanup_expired)
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - periodic cleanup survives individual filesystem failures
             logger.error("Disk cache cleanup task failed: %s", e, exc_info=True)
 
 
@@ -139,163 +138,51 @@ def start_disk_cache_cleanup_task(
     return task
 
 
-_SCAN_FREQ_TO_SECONDS = {
-    "5min": 300,
-    "10min": 600,
-    "30min": 1800,
-    "1hr": 3600,
-    "6hr": 21600,
-    "12hr": 43200,
-    "24hr": 86400,
-    "3d": 259200,
-    "7d": 604800,
-}
-
-# Longest the scheduler sleeps in one go. Long waits are chopped into ticks so a
-# changed schedule (or a finished in-progress scan) is noticed within this window;
-# the final sub-tick sleep still lands exactly on the due moment.
-_SCHEDULER_TICK = 300
-
-
-def _parse_daily_time(value: str) -> tuple[int, int]:
-    """(hour, minute) from an "HH:MM" string, defaulting to 03:00 on anything odd."""
-    try:
-        hh, mm = value.split(":")
-        hour, minute = int(hh), int(mm)
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return hour, minute
-    except (ValueError, AttributeError):
-        pass
-    return 3, 0
-
-
-def _seconds_until_next_scan(
-    freq: str,
-    daily_scan_time: str,
-    last_scan_ts: float | None,
-    now: datetime,
-) -> float:
-    """Seconds to wait before the next scan is due. 0 means "overdue, run now" - which
-    is what lets a restart catch up an overdue scan instead of resetting the clock.
-
-    "daily" fires once at daily_scan_time each day (catching up if that moment already
-    passed today without a scan); the interval values fire on a rolling gap measured
-    from the last actual scan."""
-    if freq == "daily":
-        hour, minute = _parse_daily_time(daily_scan_time)
-        today_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if now < today_at:
-            return (today_at - now).total_seconds()
-        already_scanned_today = (
-            last_scan_ts is not None and last_scan_ts >= today_at.timestamp()
-        )
-        if already_scanned_today:
-            return (today_at + timedelta(days=1) - now).total_seconds()
-        return 0.0
-
-    interval = _SCAN_FREQ_TO_SECONDS.get(freq, 86400)
-    if last_scan_ts is None:
-        return 0.0
-    return max(0.0, (last_scan_ts + interval) - now.timestamp())
-
-
-async def auto_scan_library_periodically(
-    scanner: "LibraryScanner",
-    scan_state: "ScanStateStore",
-    preferences_service: PreferencesService,
+async def export_navidrome_playlists_periodically(
+    interval: int = 300,
 ) -> None:
-    """Incremental native scan on the configured schedule. The next run is computed
-    from the last actual scan (so a restart catches up an overdue scan instead of
-    restarting the interval); a tick is skipped while a scan is already running, and a
-    failure never kills the loop."""
-    from pathlib import Path as _Path
+    """Keep Navidrome's imported playlists in step with DroppedNeedle's.
 
-    logger.info("Auto-scan scheduler started")
+    Polled rather than hooked into every playlist mutation, so no edit path
+    can be missed. Unchanged files are not rewritten.
+    """
+    from core.dependencies import (
+        get_navidrome_playlist_export_service,
+        get_preferences_service,
+    )
+
     while True:
         try:
-            schedule = preferences_service.get_library_scan_schedule()
-            freq = schedule.scan_frequency
-            if freq == "manual":
-                await asyncio.sleep(_SCHEDULER_TICK)
+            await asyncio.sleep(interval)
+            settings = get_preferences_service().get_navidrome_connection()
+            if not settings.playlist_sync_enabled or not settings.playlist_sync_path:
                 continue
-
-            state = await scan_state.get_state()
-            if state.get("status") == "scanning":
-                await asyncio.sleep(_SCHEDULER_TICK)
-                continue
-
-            delay = _seconds_until_next_scan(
-                freq, schedule.daily_scan_time, state.get("started_at"), datetime.now()
+            result = await get_navidrome_playlist_export_service().sync(
+                target_dir=settings.playlist_sync_path,
+                scope=settings.playlist_sync_scope,
+                remove_deleted=settings.playlist_sync_remove_deleted,
             )
-            if delay > 0:
-                await asyncio.sleep(min(delay, _SCHEDULER_TICK))
-                continue
-
-            paths = [
-                _Path(p)
-                for root in preferences_service.get_typed_library_settings_raw().library_roots
-                for p in [root.path]
-            ]
-            if not paths:
-                await asyncio.sleep(_SCHEDULER_TICK)
-                continue
-
-            logger.info("Auto-scan starting (schedule=%s)", freq)
-            success = True
-            try:
-                await scanner.scan(paths)
-                final = await scan_state.get_state()
-                success = final.get("status") != "error"
-            except Exception as e:
-                logger.error("Auto-scan failed: %s", e, exc_info=True)
-                success = False
-
-            schedule = preferences_service.get_library_scan_schedule()
-            preferences_service.save_library_scan_schedule(
-                clone_with_updates(
-                    schedule, {"last_scan": int(time()), "last_scan_success": success}
+            if result.removal_failures:
+                logger.error(
+                    "Navidrome playlist export could not remove %d superseded "
+                    "playlist file(s); they remain visible in Navidrome and will "
+                    "be retried: %s",
+                    result.removal_failures,
+                    result.message,
                 )
-            )
-            logger.info("Auto-scan finished (success=%s)", success)
+            elif not result.success:
+                logger.warning("Navidrome playlist export: %s", result.message)
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.error("Auto-scan task failed: %s", e, exc_info=True)
-            await asyncio.sleep(60)
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
+            logger.error("Navidrome playlist export task failed: %s", e, exc_info=True)
 
 
-def start_library_auto_scan_task(
-    scanner: "LibraryScanner",
-    scan_state: "ScanStateStore",
-    preferences_service: PreferencesService,
-) -> asyncio.Task:
+def start_navidrome_playlist_export_task(interval: int = 300) -> asyncio.Task:
     task = asyncio.create_task(
-        auto_scan_library_periodically(scanner, scan_state, preferences_service)
+        export_navidrome_playlists_periodically(interval=interval)
     )
-    TaskRegistry.get_instance().register("library-auto-scan", task)
-    return task
-
-
-def start_library_scan_resume_task(
-    scanner: "LibraryScanner",
-    library_paths: "list[Path]",
-) -> asyncio.Task:
-    """(AUD-3) Resume an interrupted native library scan on startup. Registered so
-    it is cancelled at shutdown like every other long-lived task."""
-
-    async def _resume() -> None:
-        try:
-            await scanner.startup_check(library_paths)
-        except Exception as e:  # noqa: BLE001
-            logger.error("Library scan resume failed: %s", e, exc_info=True)
-
-    task = asyncio.create_task(_resume())
-    TaskRegistry.get_instance().register("library-scan-resume", task)
-    task.add_done_callback(
-        lambda t: logger.error("Library scan resume task error: %s", t.exception())
-        if not t.cancelled() and t.exception()
-        else None
-    )
+    TaskRegistry.get_instance().register("navidrome-playlist-export", task)
     return task
 
 
@@ -306,7 +193,7 @@ def start_download_resume_task(orchestrator: "DownloadOrchestrator") -> asyncio.
     async def _resume() -> None:
         try:
             await orchestrator.startup_resume()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - startup resume must not block the download loop
             logger.error("Download resume failed: %s", e, exc_info=True)
 
     task = asyncio.create_task(_resume())
@@ -355,6 +242,52 @@ def start_acquisition_cleanup_task(get_cleanup_service) -> asyncio.Task:
     return task
 
 
+_ACQUISITION_ORPHAN_RECONCILE_INTERVAL = 3600.0
+_ACQUISITION_ORPHAN_RECONCILE_INITIAL_DELAY = 600.0
+
+
+async def run_acquisition_orphan_reconcile_periodically(
+    get_cleanup_service,
+    interval: float = _ACQUISITION_ORPHAN_RECONCILE_INTERVAL,
+    delay: float = _ACQUISITION_ORPHAN_RECONCILE_INITIAL_DELAY,
+) -> None:
+    """Close the pre-journal crash gap (#131): sweep complete-dir folders named for
+    DroppedNeedle jobs that no attempt journal owns. Sleep-first so startup
+    recovery journals legacy workspaces before the first destructive pass."""
+    await asyncio.sleep(delay)
+    while True:
+        try:
+            service = get_cleanup_service()
+            removed = await service.reconcile_orphan_folders()
+            if removed:
+                logger.info(
+                    "Acquisition orphan reconcile removed %d folder(s)", removed
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable worker survives one failed sweep
+            logger.exception("Acquisition orphan reconcile sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_acquisition_orphan_reconcile_task(get_cleanup_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        run_acquisition_orphan_reconcile_periodically(get_cleanup_service)
+    )
+    TaskRegistry.get_instance().register("acquisition-orphan-reconcile", task)
+    task.add_done_callback(
+        lambda value: logger.error(
+            "Acquisition orphan reconcile task error: %s", value.exception()
+        )
+        if not value.cancelled() and value.exception()
+        else None
+    )
+    return task
+
+
 async def warm_library_cache(
     library_service: LibraryService,
     album_service: "AlbumService",
@@ -391,7 +324,7 @@ async def warm_library_cache(
                     if i % 5 == 0:
                         await asyncio.sleep(1)
 
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 - failing item must not kill the warming loop
                     logger.error(
                         "Library cache warm item failed album=%s mbid=%s error=%s",
                         album_data.get("title"),
@@ -401,7 +334,7 @@ async def warm_library_cache(
                     )
                     continue
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
         logger.error("Library cache warming failed: %s", e, exc_info=True)
 
 
@@ -409,7 +342,7 @@ async def warm_jellyfin_mbid_index(jellyfin_repo: "JellyfinRepository") -> None:
     await asyncio.sleep(8)
     try:
         await jellyfin_repo.build_mbid_index()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
         logger.error("Jellyfin MBID index warming failed: %s", e, exc_info=True)
 
 
@@ -426,7 +359,7 @@ async def warm_navidrome_mbid_cache(service_getter=None) -> None:
             await service.warm_mbid_cache()
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Navidrome MBID cache warming failed: %s", e, exc_info=True)
         try:
             await asyncio.sleep(14400)
@@ -448,7 +381,7 @@ async def warm_plex_mbid_cache(service_getter=None) -> None:
             await service.persist_if_dirty()
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Plex MBID cache warming failed: %s", e, exc_info=True)
         try:
             await asyncio.sleep(14400)
@@ -456,287 +389,38 @@ async def warm_plex_mbid_cache(service_getter=None) -> None:
             break
 
 
-async def warm_artist_discovery_cache_periodically(
-    artist_discovery_service_getter,
-    library_db: "LibraryDB",
-    interval: int = 14400,
-    delay: float = 0.5,
-    workload_gate: "BackgroundWorkloadGate | None" = None,
-) -> None:
-    await asyncio.sleep(
-        300
-    )  # Allow initial library sync to complete before warming caches
-
-    while True:
-        try:
-            artist_cursor = ""
-            while True:
-                if workload_gate is not None:
-                    await workload_gate.wait_until_available()
-                page = await library_db.get_artist_mbid_page(
-                    after_mbid=artist_cursor, limit=500
-                )
-                if not page:
-                    break
-
-                artist_cursor = page[-1]
-                mbids = [mbid for mbid in page if is_valid_mbid(mbid)]
-                for mbid in mbids:
-                    if workload_gate is not None:
-                        await workload_gate.run_warmer_unit(
-                            lambda mbid=mbid: artist_discovery_service_getter().precache_artist_discovery(
-                                [mbid], delay=delay
-                            )
-                        )
-                    else:
-                        await (
-                            artist_discovery_service_getter().precache_artist_discovery(
-                                [mbid], delay=delay
-                            )
-                        )
-
-                if len(page) < 500:
-                    break
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error("Artist discovery cache warming failed: %s", e, exc_info=True)
-
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            break
 
 
-def start_artist_discovery_cache_warming_task(
-    artist_discovery_service_getter,
-    library_db: "LibraryDB",
-    interval: int = 14400,
-    delay: float = 0.5,
-    workload_gate: "BackgroundWorkloadGate | None" = None,
-) -> asyncio.Task:
-    task = asyncio.create_task(
-        warm_artist_discovery_cache_periodically(
-            artist_discovery_service_getter,
-            library_db,
-            interval=interval,
-            delay=delay,
-            workload_gate=workload_gate,
-        )
-    )
-    TaskRegistry.get_instance().register("artist-discovery-warming", task)
-    return task
+DISCOVER_WARMER_STARTUP_DELAY = 5
+DISCOVER_WARMER_INTERVAL = 90
 
 
-# Proactive per-user Discover/Home warmer.
-# Keeps each user's Discover/Home caches warm and CONVERGED through the
-# day, not just while they're looking at the page. During the ListenBrainz-popularity outage
-# personalisation is reconstructed from Last.fm via MusicBrainz at a hard 1 req/s, which an
-# on-visit build can't finish; a background prewarm (uncancellable) drains those resolutions
-# and banks them to mbid_store so the following normal-budget build finds them cached. One
-# loop, ONE user at a time (the single global MB 1/s queue makes concurrency pointless), and
-# it yields whenever a user is actively browsing.
-DISCOVER_WARMER_STARTUP_DELAY = 5  # after core startup, before a normal first visit
-DISCOVER_WARMER_INTERVAL = 90  # floor between per-user warm ticks
-DISCOVER_WARMER_ENUM_TTL = 600  # re-enumerate eligible users at most this often
-DISCOVER_WARMER_REFRESH_INTERVAL = 6 * 3600  # re-warm a converged user this often
-DISCOVER_WARMER_PERSONALIZING_RETRY = 600  # re-warm a still-converging user this often
-DISCOVER_WARMER_MAX_ATTEMPTS = 4  # stop fast-retrying a user that won't converge
-DISCOVER_WARMER_HARD_CAP = 300  # per-user wall-clock ceiling vs a wedged build
-
-
-async def _enumerate_warmer_users(auth_store) -> list[str]:
-    eligible: list[str] = []
-    offset = 0
-    while True:
-        users = await auth_store.list_users(limit=100, offset=offset)
-        if not users:
-            break
-        eligible.extend(u.id for u in users)
-        if len(users) < 100:
-            break
-        offset += 100
-    return eligible
-
-
-async def _pick_due_warmer_user(
-    eligible: list[str], last_warmed: dict, attempts: dict, now: float, discover
-) -> Optional[str]:
-    """The neediest not-currently-building user: never-warmed > still-personalising > stale.
-    Skips any user whose live on-visit build is already registered (they own it)."""
-    registry = TaskRegistry.get_instance()
-    stale_fallback: Optional[str] = None
-    for uid in eligible:
-        if registry.is_running(f"discover-homepage-warm-{uid}"):
-            continue
-        last = last_warmed.get(uid)
-        if last is None:
-            return uid  # never warmed - highest priority
-        age = now - last
-        if age < DISCOVER_WARMER_PERSONALIZING_RETRY:
-            continue  # warmed very recently - not due yet, skip the freshness probe
-        has_cache, still_converging = await discover.peek_freshness(uid)
-        # A warmed user with NO cached response means the last build was cut at the hard cap
-        # (a heavy user mid-outage) - keep them in the fast-retry tier, not the 6h one.
-        if (not has_cache or still_converging) and attempts.get(
-            uid, 0
-        ) < DISCOVER_WARMER_MAX_ATTEMPTS:
-            return uid  # still converging - retry soon
-        if stale_fallback is None and age > DISCOVER_WARMER_REFRESH_INTERVAL:
-            stale_fallback = uid
-    return stale_fallback
-
-
-async def _run_registered_warmer_build(name: str, coro) -> None:
-    """Run a warm build under the SAME registry name the on-visit SWR path uses, so the
-    process-global registry is the cross-instance mutex (no double build after a settings-
-    save singleton rebuild). Bail if a live GET registered first; hard-cap a wedged build."""
-    registry = TaskRegistry.get_instance()
-    task = asyncio.create_task(coro)
-    try:
-        registry.register(name, task)
-    except RuntimeError:
-        task.cancel()  # a live on-visit build won the race - let it own it
-        return
-    try:
-        await asyncio.wait_for(task, timeout=DISCOVER_WARMER_HARD_CAP)
-    except asyncio.TimeoutError:
-        logger.warning("Discover warmer build '%s' exceeded hard cap", name)
-    except Exception as e:  # noqa: BLE001 - a build failure must not kill the loop
-        logger.debug("Discover warmer build '%s' failed: %s", name, e)
-
-
-async def _warm_one_user(
-    uid: str,
-    discover,
-    home,
-    last_warmed: dict,
-    attempts: dict,
-    queue_manager=None,
-    workload_gate: "BackgroundWorkloadGate | None" = None,
-) -> None:
-    registry = TaskRegistry.get_instance()
-    if registry.is_running(f"discover-homepage-warm-{uid}"):
-        return  # a live user's build owns it
-    logger.info("Discover warmer: warming %s", uid[:8])
-    # Thorough discover build (relaxed section budgets during the LB outage so the rate-limited
-    # MusicBrainz resolution actually completes and banks), registered under the SAME name the
-    # on-visit SWR path uses so the two never double-run; then home (reads the discover cache).
-    # _run_registered_warmer_build hard-caps it at DISCOVER_WARMER_HARD_CAP.
-    if workload_gate is not None:
-        await workload_gate.wait_until_available()
-    await _run_registered_warmer_build(
-        f"discover-homepage-warm-{uid}", discover.warm_cache_thorough(uid)
-    )
-    if workload_gate is not None:
-        await workload_gate.wait_until_available()
-    await _run_registered_warmer_build(f"home-warm-{uid}", home.warm_cache(uid))
-    if queue_manager is not None:
-        if workload_gate is not None:
-            await workload_gate.wait_until_available()
-        await queue_manager.start_build(uid)
-        try:
-            await asyncio.wait_for(
-                queue_manager.wait_for_build(uid), timeout=DISCOVER_WARMER_HARD_CAP
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Discover queue warmer for %s exceeded hard cap", uid[:8])
-    last_warmed[uid] = monotonic()
-    has_cache, still_converging = await discover.peek_freshness(uid)
-    # converged only when a real response is cached AND it isn't trending-only; a cut-at-cap
-    # build (no cache) counts as an attempt so MAX_ATTEMPTS still bounds a hopeless user.
-    converged = has_cache and not still_converging
-    attempts[uid] = 0 if converged else attempts.get(uid, 0) + 1
-    logger.info("Discover warmer: %s warmed (converged=%s)", uid[:8], converged)
 
 
 async def warm_discover_home_periodically(
-    get_discover_service,
-    get_home_service,
-    get_auth_store,
-    get_queue_manager=None,
     interval: int = DISCOVER_WARMER_INTERVAL,
     workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> None:
-    from core.config import get_settings
+    from core.dependencies.service_providers import get_discovery_demand_service
 
-    logger.info(
-        "Discover/Home warmer starting (delay %ss)", DISCOVER_WARMER_STARTUP_DELAY
-    )
     await asyncio.sleep(DISCOVER_WARMER_STARTUP_DELAY)
-
-    eligible: list[str] = []
-    enumerated_at = 0.0
-    last_warmed: dict[str, float] = {}
-    attempts: dict[str, int] = {}
-
     while True:
         try:
             if workload_gate is not None:
                 await workload_gate.wait_until_available()
-            if not get_settings().discover_warmer_enabled:
-                await asyncio.sleep(interval)
-                continue
-            now = monotonic()
-            if not eligible or (now - enumerated_at) > DISCOVER_WARMER_ENUM_TTL:
-                eligible = await _enumerate_warmer_users(get_auth_store())
-                enumerated_at = now
-                logger.info(
-                    "Discover warmer: %d user(s) eligible",
-                    len(eligible),
-                )
-            # We do NOT hard-skip when a user is "active" - the MusicBrainz priority queue
-            # already yields background resolution to live USER_INITIATED requests, and the
-            # per-user is_running check below avoids fighting a live build. A loop-level skip
-            # here just stalled convergence for the very user watching the page.
-            if eligible:
-                uid = await _pick_due_warmer_user(
-                    eligible, last_warmed, attempts, now, get_discover_service()
-                )
-                if uid is not None:
-                    if workload_gate is not None:
-                        await workload_gate.run_warmer_unit(
-                            lambda: _warm_one_user(
-                                uid,
-                                get_discover_service(),
-                                get_home_service(),
-                                last_warmed,
-                                attempts,
-                                get_queue_manager() if get_queue_manager else None,
-                                workload_gate,
-                            )
-                        )
-                    else:
-                        await _warm_one_user(
-                            uid,
-                            get_discover_service(),
-                            get_home_service(),
-                            last_warmed,
-                            attempts,
-                            get_queue_manager() if get_queue_manager else None,
-                            workload_gate,
-                        )
+            await get_discovery_demand_service().run_due_tick()
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.error("Discover/Home warmer failed: %s", e, exc_info=True)
-
+        except Exception:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
+            logger.exception("Discovery demand scheduler failed")
         await asyncio.sleep(interval)
 
 
 def start_discover_home_warmer_task(
-    get_discover_service,
-    get_home_service,
-    get_auth_store,
-    get_queue_manager=None,
     workload_gate: "BackgroundWorkloadGate | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         warm_discover_home_periodically(
-            get_discover_service,
-            get_home_service,
-            get_auth_store,
-            get_queue_manager,
             workload_gate=workload_gate,
         )
     )
@@ -781,7 +465,7 @@ async def warm_audiodb_cache_periodically(
             )
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("AudioDB sweep cycle failed: %s", e, exc_info=True)
         try:
             await asyncio.sleep(_AUDIODB_SWEEP_INTERVAL)
@@ -900,7 +584,7 @@ async def _run_audiodb_sweep_cycle(
                         bytes_ok += 1
                     else:
                         bytes_fail += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - failing item must not kill the sweep loop
             logger.error(
                 "audiodb.sweep action=item_error entity_type=%s mbid=%s error=%s",
                 entity_type,
@@ -962,7 +646,7 @@ async def sync_request_statuses_periodically(
             await requests_page_service.sync_request_statuses()
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Periodic request status sync failed: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
@@ -997,7 +681,7 @@ async def reap_stale_downloads_periodically(
             await get_orchestrator().reap_stale_tasks()
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Download watchdog sweep failed: %s", e, exc_info=True)
         await asyncio.sleep(interval)
 
@@ -1025,7 +709,7 @@ async def auto_retry_failed_downloads_periodically(
             await get_orchestrator().retry_failed_tasks()
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Download auto-retry sweep failed: %s", e, exc_info=True)
         await asyncio.sleep(interval)
 
@@ -1067,6 +751,12 @@ def start_management_hold_auto_retry_task(get_download_service) -> asyncio.Task:
     return task
 
 
+def _jittered_sleep(base: float, jitter: float = 0.2) -> float:
+    """Tick duration with +/- jitter so same-second ticks across instances
+    desynchronize. Mean-preserving: uniform over base*(1-j)..base*(1+j)."""
+    return random.uniform(base * (1 - jitter), base * (1 + jitter))
+
+
 _WANTED_WATCHER_INTERVAL = 900
 _WANTED_WATCHER_INITIAL_DELAY = 240
 
@@ -1084,9 +774,9 @@ async def run_wanted_watcher_periodically(
             await get_wanted_watcher().run_sweep()
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Wanted watcher sweep failed: %s", e, exc_info=True)
-        await asyncio.sleep(interval)
+        await asyncio.sleep(_jittered_sleep(interval))
 
 
 def start_wanted_watcher_task(get_wanted_watcher) -> asyncio.Task:
@@ -1095,12 +785,15 @@ def start_wanted_watcher_task(get_wanted_watcher) -> asyncio.Task:
     return task
 
 
-_FOLLOW_POLL_INTERVAL = 86400  # 24h, hardcoded for v1 (L2)
+# D1 due-driven tick: provider work happens only for due artists (max 10/tick),
+# so the short interval sets service latency, not request rate; idle ticks are
+# one cheap due-list query.
+_FOLLOW_POLL_INTERVAL = 60
 _FOLLOW_POLL_INITIAL_DELAY = 300
 
 
 async def poll_followed_artists_new_releases(
-    new_release_service: "NewReleaseService",
+    get_new_release_service,
     interval: int = _FOLLOW_POLL_INTERVAL,
 ) -> None:
     """Detect new releases for followed artists and auto-enqueue for approved
@@ -1110,19 +803,19 @@ async def poll_followed_artists_new_releases(
 
     while True:
         try:
-            await new_release_service.run_poll()
+            await get_new_release_service().run_poll()
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Follow new-release poll failed: %s", e, exc_info=True)
 
-        await asyncio.sleep(interval)
+        await asyncio.sleep(_jittered_sleep(interval))
 
 
 def start_poll_new_releases_task(
-    new_release_service: "NewReleaseService",
+    get_new_release_service,
 ) -> asyncio.Task:
-    task = asyncio.create_task(poll_followed_artists_new_releases(new_release_service))
+    task = asyncio.create_task(poll_followed_artists_new_releases(get_new_release_service))
     TaskRegistry.get_instance().register("follow-new-release-poll", task)
     return task
 
@@ -1176,7 +869,7 @@ async def run_events_watcher_periodically(get_events_watcher, get_poll_time) -> 
                 last_sweep = now
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Events watcher sweep failed: %s", e, exc_info=True)
             last_sweep = datetime.now()  # a failing sweep still waits for the next slot
         await asyncio.sleep(_EVENTS_SCHEDULER_TICK)
@@ -1234,7 +927,7 @@ async def refresh_personal_mixes_periodically(
             await personal_mix_service.run_for_all_users()
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Personal mix refresh failed: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
@@ -1275,7 +968,7 @@ async def demote_orphaned_covers_periodically(
             await asyncio.to_thread(cover_disk_cache.demote_orphaned, valid_hashes)
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Orphan cover demotion failed: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
@@ -1303,6 +996,7 @@ async def prune_stores_periodically(
     ignored_retention_days: int = 365,
     interval: int = 21600,
     wanted_store: "WantedStore | None" = None,
+    native_store: "NativeLibraryStore | None" = None,
 ) -> None:
     await asyncio.sleep(600)
     while True:
@@ -1314,9 +1008,16 @@ async def prune_stores_periodically(
                 # terminal (stopped/fulfilled) watches age out on the same window
                 # as requests; orphaned seen-candidate rows go with them (§5.1)
                 await wanted_store.prune(request_retention_days)
+            if native_store is not None:
+                # F-PERF-04: bounded 30-day retention for terminal automatic
+                # identification jobs (signed LibraryAudit decision); one batch
+                # per pass, continuation handled by the next interval.
+                await native_store.prune_old_terminal_identification_jobs(
+                    now=time()
+                )
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Store prune task failed: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
@@ -1330,6 +1031,7 @@ def start_store_prune_task(
     ignored_retention_days: int = 365,
     interval: int = 21600,
     wanted_store: "WantedStore | None" = None,
+    native_store: "NativeLibraryStore | None" = None,
 ) -> asyncio.Task:
     task = asyncio.create_task(
         prune_stores_periodically(
@@ -1340,6 +1042,7 @@ def start_store_prune_task(
             ignored_retention_days=ignored_retention_days,
             interval=interval,
             wanted_store=wanted_store,
+            native_store=native_store,
         )
     )
     TaskRegistry.get_instance().register("store-prune", task)
@@ -1372,7 +1075,7 @@ async def prune_recycle_bin_periodically(
                         logger.info("Recycle bin prune removed %d entries", removed)
         except asyncio.CancelledError:
             break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Recycle bin prune failed: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
@@ -1410,14 +1113,23 @@ async def run_background_upgrade_sweep(
     for item in items:
         if enqueued >= policy.background_upgrade_max_per_run:
             break
-        task_id = await download_service.request_upgrade_album(
-            user_id=owner.id,
-            release_group_mbid=item["release_group_mbid"],
-            artist_name=item.get("artist_name") or "Unknown",
-            album_title=item.get("album_title") or "Unknown",
-            year=item.get("year"),
-            artist_mbid=item.get("artist_mbid"),
-        )
+        try:
+            task_id = await download_service.request_upgrade_album(
+                user_id=owner.id,
+                release_group_mbid=item["release_group_mbid"],
+                artist_name=item.get("artist_name") or "Unknown",
+                album_title=item.get("album_title") or "Unknown",
+                year=item.get("year"),
+                artist_mbid=item.get("artist_mbid"),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - F-13 poison item must not starve sweep siblings
+            logger.exception(
+                "Background upgrade sweep item failed rg=%s",
+                item.get("release_group_mbid"),
+            )
+            continue
         if task_id != "already_in_library":
             enqueued += 1
     if enqueued:
@@ -1445,7 +1157,7 @@ async def scan_for_upgrades_periodically(
                 )
         except asyncio.CancelledError:
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - loop-cycle boundary logs and continues per the loop contract
             logger.error("Background upgrade sweep failed: %s", e, exc_info=True)
         await asyncio.sleep(interval_hours * 3600)
 

@@ -17,6 +17,7 @@ from api.v1.schemas.library_operations import (
 from core.exceptions import ResourceNotFoundError, ValidationError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.identification_revisions import album_input_revisions
+from services.native.library_review_service import TIER_STATE
 
 LEASE_SECONDS = 60.0
 AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
@@ -214,6 +215,9 @@ class LibraryOperationService:
                 result["state"] == "succeeded"
                 and str(work["action"]).startswith("accept_candidate:")
                 and work["local_album_id"] is not None
+                # Tier-row accepts are catalog-only (the confirm lane
+                # promises files never change there), like single accepts.
+                and result.get("prior_state") != TIER_STATE
             ):
                 await self._schedule_scan_management(str(work["local_album_id"]))
             if checkpoint is not None:
@@ -243,6 +247,29 @@ class LibraryOperationService:
         timestamp = time.time() if now is None else now
         return await self._store.claim_operation_job(
             worker_id, now=timestamp, lease_seconds=LEASE_SECONDS
+        )
+
+    @staticmethod
+    def response_for(
+        row: dict,
+        *,
+        results: list[OperationWorkResult] | None = None,
+        results_truncated: bool = False,
+        repair_summary: RepairReportSummary | None = None,
+        reidentification_candidates: list[ReviewCandidateDetail] | None = None,
+        selected_reidentification_candidate_key: str | None = None,
+    ) -> OperationResponse:
+        """Public response builder (F-111); cross-module callers use this."""
+
+        return LibraryOperationService._response(
+            row,
+            results=results,
+            results_truncated=results_truncated,
+            repair_summary=repair_summary,
+            reidentification_candidates=reidentification_candidates,
+            selected_reidentification_candidate_key=(
+                selected_reidentification_candidate_key
+            ),
         )
 
     @staticmethod

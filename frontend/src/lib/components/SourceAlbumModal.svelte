@@ -2,7 +2,7 @@
 	import { Shuffle, Play, X, ListPlus, ListStart, ListMusic, Info, Download } from 'lucide-svelte';
 	import { goto } from '$app/navigation';
 	import { API } from '$lib/constants';
-	import { downloadFile } from '$lib/utils/downloadHelper';
+	import { downloadAlbumArchive, downloadTrackFile } from '$lib/utils/downloadActions';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { launchJellyfinPlayback } from '$lib/player/launchJellyfinPlayback';
 	import { launchLocalPlayback } from '$lib/player/launchLocalPlayback';
@@ -27,6 +27,7 @@
 	} from '$lib/player/queueHelpers';
 	import type { QueueItem } from '$lib/player/types';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { api } from '$lib/api/client';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
@@ -51,11 +52,7 @@
 		open: boolean;
 		sourceType: SourceType;
 		album:
-			| JellyfinAlbumSummary
-			| LocalAlbumSummary
-			| NavidromeAlbumSummary
-			| PlexAlbumSummary
-			| null;
+			JellyfinAlbumSummary | LocalAlbumSummary | NavidromeAlbumSummary | PlexAlbumSummary | null;
 		onclose: () => void;
 	}
 
@@ -94,6 +91,11 @@
 				: sourceType === 'plex'
 					? plexTracks.length
 					: localTracks.length
+	);
+	// Album-level viewer permission gates both the bulk and per-track Download
+	// items (mirrors the album-page menus); fail-open on a missing bit.
+	let localDownloadAllowed = $derived(
+		sourceType !== 'local' || (album as LocalAlbumSummary | null)?.download_allowed !== false
 	);
 
 	function getAlbumCoverUrl(): string {
@@ -201,10 +203,10 @@
 		if (mbid) {
 			const target = mbid;
 			handleClose();
-			goto(`/album/${target}`);
+			goto(withBasePath(`/album/${target}`));
 		} else if (albumName) {
 			handleClose();
-			goto(`/search?q=${encodeURIComponent(albumName)}`);
+			goto(withBasePath(`/search?q=${encodeURIComponent(albumName)}`));
 		}
 	}
 
@@ -212,7 +214,7 @@
 		if (!canNavigateArtist || !artistMbid) return;
 		const target = artistMbid;
 		handleClose();
-		goto(`/artist/${target}`);
+		goto(withBasePath(`/artist/${target}`));
 	}
 
 	async function launchInstantMix() {
@@ -434,11 +436,14 @@
 		];
 		if (sourceType === 'local' && album) {
 			const localAlbum = album as import('$lib/types').LocalAlbumSummary;
-			items.push({
-				label: 'Download Album',
-				icon: Download,
-				onclick: () => downloadFile(API.download.localAlbumByMbid(localAlbum.musicbrainz_id))
-			});
+			if (localAlbum.download_allowed !== false) {
+				items.push({
+					label: 'Download Album',
+					icon: Download,
+					onclick: () =>
+						void downloadAlbumArchive(API.download.localAlbumByMbid(localAlbum.musicbrainz_id))
+				});
+			}
 		}
 		return items;
 	}
@@ -470,13 +475,14 @@
 				disabled: !hasQueueItem
 			}
 		];
-		if (sourceType === 'local') {
+		if (sourceType === 'local' && localDownloadAllowed) {
 			const track = localTracks[index];
 			if (track) {
 				items.push({
 					label: 'Download',
 					icon: Download,
-					onclick: () => downloadFile(API.download.localTrack(track.track_file_id))
+					onclick: () =>
+						void downloadTrackFile(API.download.localTrack(track.track_file_id), track.title)
 				});
 			}
 		}

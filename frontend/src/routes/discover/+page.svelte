@@ -21,6 +21,7 @@
 	import LiveUpdatingBadge from '$lib/components/LiveUpdatingBadge.svelte';
 	import { api } from '$lib/api/client';
 	import { isDismissed } from '$lib/utils/dismissedPrompts';
+	import { withBasePath } from '$lib/utils/basePath';
 	import {
 		Compass,
 		CircleAlert,
@@ -31,7 +32,7 @@
 		Library,
 		TrendingUp,
 		LayoutGrid,
-		Wand2,
+		WandSparkles,
 		Heart,
 		SlidersHorizontal
 	} from 'lucide-svelte';
@@ -44,6 +45,9 @@
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { invalidateQueriesWithPersister } from '$lib/queries/QueryClient';
 	import { API } from '$lib/constants';
+	import { useDiscoverActivity } from '$lib/queries/discover/DiscoverDemand.svelte';
+
+	useDiscoverActivity(() => ({ feature: 'discover' }));
 
 	let playlistDiscoverOpen = $state(false);
 
@@ -259,7 +263,7 @@
 					<DiscoverZoneNav {zones}>
 						{#snippet action()}
 							<a
-								href="/settings?tab=discover"
+								href={withBasePath('/settings?tab=discover')}
 								class="btn btn-ghost btn-xs gap-1.5 text-base-content/60 hover:text-primary"
 								title="Choose which sections appear here"
 							>
@@ -321,7 +325,7 @@
 											<div
 												class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary/15 shadow-[0_0_16px_oklch(from_var(--color-primary)_l_c_h_/_0.15)]"
 											>
-												<Wand2 class="h-5 w-5 text-primary" />
+												<WandSparkles class="h-5 w-5 text-primary" />
 											</div>
 											<div class="flex-1 min-w-0">
 												<h3 class="font-bold text-sm sm:text-base">Discover for a Playlist</h3>
@@ -536,7 +540,7 @@
 									Connect a music service to get recommendations. The more you connect, the better
 									they get.
 								</p>
-								<a href="/settings" class="btn btn-primary">Connect Services</a>
+								<a href={withBasePath('/settings')} class="btn btn-primary">Connect Services</a>
 							</div>
 						{:else if !hasContent && degradedSources.length > 0}
 							<div class="flex flex-col items-center justify-center py-12 sm:py-16">
@@ -571,7 +575,7 @@
 								<p class="mb-6 max-w-md px-4 text-center text-sm text-base-content/70 sm:text-base">
 									Turn some discovery sections back on to fill this page.
 								</p>
-								<a href="/settings?tab=discover" class="btn btn-primary gap-2">
+								<a href={withBasePath('/settings?tab=discover')} class="btn btn-primary gap-2">
 									<SlidersHorizontal class="h-4 w-4" />
 									Customise Sections
 								</a>

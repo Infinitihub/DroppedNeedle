@@ -11,7 +11,6 @@ MB_ALBUM_SEARCH_PREFIX = "mb:album:search:"
 MB_RG_DETAIL_PREFIX = "mb:rg:detail:"
 MB_RELEASE_DETAIL_PREFIX = "mb:release:detail:"
 MB_RELEASE_TO_RG_PREFIX = "mb:release_to_rg:"
-MB_RELEASE_REC_PREFIX = "mb:release_rec_positions:"
 MB_RECORDING_PREFIX = "mb:recording:"
 MB_RECORDING_SEARCH_PREFIX = "mb:recording:search:"
 MB_RECORDING_TO_RG_PREFIX = "mb:recording_to_rg:"
@@ -24,6 +23,8 @@ MB_RELEASE_VERIFY_PREFIX = "mb:release:verify:"
 MB_DUPLICATE_SEARCH_PREFIX = "mb:release:duplicate-search:"
 MB_RELEASE_EDITION_SEARCH_PREFIX = "mb:release:edition-search:"
 MB_MANAGEMENT_RELEASE_PREFIX = "mb:management:release:"
+MB_REDIRECT_PREFIX = "mb:redirect:"
+MB_ISRC_PREFIX = "mb:isrc:"
 CAA_MANAGEMENT_PREFIX = "caa:management:"
 
 LB_PREFIX = "lb_"
@@ -71,6 +72,8 @@ ALBUM_INFO_PREFIX = "album_info:"
 ALBUM_TRACKS_INFO_PREFIX = "album_tracks_info:"
 
 ARTIST_DISCOVERY_PREFIX = "artist_discovery:"
+ARTIST_DISCOVERY_TOP_SONGS_PREFIX = f"{ARTIST_DISCOVERY_PREFIX}top_songs:"
+ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX = f"{ARTIST_DISCOVERY_PREFIX}top_albums:"
 DISCOVER_QUEUE_ENRICH_PREFIX = "discover_queue_enrich:"
 
 ARTIST_WIKIDATA_PREFIX = "artist_wikidata:"
@@ -91,17 +94,23 @@ GETIT_OPTIONS_PREFIX = "getit:v2:options:"
 GETIT_ARTIST_OPTIONS_PREFIX = "getit:v2:artist_options:"
 
 
+def _mbid_key(value: str) -> str:
+    """Canonicalize a MusicBrainz entity ID for cache identity only."""
+    return str(value).strip().casefold()
+
+
 def library_policy_prefixes() -> list[str]:
     return [LIBRARY_POLICY_TREE_PREFIX, LIBRARY_POLICY_IMPACT_PREFIX]
 
 
 def library_identification_prefixes() -> list[str]:
+    # ST1 note: LIBRARY_ARTIST_IMAGE_PREFIX / LIBRARY_ALBUM_IMAGE_PREFIX were
+    # removed - repo-wide grep found zero writers (only sweeps), so sweeping
+    # them was dead weight. Restore alongside a real writer if one appears.
     return [
         LIBRARY_PREFIX,
-        LIBRARY_ARTIST_IMAGE_PREFIX,
         LIBRARY_ARTIST_DETAILS_PREFIX,
         LIBRARY_ARTIST_ALBUMS_PREFIX,
-        LIBRARY_ALBUM_IMAGE_PREFIX,
         LIBRARY_ALBUM_DETAILS_PREFIX,
         LIBRARY_ALBUM_TRACKS_PREFIX,
         LIBRARY_TRACKFILE_PREFIX,
@@ -126,6 +135,34 @@ def library_identification_prefixes() -> list[str]:
     ]
 
 
+def catalog_entity_prefixes() -> list[str]:
+    """ST1: the slice of library_identification_prefixes() whose keys are
+    shaped ``{prefix}{mbid}`` and therefore deletable per entity. Shape
+    verified against every remaining delete/write site (e.g.
+    album_service refresh_album, service_providers import hook); MBID values
+    never contain ':', so the concatenation is unambiguous."""
+    return [
+        ARTIST_INFO_PREFIX,
+        ALBUM_INFO_PREFIX,
+        ALBUM_TRACKS_INFO_PREFIX,
+        LIBRARY_ARTIST_DETAILS_PREFIX,
+        LIBRARY_ARTIST_ALBUMS_PREFIX,
+        LIBRARY_ALBUM_DETAILS_PREFIX,
+    ]
+
+
+def catalog_list_prefixes() -> list[str]:
+    """ST1 complement: cheap locally-rebuilt snapshots plus the legacy
+    LIBRARY_ALBUM_TRACKS/trackfile prefixes (kept bulk because their writers
+    could not be confirmed to use bare ``{id}`` key shapes - see grep notes in
+    the ST1 ledger entry). Partition of library_identification_prefixes()
+    once the two dead image prefixes are excluded."""
+    entity = set(catalog_entity_prefixes())
+    return [
+        prefix for prefix in library_identification_prefixes() if prefix not in entity
+    ]
+
+
 def getit_prefixes() -> list[str]:
     """ "Get it" purchase-option keys; swept when Get-it settings change."""
     return [GETIT_OPTIONS_PREFIX, GETIT_ARTIST_OPTIONS_PREFIX]
@@ -140,7 +177,7 @@ def getit_artist_options_key(artist_mbid: str) -> str:
 
 
 def musicbrainz_prefixes() -> list[str]:
-    """All MusicBrainz cache key prefixes for bulk invalidation."""
+    """MusicBrainz source-dependent cache prefixes for bulk invalidation."""
     return [
         MB_ARTIST_SEARCH_PREFIX,
         MB_ARTIST_DETAIL_PREFIX,
@@ -148,7 +185,6 @@ def musicbrainz_prefixes() -> list[str]:
         MB_RG_DETAIL_PREFIX,
         MB_RELEASE_DETAIL_PREFIX,
         MB_RELEASE_TO_RG_PREFIX,
-        MB_RELEASE_REC_PREFIX,
         MB_RECORDING_PREFIX,
         MB_RECORDING_SEARCH_PREFIX,
         MB_RECORDING_TO_RG_PREFIX,
@@ -161,7 +197,18 @@ def musicbrainz_prefixes() -> list[str]:
         MB_DUPLICATE_SEARCH_PREFIX,
         MB_RELEASE_EDITION_SEARCH_PREFIX,
         MB_MANAGEMENT_RELEASE_PREFIX,
+        MB_REDIRECT_PREFIX,
+        MB_ISRC_PREFIX,
+        # Provider-bearing composite responses must cold-clear with the
+        # endpoint-specific MusicBrainz entries on a source change.
+        ARTIST_INFO_PREFIX,
+        HOME_RESPONSE_PREFIX,
+        DISCOVER_RESPONSE_PREFIX,
+        ALBUM_INFO_PREFIX,
         ALBUM_TRACKS_INFO_PREFIX,
+        DISCOVER_QUEUE_ENRICH_PREFIX,
+        ARTIST_DISCOVERY_TOP_SONGS_PREFIX,
+        ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX,
     ]
 
 
@@ -176,7 +223,7 @@ def mb_release_edition_search_key(
 
 
 def mb_recording_canonical_id_key(recording_mbid: str) -> str:
-    return f"{MB_RECORDING_PREFIX}{recording_mbid.casefold()}:canonical-id"
+    return f"{MB_RECORDING_PREFIX}{_mbid_key(recording_mbid)}:canonical-id"
 
 
 def listenbrainz_prefixes() -> list[str]:
@@ -286,22 +333,68 @@ def mb_album_search_key(
     return f"{MB_ALBUM_SEARCH_PREFIX}{query}:{limit}:{offset}:{types_str}:{primary_str}"
 
 
-def mb_artist_detail_key(mbid: str) -> str:
-    return f"{MB_ARTIST_DETAIL_PREFIX}{mbid}"
+def mb_artist_detail_key(
+    mbid: str, *, include_releases: bool = True,
+    release_group_limit: int = 50, profile: str | None = None,
+) -> str:
+    selected_profile = profile or ("full" if include_releases else "basic")
+    limit = max(int(release_group_limit), 1) if selected_profile == "full" else 0
+    return f"{MB_ARTIST_DETAIL_PREFIX}{_mbid_key(mbid)}:{selected_profile}:{limit}"
 
 
 def mb_artist_release_groups_key(artist_mbid: str) -> str:
-    return f"{MB_ARTIST_RGS_PREFIX}{artist_mbid.casefold()}"
+    return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}"
+
+
+def mb_artist_rgs_browse_key(artist_mbid: str, limit: int) -> str:
+    """Key for the single-page artist->release-groups browse (QW1).
+
+    Extends MB_ARTIST_RGS_PREFIX, so it is swept by musicbrainz_prefixes()
+    consumers without any new prefix-list membership. Collision-safe: the
+    sibling builder above stores bare casefolded MBIDs and MBIDs never
+    contain ':', so the ':browse:' segment cannot collide.
+    """
+    return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}:browse:{limit}"
+
+
+def mb_artist_rgs_page_key(artist_mbid: str, limit: int, offset: int) -> str:
+    """Key for one artist->release-groups browse page.
+
+    Shape: ``mb:artist_rgs:{mbid}:page:{limit}:{offset}``. Extends
+    MB_ARTIST_RGS_PREFIX, so prefix sweeps cover it with no new list
+    membership. Collision-safe: the bare builder stores casefolded MBIDs
+    with no ':' segment, the QW1 builder uses ':browse:', and MBIDs never
+    contain ':', so ':page:' collides with neither shape.
+    """
+    return f"{MB_ARTIST_RGS_PREFIX}{_mbid_key(artist_mbid)}:page:{limit}:{offset}"
+
+
+def mb_redirect_key(kind: str, mbid: str) -> str:
+    """Key for a persisted MusicBrainz redirect mapping.
+
+    Shape: ``mb:redirect:{kind}:{mbid-casefolded}``. Callers pass the MBID
+    already lower-normalized.
+    """
+    return f"{MB_REDIRECT_PREFIX}{kind}:{mbid}"
+
+
+def mb_isrc_key(isrc: str) -> str:
+    """Key for a MusicBrainz ISRC lookup entry.
+
+    Shape: ``mb:isrc:{ISRC-upper}``. Callers pass the ISRC already
+    upper-normalized.
+    """
+    return f"{MB_ISRC_PREFIX}{isrc}"
 
 
 def mb_release_group_key(mbid: str, includes: Optional[list[str]] = None) -> str:
     includes_str = ",".join(sorted(includes)) if includes else "default"
-    return f"{MB_RG_DETAIL_PREFIX}{mbid}:{includes_str}"
+    return f"{MB_RG_DETAIL_PREFIX}{_mbid_key(mbid)}:{includes_str}"
 
 
 def mb_release_key(release_id: str, includes: Optional[list[str]] = None) -> str:
     includes_str = ",".join(sorted(includes)) if includes else "default"
-    return f"{MB_RELEASE_DETAIL_PREFIX}{release_id}:{includes_str}"
+    return f"{MB_RELEASE_DETAIL_PREFIX}{_mbid_key(release_id)}:{includes_str}"
 
 
 def mb_management_release_key(
@@ -314,7 +407,7 @@ def mb_management_release_key(
     locales_part = ",".join(locale.strip().casefold() for locale in preferred_locales)
     standardization_part = artist_standardization.strip().casefold()
     return (
-        f"{MB_MANAGEMENT_RELEASE_PREFIX}{release_id}:"
+        f"{MB_MANAGEMENT_RELEASE_PREFIX}{_mbid_key(release_id)}:"
         f"inc={includes_part}:locales={locales_part}:artists={standardization_part}"
     )
 

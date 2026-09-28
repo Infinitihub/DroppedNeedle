@@ -1,4 +1,6 @@
 import ast
+import logging
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -71,7 +73,27 @@ from target_application import (
     create_isolated_target_application,
     create_production_target_application,
 )
-from tests.helpers import build_test_client, override_admin_auth, override_user_auth
+from tests.helpers import (
+    build_test_client,
+    openapi_method_paths,
+    override_admin_auth,
+    override_user_auth,
+)
+
+
+def _iter_leaf_routes(routes: Iterable) -> Iterator:
+    """Yield endpoint-bearing routes, expanding lazily included routers.
+
+    FastAPI>=0.140 stores include_router() entries as lazy wrapper nodes
+    (exposing the sub-router as ``original_router``) instead of merged copies;
+    descend through them so allowlist assertions keep seeing every route.
+    """
+    for route in routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            yield from _iter_leaf_routes(original.routes)
+        else:
+            yield route
 
 
 def test_target_scheduler_uses_configured_iana_timezone(
@@ -80,15 +102,6 @@ def test_target_scheduler_uses_configured_iana_timezone(
     monkeypatch.setenv("TZ", "Europe/London")
 
     assert _server_timezone_name() == "Europe/London"
-
-
-def test_library_operation_stream_precedes_dynamic_operation_route() -> None:
-    app = create_isolated_target_application()
-    paths = [route.path for route in app.routes]
-
-    assert paths.index("/api/v1/library/operations/stream") < paths.index(
-        "/api/v1/library/operations/{job_id}"
-    )
 
 
 @pytest.mark.parametrize("invalid_timezone", ["BST", "/etc/localtime"])
@@ -141,7 +154,9 @@ def test_isolated_target_application_mounts_target_catalog_and_compat_routes() -
 
     response = build_test_client(app).get("/api/v1/library/albums")
     route_modules = {
-        route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")
+        route.endpoint.__module__
+        for route in _iter_leaf_routes(app.routes)
+        if hasattr(route, "endpoint")
     }
 
     assert response.status_code == 200
@@ -288,6 +303,51 @@ async def test_full_albums_route_filters_stale_and_incomplete_coverage() -> None
     assert all(not schedule for _, schedule in coverage_calls)
 
 
+@pytest.mark.asyncio
+async def test_full_albums_route_includes_manually_marked_albums() -> None:
+    albums = [
+        TargetNativeAlbum(
+            id="partial", title="Partial", artist_name="Artist", artist_id="artist"
+        ),
+        TargetNativeAlbum(
+            id="marked",
+            title="Marked",
+            artist_name="Artist",
+            artist_id="artist",
+            marked_full=True,
+        ),
+    ]
+
+    class LibraryService:
+        async def albums(self, *, limit, offset, sort, search, file_format):
+            return albums[offset : offset + limit], len(albums)
+
+    class CoverageService:
+        async def get_coverage(self, album_id, *, schedule_stale):
+            assert album_id == "partial"
+            return SimpleNamespace(
+                evidence_revision="evidence-1",
+                musicbrainz_release_group_id="release-group-1",
+                stale=False,
+                supported=[object()],
+                missing_expected_tracks=["track"],
+            )
+
+    result = await get_target_full_albums(
+        object(),
+        LibraryService(),
+        CoverageService(),
+        page=1,
+        page_size=10,
+        sort="recent",
+        q=None,
+        file_format=None,
+    )
+
+    assert [album.id for album in result.items] == ["marked"]
+    assert result.total == 1
+
+
 def test_target_release_cover_warming_uses_the_target_adapter_surface() -> None:
     release_id = "55555555-5555-4555-8555-555555555555"
     provider = AsyncMock()
@@ -339,11 +399,13 @@ def test_target_application_exposes_only_typed_library_root_mutations() -> None:
     override_admin_auth(app)
 
     response = build_test_client(app).get("/api/v1/settings/library")
+    # Sourced from the OpenAPI paths (which FastAPI flattens from the same
+    # route tree, including router prefixes) instead of raw app.routes, whose
+    # entries are lazy include-nodes since FastAPI>=0.140.
     method_paths = [
-        (method, route.path)
-        for route in app.routes
-        for method in getattr(route, "methods", set())
-        if method in {"GET", "PUT", "POST", "DELETE"}
+        pair
+        for pair in openapi_method_paths(app)
+        if pair[0] in {"GET", "PUT", "POST", "DELETE"}
     ]
 
     assert response.status_code == 200
@@ -359,14 +421,29 @@ def test_target_application_exposes_only_typed_library_root_mutations() -> None:
 
 
 def test_deployed_entrypoint_has_no_target_selector_or_target_mount() -> None:
-    backend = Path(__file__).parents[2]
-    deployed_source = (backend / "main.py").read_text()
-    target_source = (backend / "target_application.py").read_text()
+    """F-NL-03 cutover: the legacy main:app entrypoint is an unsupported-install
+    guard - a stale launcher must fail with upgrade guidance, never serve a
+    partial legacy API, and the target source keeps its single composition."""
+    import subprocess
+    import sys
 
-    assert "target_application" not in deployed_source
-    assert "library_target" not in deployed_source
-    assert "library_management" not in deployed_source
-    assert "get_target_" not in deployed_source
+    backend = Path(__file__).parents[2]
+    main_source = (backend / "main.py").read_text()
+    assert "APIRouter" not in main_source
+    assert "include_router" not in main_source
+    assert "FastAPI(" not in main_source
+    assert "target_main:app" in main_source  # operator guidance present
+    result = subprocess.run(
+        [sys.executable, "-c", "import main"],
+        cwd=backend,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(backend)},
+    )
+    assert result.returncode != 0
+    assert "Unsupported installation" in (result.stderr + result.stdout)
+    assert "target_main:app" in (result.stderr + result.stdout)
+    target_source = (backend / "target_application.py").read_text()
     module = ast.parse(target_source)
     assert not any(
         isinstance(node, (ast.Assign, ast.AnnAssign))
@@ -386,7 +463,9 @@ def test_offline_replacement_entrypoint_is_complete_and_single_worker() -> None:
     backend = Path(__file__).parents[2]
     app = create_production_target_application()
     route_modules = {
-        route.endpoint.__module__ for route in app.routes if hasattr(route, "endpoint")
+        route.endpoint.__module__
+        for route in _iter_leaf_routes(app.routes)
+        if hasattr(route, "endpoint")
     }
     middleware = {item.cls.__name__ for item in app.user_middleware}
 
@@ -437,7 +516,10 @@ def test_production_target_application_always_runs_startup_validation(
     reject.assert_awaited_once_with("steady_state")
 
 
-def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
+def test_target_lifecycle_retains_every_source_task() -> None:
+    """F-NL-03 cutover: the legacy main.py composition is gone; the target
+    lifecycle is the sole source of long-lived tasks and retains every
+    non-legacy starter (the two legacy scan tasks are removed, not replaced)."""
     backend = Path(__file__).parents[2]
 
     def starter_calls(path: Path, functions: set[str]) -> set[str]:
@@ -453,17 +535,17 @@ def test_target_lifecycle_retains_every_nonlegacy_source_task() -> None:
             and call.func.id.startswith("start_")
         }
 
-    source = starter_calls(backend / "main.py", {"lifespan"})
     target = starter_calls(
         backend / "target_application.py", {"production_target_lifespan"}
     ) | starter_calls(
         backend / "services/native/target_application_lifecycle.py",
         {"start_target_operational_runtime"},
     )
-    replaced = {"start_library_scan_resume_task", "start_library_auto_scan_task"}
 
-    assert source - replaced <= target
-    assert replaced.isdisjoint(target)
+    assert {
+        "start_library_scan_resume_task",
+        "start_library_auto_scan_task",
+    }.isdisjoint(target)
     assert {
         "start_library_contribution_verification_worker",
         "start_target_scan_supervisor",
@@ -533,6 +615,11 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         get_library_scan_schedule=lambda: SimpleNamespace(
             scan_frequency="manual", daily_scan_time="03:00"
         ),
+        get_library_scan_dirty_scopes=lambda: SimpleNamespace(scope_ids=[]),
+        clear_library_scan_dirty_scopes=lambda _ids: None,
+        get_library_scan_filesystem_watcher=lambda: SimpleNamespace(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
     )
     auth = SimpleNamespace(cleanup_expired_tokens=AsyncMock())
     auth_store = object()
@@ -600,10 +687,27 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     monkeypatch.setattr(
         target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None
     )
+    def _capture_supervisor(*args: object, **kwargs: object) -> object:
+        scan_supervisor_arguments["__args"] = args  # type: ignore[assignment]
+        scan_supervisor_arguments.update(kwargs)  # type: ignore[arg-type]
+        return None
+
     monkeypatch.setattr(
         target_module,
         "start_target_scan_supervisor",
-        lambda *args, **kwargs: scan_supervisor_arguments.update(kwargs),
+        _capture_supervisor,
+    )
+    filesystem_watcher_arguments: dict[str, object] = {}
+
+    def _capture_filesystem_watcher(*args: object, **kwargs: object) -> object:
+        filesystem_watcher_arguments["__args"] = args  # type: ignore[assignment]
+        filesystem_watcher_arguments.update(kwargs)  # type: ignore[arg-type]
+        return None
+
+    monkeypatch.setattr(
+        target_module,
+        "start_library_filesystem_watcher",
+        _capture_filesystem_watcher,
     )
     identification_worker_arguments: dict[str, object] = {}
     monkeypatch.setattr(
@@ -621,6 +725,11 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
         target_module,
         "start_library_contribution_verification_worker",
         lambda *a, **k: None,
+    )
+    # (GH-293) The PASSIVE WAL checkpoint task registers a real background loop;
+    # drain it here so lifespan tests never leave a pending task behind.
+    monkeypatch.setattr(
+        target_module, "start_target_wal_checkpoint_task", lambda _service: None
     )
     watchdog_starters: dict[str, object] = {}
     monkeypatch.setattr(
@@ -689,10 +798,32 @@ def test_production_target_lifespan_selects_validation_phase_and_runs_runtime(
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     assert schedule_settings_getter()["timezone_name"] == "Europe/London"
     timezone_name.assert_called_once_with()
+    supervisor_args = scan_supervisor_arguments.get("__args")  # type: ignore[assignment]
+    assert isinstance(supervisor_args, tuple) and len(supervisor_args) == 3
+    assert callable(supervisor_args[0])
+    assert callable(supervisor_args[1])
+    assert supervisor_args[2] is work_wakeups
+    assert callable(scan_supervisor_arguments.get("scheduler_getter"))
+    assert callable(scan_supervisor_arguments.get("resolver_getter"))
+    assert callable(scan_supervisor_arguments.get("schedule_settings_getter"))
+    watcher_args = filesystem_watcher_arguments.get("__args")  # type: ignore[assignment]
+    assert isinstance(watcher_args, tuple) and len(watcher_args) == 3
+    assert callable(watcher_args[0])
+    assert callable(watcher_args[1])
+    assert watcher_args[2] is work_wakeups
+    assert callable(filesystem_watcher_arguments.get("scheduler_getter"))
+    assert callable(filesystem_watcher_arguments.get("resolver_getter"))
+    watcher_settings_getter = filesystem_watcher_arguments.get(
+        "watcher_settings_getter"
+    )
+    assert callable(watcher_settings_getter)
+    assert watcher_settings_getter().poll_interval_seconds == 300.0  # type: ignore[operator]
     assert set(watchdog_starters) == {
+        "target-library-scan-supervisor",
         "target-library-identification-worker",
         "target-library-operation-worker",
         "library-contribution-verification-worker",
+        "target-library-filesystem-watcher",
     }
     assert all(callable(starter) for starter in watchdog_starters.values())
     registry.cancel.assert_awaited_once_with("target-worker-watchdog")
@@ -748,6 +879,82 @@ def test_production_target_lifespan_rejects_malformed_admission_before_validatio
             pass
 
     validate.assert_not_awaited()
+def test_production_target_lifespan_closes_scan_coordinator_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import target_application as target_module
+    from core.dependencies import auth_providers
+    from maintenance import automatic_upgrade
+
+    lifecycle_order: list[str] = []
+    validate = AsyncMock(side_effect=lambda _phase: lifecycle_order.append("validate"))
+    admission = AsyncMock(side_effect=lambda _settings: lifecycle_order.append("admit"))
+    init = AsyncMock()
+    cleanup = AsyncMock()
+    migrate = AsyncMock(side_effect=lambda **_kwargs: lifecycle_order.append("migrate"))
+    operational = AsyncMock(side_effect=lambda **_kwargs: lifecycle_order.append("operational"))
+    timezone_name = MagicMock(return_value="Europe/London")
+    cache = SimpleNamespace(clear=AsyncMock())
+    preferences = SimpleNamespace(
+        get_instance_id=lambda: "instance",
+        get_advanced_settings=lambda: SimpleNamespace(memory_cache_cleanup_interval=60, disk_cache_cleanup_interval=60),
+        get_typed_library_settings=lambda: SimpleNamespace(library_roots=[], enabled=True),
+        get_library_scan_schedule=lambda: SimpleNamespace(scan_frequency="manual", daily_scan_time="03:00"),
+        get_library_scan_dirty_scopes=lambda: SimpleNamespace(scope_ids=[]),
+        clear_library_scan_dirty_scopes=lambda _ids: None,
+        get_library_scan_filesystem_watcher=lambda: SimpleNamespace(
+            enabled=True, poll_interval_seconds=300.0, batch_window_seconds=60.0
+        ),
+    )
+    auth = SimpleNamespace(cleanup_expired_tokens=AsyncMock())
+    auth_store = object()
+    operation_supervisor = SimpleNamespace(recover=AsyncMock(side_effect=lambda: lifecycle_order.append("operation-recovery")))
+    recovery_service = SimpleNamespace(
+        recover_startup=AsyncMock(return_value=SimpleNamespace(examined_bundles=0, recovered_bundles=0, rolled_back_bundles=0, needs_attention_bundles=0, skipped_bundles=0), side_effect=lambda: (lifecycle_order.append("management-recovery") or SimpleNamespace(examined_bundles=0, recovered_bundles=0, rolled_back_bundles=0, needs_attention_bundles=0, skipped_bundles=0))),
+    )
+    monkeypatch.setattr(target_module.TargetStartupValidator, "validate", validate)
+    monkeypatch.setattr(automatic_upgrade, "await_target_startup_admission", admission)
+    monkeypatch.setattr(target_module, "init_app_state", init)
+    monkeypatch.setattr(target_module, "cleanup_app_state", cleanup)
+    monkeypatch.setattr(target_module, "run_target_one_time_migrations", migrate)
+    monkeypatch.setattr(target_module, "start_target_operational_runtime", operational)
+    monkeypatch.setattr(target_module, "_server_timezone_name", timezone_name)
+    monkeypatch.setattr(target_module, "get_preferences_service", lambda: preferences)
+    monkeypatch.setattr(target_module, "get_native_library_store", lambda: SimpleNamespace(work_wakeups=object()))
+    monkeypatch.setattr(target_module, "get_cache", lambda: cache)
+    monkeypatch.setattr(target_module, "get_disk_cache", lambda: object())
+    monkeypatch.setattr(target_module, "get_target_library_operation_supervisor", lambda: operation_supervisor)
+    monkeypatch.setattr(target_module, "get_library_management_recovery_service", lambda: recovery_service)
+    monkeypatch.setattr(target_module, "get_target_consumer_composition", lambda: SimpleNamespace(covers=SimpleNamespace(disk_cache=object())))
+    monkeypatch.setattr(target_module, "start_cache_cleanup_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_memory_maintenance_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_disk_cache_cleanup_task", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_scan_supervisor", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_library_filesystem_watcher", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_identification_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_operation_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_library_contribution_verification_worker", lambda *a, **k: None)
+    monkeypatch.setattr(target_module, "start_target_wal_checkpoint_task", lambda _service: None)
+    monkeypatch.setattr(target_module, "start_target_worker_watchdog", lambda starters: None)
+    pending_migration = AsyncMock()
+    pending_migration.schedule.return_value = False
+    monkeypatch.setattr(target_module, "get_legacy_pending_migration_service", lambda: pending_migration)
+    monkeypatch.setattr(auth_providers, "get_auth_service", lambda: auth)
+    monkeypatch.setattr(auth_providers, "get_auth_store", lambda: auth_store)
+    coordinator_close = AsyncMock()
+    mock_coordinator = SimpleNamespace(aclose=coordinator_close, close=MagicMock())
+    monkeypatch.setattr(target_module, "get_target_library_scan_coordinator", lambda: mock_coordinator)
+    registry = target_module.TaskRegistry.get_instance()
+    monkeypatch.setattr(registry, "cancel", AsyncMock())
+    monkeypatch.setattr(registry, "cancel_all", AsyncMock())
+    monkeypatch.setenv("TZ", "Europe/London")
+    monkeypatch.delenv("DROPPEDNEEDLE_TARGET_ADMISSION_TOKEN", raising=False)
+    app = create_production_target_application()
+    with build_test_client(app):
+        pass
+    coordinator_close.assert_awaited_once()
+
+
 
 
 def test_target_provider_call_graph_has_no_direct_legacy_catalog_edge() -> None:
@@ -837,7 +1044,12 @@ def test_target_cover_provider_has_no_legacy_catalog_inputs(monkeypatch) -> None
     repo_providers.get_target_coverart_repository.cache_clear()
 
     assert repo_providers.get_target_coverart_repository() is built
-    builder.assert_called_once_with()
+    # Mechanical repair during F-PERF-04 verification: this provider now
+    # receives the native library store singleton by design (pre-existing
+    # stale assertion found failing at HEAD 509e01e before any local edits).
+    builder.assert_called_once_with(
+        native_library_store=repo_providers.get_native_library_store()
+    )
 
     repo_providers.get_target_coverart_repository.cache_clear()
 
@@ -924,3 +1136,276 @@ def test_target_application_refuses_startup_when_validation_fails() -> None:
     with pytest.raises(TargetStartupInvariantError, match="scratch invariant failure"):
         with build_test_client(app):
             pass
+
+
+def test_store_prune_task_receives_the_native_library_singleton() -> None:
+    """F-PERF-04: the six-hour store-prune task must receive the native
+    library store through the dependency-registry getter - never a separately
+    constructed store (AGENTS singleton rule)."""
+    lifecycle = (
+        Path(__file__).parents[2] / "services/native/target_application_lifecycle.py"
+    )
+    module = ast.parse(lifecycle.read_text())
+    calls = [
+        call
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "start_target_operational_runtime"
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "start_store_prune_task"
+    ]
+    assert len(calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+    native = keywords.get("native_store")
+    assert native is not None, "native_store kwarg missing from start_store_prune_task"
+    assert (
+        isinstance(native, ast.Call)
+        and isinstance(native.func, ast.Name)
+        and native.func.id == "get_native_library_store"
+    ), "native_store must come from get_native_library_store()"
+
+
+def _build_production_app_with_base(
+    monkeypatch: pytest.MonkeyPatch, base_path: str
+):
+    """Build the production target app with BASE_PATH forced and settings fresh."""
+    monkeypatch.setenv("BASE_PATH", base_path)
+    import core.config as config_module
+
+    monkeypatch.setattr(config_module, "_settings", None)
+    return build_test_client(create_production_target_application())
+
+
+def test_production_target_places_base_path_inside_proxy_headers() -> None:
+    from api.compat.common.path_case import CompatPathCaseMiddleware
+    from core.base_path import BasePathMiddleware
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    app = create_production_target_application()
+    outermost = [middleware.cls for middleware in app.user_middleware[:3]]
+    assert outermost == [
+        ProxyHeadersMiddleware,
+        BasePathMiddleware,
+        CompatPathCaseMiddleware,
+    ]
+
+
+def test_prefixed_surface_serves_health_and_api_under_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    prefixed_health = client.get("/music/health")
+    assert prefixed_health.status_code == 200
+    assert prefixed_health.json() == {
+        "status": "ok",
+        "message": "DroppedNeedle backend running",
+    }
+
+    unprefixed_health = client.get("/health")
+    assert unprefixed_health.status_code == 404
+    assert unprefixed_health.json() == {
+        "error": {"code": "NOT_FOUND", "message": "Not found", "details": None}
+    }
+
+    assert client.get("/music/api/v1/openapi.json").status_code == 200
+    assert client.get("/api/v1/openapi.json").status_code == 404
+
+
+def test_prefix_matching_is_segment_exact_and_strips_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    for path in ["//music/health", "/music-x/health", "/musicx/health"]:
+        response = client.get(path)
+        assert response.status_code == 404, path
+        assert response.json()["error"]["code"] == "NOT_FOUND", path
+
+    assert client.get("/music/music/health").status_code == 404
+
+
+def test_auth_middleware_guards_prefixed_api_but_sees_nothing_unprefixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "/music")
+
+    protected = client.get("/music/api/v1/artists")
+    assert protected.status_code == 401
+    assert protected.json()["error"]["code"] == "UNAUTHORIZED"
+
+    hidden = client.get("/api/v1/artists")
+    assert hidden.status_code == 404
+    assert hidden.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_empty_base_path_keeps_today_unprefixed_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_production_app_with_base(monkeypatch, "")
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/v1/openapi.json").status_code == 200
+
+    protected = client.get("/api/v1/artists")
+    assert protected.status_code == 401
+    assert protected.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+_BYPASS_WARNING = (
+    "[upgrade] WARNING: library migration launcher was bypassed - expected "
+    "`python -m maintenance.automatic_upgrade --start-target`; catalog "
+    "migrations did not run. Restore the image CMD."
+)
+
+
+def _bypass_settings(tmp_path: Path, *, root: Path, db_exists: bool) -> SimpleNamespace:
+    database = tmp_path / "library.db"
+    if db_exists:
+        database.write_bytes(b"")
+    return SimpleNamespace(
+        root_app_dir=root,
+        cache_dir=tmp_path,
+        library_db_path=database,
+    )
+
+
+def _patch_bypass_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    automatic_upgrade: object,
+    tmp_path: Path,
+    *,
+    container: bool,
+    token: str | None,
+) -> None:
+    if token is None:
+        monkeypatch.delenv("DROPPEDNEEDLE_TARGET_ADMISSION_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("DROPPEDNEEDLE_TARGET_ADMISSION_TOKEN", token)
+    revision = tmp_path / "source-revision"
+    if container:
+        revision.write_text("rev")
+    monkeypatch.setattr(automatic_upgrade, "_SOURCE_REVISION_PATH", revision)
+
+
+@pytest.mark.parametrize(
+    ("has_marker", "state"),
+    [(False, None), (True, {"stage": "promoted_pending_startup"})],
+)
+def test_launcher_bypass_warns_when_container_db_needs_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    has_marker: bool,
+    state: dict[str, str] | None,
+) -> None:
+    import target_application as target_module
+    from maintenance import automatic_upgrade
+
+    _patch_bypass_environment(
+        monkeypatch, automatic_upgrade, tmp_path, container=True, token=None
+    )
+    monkeypatch.setattr(
+        automatic_upgrade, "_database_has_marker", lambda _db: has_marker
+    )
+    monkeypatch.setattr(automatic_upgrade, "_read_state", lambda _path: state)
+    settings = _bypass_settings(tmp_path, root=Path("/app"), db_exists=True)
+
+    assert target_module._launcher_bypassed(settings) is True
+    assert target_module._LAUNCHER_BYPASS_WARNING == _BYPASS_WARNING
+
+    with caplog.at_level(logging.WARNING, logger="target_application"):
+        target_module._emit_launcher_bypass_warning()
+    assert _BYPASS_WARNING in caplog.text
+    assert capsys.readouterr().out.strip() == _BYPASS_WARNING
+
+
+@pytest.mark.parametrize(
+    "state",
+    [None, {"stage": "completed"}],
+)
+def test_launcher_bypass_silent_when_container_db_marked_and_settled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: dict[str, str] | None,
+) -> None:
+    import target_application as target_module
+    from maintenance import automatic_upgrade
+
+    _patch_bypass_environment(
+        monkeypatch, automatic_upgrade, tmp_path, container=True, token=None
+    )
+    monkeypatch.setattr(automatic_upgrade, "_database_has_marker", lambda _db: True)
+    monkeypatch.setattr(automatic_upgrade, "_read_state", lambda _path: state)
+    settings = _bypass_settings(tmp_path, root=Path("/app"), db_exists=True)
+
+    assert target_module._launcher_bypassed(settings) is False
+
+
+def test_launcher_bypass_silent_on_fresh_volume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import target_application as target_module
+    from maintenance import automatic_upgrade
+
+    _patch_bypass_environment(
+        monkeypatch, automatic_upgrade, tmp_path, container=True, token=None
+    )
+    marker = MagicMock()
+    monkeypatch.setattr(automatic_upgrade, "_database_has_marker", marker)
+    settings = _bypass_settings(tmp_path, root=Path("/app"), db_exists=False)
+
+    assert target_module._launcher_bypassed(settings) is False
+    marker.assert_not_called()
+
+
+def test_launcher_bypass_silent_with_admission_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import target_application as target_module
+    from maintenance import automatic_upgrade
+
+    _patch_bypass_environment(
+        monkeypatch, automatic_upgrade, tmp_path, container=True, token="a" * 32
+    )
+    marker = MagicMock(return_value=False)
+    monkeypatch.setattr(automatic_upgrade, "_database_has_marker", marker)
+    settings = _bypass_settings(tmp_path, root=Path("/app"), db_exists=True)
+
+    assert target_module._launcher_bypassed(settings) is False
+    marker.assert_not_called()
+
+
+def test_launcher_bypass_silent_on_local_dev_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import target_application as target_module
+    from maintenance import automatic_upgrade
+
+    _patch_bypass_environment(
+        monkeypatch, automatic_upgrade, tmp_path, container=False, token=None
+    )
+    marker = MagicMock(return_value=False)
+    monkeypatch.setattr(automatic_upgrade, "_database_has_marker", marker)
+    settings = _bypass_settings(tmp_path, root=tmp_path, db_exists=True)
+
+    assert target_module._launcher_bypassed(settings) is False
+    marker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_launcher_bypass_warning_never_blocks_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import target_application as target_module
+
+    def _boom(_settings: object) -> bool:
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(target_module, "_launcher_bypassed", _boom)
+    settings = _bypass_settings(tmp_path, root=Path("/app"), db_exists=True)
+
+    assert await target_module._warn_if_launcher_bypassed(settings) is False

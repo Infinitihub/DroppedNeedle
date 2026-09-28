@@ -21,7 +21,9 @@ def _make_prefs() -> MagicMock:
         api_key="k", shared_secret="s", session_key="sk", username="u", enabled=False
     )
     prefs.is_lastfm_enabled.return_value = False
-    prefs.get_primary_music_source.return_value = PrimaryMusicSourceSettings(source="listenbrainz")
+    prefs.get_primary_music_source.return_value = PrimaryMusicSourceSettings(
+        source="listenbrainz"
+    )
     jf = MagicMock()
     jf.enabled = False
     jf.jellyfin_url = ""
@@ -75,7 +77,13 @@ class TestEnrichSingleflight:
         call_count = 0
         original_do_enrich = service._enrichment._do_enrich_queue_item
 
-        async def counting_enrich(release_group_mbid: str, cache_key: str):
+        async def counting_enrich(
+            release_group_mbid: str,
+            cache_key: str,
+            *,
+            priority=None,
+            source_context=None,
+        ):
             nonlocal call_count
             call_count += 1
             await asyncio.sleep(0.05)
@@ -98,20 +106,26 @@ class TestEnrichSingleflight:
         runs the pipeline again (useful if the first result wasn't cached)."""
         service, _ = _make_service(memory_cache=None)
 
-        async def quick_enrich(release_group_mbid: str, cache_key: str):
+        async def quick_enrich(
+            release_group_mbid: str,
+            cache_key: str,
+            *,
+            priority=None,
+            source_context=None,
+        ):
             return FAKE_ENRICHMENT
 
         service._enrichment._do_enrich_queue_item = quick_enrich
 
         await service.enrich_queue_item(MBID)
-        assert MBID not in service._enrichment._enrich_in_flight
+        assert service._enrichment._enrich_in_flight == {}
 
     @pytest.mark.asyncio
     async def test_singleflight_propagates_exception_to_all_waiters(self):
         """If enrichment raises, all concurrent callers should receive the same exception."""
         service, _ = _make_service(memory_cache=None)
 
-        async def failing_enrich(release_group_mbid: str, cache_key: str):
+        async def failing_enrich(release_group_mbid: str, cache_key: str, **kwargs):
             await asyncio.sleep(0.05)
             raise RuntimeError("MB rate limit")
 
@@ -126,13 +140,13 @@ class TestEnrichSingleflight:
 
         assert all(isinstance(r, RuntimeError) for r in results)
         assert all(str(r) == "MB rate limit" for r in results)
-        assert MBID not in service._enrichment._enrich_in_flight
+        assert service._enrichment._enrich_in_flight == {}
 
     @pytest.mark.asyncio
     async def test_memory_cache_hit_skips_singleflight(self):
         """If the enrichment is in the memory cache, singleflight should not be consulted."""
         cache = AsyncMock()
-        cache.get = AsyncMock(return_value=FAKE_ENRICHMENT)
+        cache.get_with_metadata = AsyncMock(return_value=(FAKE_ENRICHMENT, None))
         service, _ = _make_service(memory_cache=cache)
 
         call_count = 0
@@ -152,11 +166,12 @@ class TestEnrichSingleflight:
     async def test_memory_cache_miss_triggers_enrichment(self):
         """If the memory cache returns None, the enrichment pipeline should run."""
         cache = AsyncMock()
-        cache.get = AsyncMock(return_value=None)
-        cache.set = AsyncMock()
+        cache.get_with_metadata = AsyncMock(return_value=(None, None))
+        cache.set_if_token = AsyncMock(return_value=True)
+        cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
         service, _ = _make_service(memory_cache=cache)
 
-        async def simple_enrich(release_group_mbid: str, cache_key: str):
+        async def simple_enrich(release_group_mbid: str, cache_key: str, **kwargs):
             return FAKE_ENRICHMENT
 
         service._enrichment._do_enrich_queue_item = simple_enrich
@@ -170,7 +185,7 @@ class TestEnrichSingleflight:
         service, _ = _make_service(memory_cache=None)
         call_mbids: list[str] = []
 
-        async def tracking_enrich(release_group_mbid: str, cache_key: str):
+        async def tracking_enrich(release_group_mbid: str, cache_key: str, **kwargs):
             call_mbids.append(release_group_mbid)
             await asyncio.sleep(0.02)
             return FAKE_ENRICHMENT
@@ -187,3 +202,140 @@ class TestEnrichSingleflight:
         assert len(call_mbids) == 2
         assert mbid_a in call_mbids
         assert mbid_b in call_mbids
+
+    @pytest.mark.asyncio
+    async def test_source_switch_separates_leaders_and_fences_cache_writes(self):
+        import repositories.musicbrainz_base as mb_base
+
+        cache = AsyncMock()
+        cached_values: dict[str, DiscoverQueueEnrichment] = {}
+
+        async def cache_get(key: str):
+            namespaced = mb_base.namespace_mb_cache_key(key)
+            return cached_values.get(namespaced), None
+
+        async def cache_set_if_token(
+            _token: tuple[object, int],
+            key: str,
+            value: DiscoverQueueEnrichment,
+            _ttl: int | float,
+            metadata: object = None,
+        ) -> bool:
+            del metadata
+            cached_values[mb_base.namespace_mb_cache_key(key)] = value
+            return True
+
+        cache.get_with_metadata.side_effect = cache_get
+        cache.set_if_token.side_effect = cache_set_if_token
+        cache.capture_clear_token = MagicMock(return_value=("test-cache", 0))
+        service, mb_repo = _make_service(memory_cache=cache)
+        service._enrichment._coalesce_popularity = AsyncMock(return_value=None)
+        mb_repo.extract_youtube_url_from_relations = MagicMock(return_value=None)
+        old_gate = asyncio.Event()
+        new_gate = asyncio.Event()
+        old_started = asyncio.Event()
+        new_started = asyncio.Event()
+        calls: list[int] = []
+        original_source = mb_base.capture_mb_source_context()
+        original_runtime = mb_base.brainzmash_runtime_enabled()
+        mb_base.set_mb_api_base(
+            "https://old.example/ws/2",
+            source_mode="mirror",
+            source_id="discover-enrich-old",
+            generation=original_source.generation + 1,
+        )
+        old_generation = mb_base.get_mb_source_generation()
+
+        async def delayed_release_group(*_args, **_kwargs):
+            generation = mb_base.get_mb_source_generation()
+            calls.append(generation)
+            if generation == old_generation:
+                old_started.set()
+                await old_gate.wait()
+                label = "old"
+            else:
+                new_started.set()
+                await new_gate.wait()
+                label = "new"
+            return {"title": label, "tags": [{"name": label}]}
+
+        mb_repo.get_release_group_by_id.side_effect = delayed_release_group
+        try:
+            old_leader = asyncio.create_task(service.enrich_queue_item(MBID))
+            await old_started.wait()
+            old_follower = asyncio.create_task(service.enrich_queue_item(MBID))
+            await asyncio.sleep(0)
+
+            mb_base.set_mb_api_base(
+                "https://new.example/ws/2",
+                source_mode="mirror",
+                source_id="discover-enrich-new",
+                generation=old_generation + 1,
+            )
+            new_generation = mb_base.get_mb_source_generation()
+            new_leader = asyncio.create_task(service.enrich_queue_item(MBID))
+            await new_started.wait()
+            new_follower = asyncio.create_task(service.enrich_queue_item(MBID))
+            await asyncio.sleep(0)
+
+            assert len(service._enrichment._enrich_in_flight) == 2
+            assert (MBID, old_generation) in service._enrichment._enrich_in_flight
+            assert (MBID, new_generation) in service._enrichment._enrich_in_flight
+
+            new_gate.set()
+            new_leader_result, new_follower_result = await asyncio.gather(
+                new_leader, new_follower
+            )
+            old_gate.set()
+            old_leader_result, old_follower_result = await asyncio.gather(
+                old_leader, old_follower
+            )
+
+            cached_result = await service.enrich_queue_item(MBID)
+            assert cached_result.tags == ["new"]
+            new_namespaced_key = (
+                "discover_queue_enrich:"
+                f"source:mirror:discover-enrich-new:g{new_generation}:"
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
+            assert cached_values[new_namespaced_key].tags == ["new"]
+            assert cache.set_if_token.await_count == 1
+        finally:
+            old_gate.set()
+            new_gate.set()
+            mb_base.set_mb_api_base(
+                original_source.source_url,
+                source_mode=original_source.source_mode,
+                source_id=original_source.source_id,
+                generation=original_source.generation,
+                brainzmash_binding_valid=original_runtime,
+            )
+
+        assert calls == [old_generation, new_generation]
+        assert old_leader_result.tags == ["old"]
+        assert old_follower_result.tags == ["old"]
+        assert new_leader_result.tags == ["new"]
+        assert new_follower_result.tags == ["new"]
+        assert service._enrichment._enrich_in_flight == {}
+
+
+@pytest.mark.asyncio
+async def test_popularity_coalescer_batches_concurrent_listen_counts():
+    service, _ = _make_service(memory_cache=None)
+    lb_repo = service._enrichment._lb_repo
+    lb_repo.get_release_group_popularity_batch = AsyncMock(
+        return_value={"rg-a": 17, "rg-b": 4}
+    )
+
+    first = asyncio.create_task(service._enrichment._coalesce_popularity("rg-a"))
+    second = asyncio.create_task(service._enrichment._coalesce_popularity("rg-b"))
+    await asyncio.sleep(0)
+    service._enrichment._flush_popularity_now()
+
+    assert await asyncio.gather(first, second) == [17, 4]
+    lb_repo.get_release_group_popularity_batch.assert_awaited_once_with(
+        ["rg-a", "rg-b"]
+    )
+    flush_task = service._enrichment._popularity_flush_task
+    if flush_task is not None:
+        await flush_task

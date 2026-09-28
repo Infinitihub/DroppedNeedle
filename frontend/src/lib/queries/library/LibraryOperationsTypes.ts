@@ -13,6 +13,17 @@ export type LibraryWorkState =
 	| 'running'
 	| 'idle';
 
+export interface DeferredJobSummary {
+	job_id: string;
+	local_album_id: string | null;
+	album_title: string | null;
+	artist_name: string | null;
+	last_failure_code: string;
+	attempt_count: number;
+	not_before: number | null;
+	updated_at: number;
+}
+
 export interface LibraryActivityItem {
 	kind: 'scan' | 'identification';
 	state: LibraryWorkState;
@@ -29,6 +40,7 @@ export interface LibraryActivityItem {
 	failed_count: number;
 	deferred_count: number;
 	deferred_reason_counts: Record<string, number>;
+	deferred_jobs: DeferredJobSummary[];
 	attention_count: number;
 	priority_band: string | null;
 	oldest_backlog_at: number | null;
@@ -78,6 +90,12 @@ export interface LibraryWorkItem {
 	priority: number;
 	failure_event_id: string | null;
 	failure_at: number | null;
+	/** Presentation-only synthetic drain marker (id 'identification-drain', never a real run). */
+	synthetic?: boolean;
+	/** False while a settled scan still has albums awaiting identification. */
+	catalog_settled?: boolean | null;
+	/** Albums still awaiting identification when the synthetic drain is active. */
+	pending_identification?: number | null;
 }
 
 export interface LibraryActivityResponse {
@@ -182,7 +200,20 @@ export interface IdentificationControlResponse {
 	row_revision: number;
 }
 
-export type ReviewState = 'needs_review' | 'keep_tagged' | 'excluded' | 'resolved';
+export type ReviewState =
+	'needs_review' | 'edition_to_confirm' | 'keep_tagged' | 'excluded' | 'resolved';
+
+export const EDITION_UNCERTAIN_REASON = 'EDITION_UNCERTAIN';
+
+export function isEditionToConfirmReview(
+	item: Pick<ReviewListItem, 'state' | 'reason_code'> & { edition_uncertain?: boolean | null }
+): boolean {
+	return (
+		item.state === 'edition_to_confirm' ||
+		item.reason_code === EDITION_UNCERTAIN_REASON ||
+		item.edition_uncertain === true
+	);
+}
 
 export interface ReviewListItem {
 	id: string;
@@ -200,8 +231,9 @@ export interface ReviewListItem {
 	effective_policy: string;
 	exclusion_source: string | null;
 	release_group_mbid: string | null;
+	edition_uncertain?: boolean | null;
+	ranked_edition_keys?: string[] | null;
 	identity_source: string | null;
-	candidate_count: number;
 	evidence_summary: Record<string, number>;
 	active_job_state: string | null;
 	created_at: number;
@@ -216,6 +248,8 @@ export interface ReviewListResponse {
 	filtered_total: number;
 	counts_by_state: Record<string, number>;
 	counts_by_reason: Record<string, number>;
+	counts_by_reason_filtered?: Record<string, number>;
+	counts_by_state_filtered?: Record<string, number>;
 	catalog_revision: number;
 }
 
@@ -348,14 +382,7 @@ export interface BulkReviewPreviewResponse {
 }
 
 export type OperationState =
-	| 'queued'
-	| 'running'
-	| 'paused'
-	| 'ready'
-	| 'succeeded'
-	| 'failed'
-	| 'cancelled'
-	| 'stopped';
+	'queued' | 'running' | 'paused' | 'ready' | 'succeeded' | 'failed' | 'cancelled' | 'stopped';
 
 export interface OperationWorkResult {
 	ordinal: number;
@@ -460,6 +487,7 @@ export interface SuggestedEditionSummary {
 	date: string | null;
 	country: string | null;
 	status: string | null;
+	auto_gate: string | null;
 }
 
 export interface RepairFindingResponse {
@@ -478,8 +506,20 @@ export interface RepairFindingResponse {
 	state: string;
 	apply_result: string | null;
 	suggested_edition: SuggestedEditionSummary | null;
+	automatic_undo: AutomaticEditionUndoInfo | null;
 	updated_at: number;
 	row_revision: number;
+}
+
+export interface AutomaticEditionUndoInfo {
+	expected_album_revision: number;
+	expected_identity_revision: number;
+}
+
+export interface AutomaticEditionUndoResponse {
+	local_album_id: string;
+	outcome: string;
+	review_id: string | null;
 }
 
 export interface RepairFindingListResponse {

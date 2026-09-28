@@ -16,7 +16,10 @@ stay structurally identical to the protocol for the conformance contract test.
 
 import asyncio
 import logging
+import os
 import re
+import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 
 from models.common import ServiceStatus
@@ -29,6 +32,8 @@ from repositories.protocols.download_client import (
     TaskHandle,
 )
 
+from core.exceptions import SlskdAuthError
+
 from .slskd_client import SlskdClient
 from .slskd_models import SlskdEnqueueResponse, SlskdTransfer, SlskdUserSearchResponse
 
@@ -36,6 +41,110 @@ logger = logging.getLogger(__name__)
 
 _DISC_DIR = re.compile(r"\b(?:Disc|CD)\s*\d+\b", re.IGNORECASE)
 _LOSSLESS_EXT = {"flac", "alac", "wav", "ape", "wv"}
+_NO_TIMESTAMP = datetime.min.replace(tzinfo=timezone.utc)
+_MAX_WALK_ENTRIES = 10_000
+
+
+def _normalised_filename(value: str) -> str:
+    """Return the NFC form used for filename comparisons only."""
+    return unicodedata.normalize("NFC", value)
+
+
+def _exact_transfer_path(value: str) -> str:
+    """Return a transfer path key with separators normalised, but not Unicode."""
+    return value.replace("\\", "/")
+
+
+def _normalised_path(value: str) -> str:
+    """Canonical comparison key for a path reported by slskd."""
+    return _normalised_filename(_exact_transfer_path(value))
+
+_FUZZY_DASH_SPLIT = re.compile(r"\s*[-\u2013\u2014_]\s*")
+_FUZZY_TRACK_FIND = re.compile(r"\b(\d{1,3})\b")
+_FUZZY_LEADING_TRACK = re.compile(r"^(\d{1,3})\b[.\-_\s]*")
+
+
+def _fuzzy_file_key(basename: str) -> tuple[int | None, str, str]:
+    """Split a download basename into (track_number, title_core, extension).
+
+    Local fallback for ``_locate_file`` steps 8-9 (issue #229): peers advertise a
+    flat ``Artist - Album - NN - Title`` name while slskd files the download as
+    ``NN. Title`` inside an album folder. The name is NFC-normalised then
+    casefolded; an ``Artist - Album`` prefix is stripped up to a standalone
+    track-number segment (falling back to the first ``NN`` token); a leading
+    track token (``^\\d{1,3}\\b`` over ``[.-_\\s]*`` separators) is split off and
+    compared numerically; the title core drops every non-alphanumeric so only
+    separator/punctuation drift remains invisible.
+    """
+    normalised = unicodedata.normalize("NFC", basename).casefold()
+    stem, dot, ext = normalised.rpartition(".")
+    if not dot or not stem:
+        stem, ext = normalised, ""
+    remainder = stem
+    segments = _FUZZY_DASH_SPLIT.split(stem)
+    for index, segment in enumerate(segments):
+        if re.fullmatch(r"\d{1,3}\.?", segment.strip()):
+            remainder = " - ".join(segments[index:])
+            break
+    else:
+        found = _FUZZY_TRACK_FIND.search(stem)
+        if found:
+            remainder = stem[found.start(1):]
+    remainder = remainder.strip()
+    track: int | None = None
+    title_part = remainder
+    leading = _FUZZY_LEADING_TRACK.match(remainder)
+    if leading:
+        track = int(leading.group(1))
+        title_part = remainder[leading.end():]
+    core = "".join(ch for ch in title_part if ch.isalnum())
+    return track, core, ext
+
+
+def _fuzzy_keys_match(
+    expected: tuple[int | None, str, str], candidate_name: str
+) -> bool:
+    """Return True when an on-disk basename names the expected download fuzzily.
+
+    Track tokens must agree when both sides carry one, the extensions must be
+    equal, both title cores must be non-trivial, and the shorter core must be
+    contained in the longer one (either direction).
+    """
+    expected_track, expected_core, expected_ext = expected
+    candidate_track, candidate_core, candidate_ext = _fuzzy_file_key(candidate_name)
+    if expected_ext != candidate_ext:
+        return False
+    if (
+        expected_track is not None
+        and candidate_track is not None
+        and expected_track != candidate_track
+    ):
+        return False
+    if not expected_core or not candidate_core:
+        return False
+    short, long = sorted((expected_core, candidate_core), key=len)
+    if len(short) < 2:
+        return False
+    return short in long
+
+
+class _EntryBudget:
+    """Shared cap for all normalized fallback directory entries."""
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, limit: int) -> None:
+        self.remaining = limit
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0
 
 
 class SlskdRepository:
@@ -55,11 +164,17 @@ class SlskdRepository:
         downloads_mount: Path,
         concurrent_searches: int = 1,
         concurrent_enqueues: int = 1,
+        incomplete_mount: Path | None = None,
     ):
         self._client = client
         self._url = url
         self._api_key = api_key
         self._downloads_mount = Path(downloads_mount)
+        # Optional second mount for slskd's incomplete dir (#292). None disables the
+        # partial fallback entirely; never consulted by get_file_path, only by
+        # locate_partial. Stored unresolved; each lookup resolves it fresh so a
+        # symlinked root cannot escape confinement (escape-in).
+        self._incomplete_mount = Path(incomplete_mount) if incomplete_mount else None
         self._search_semaphore = asyncio.Semaphore(concurrent_searches)
         self._enqueue_semaphore = asyncio.Semaphore(concurrent_enqueues)
 
@@ -73,6 +188,21 @@ class SlskdRepository:
     async def health_check(self) -> ServiceStatus:
         try:
             info = await self._client.health_check()
+        except SlskdAuthError as exc:
+            # Wrong key and key-CIDR deny are both 401 server-side: one uniform
+            # message, never the URL/host/key/headers. The slskd body (usually
+            # empty) is appended only as a stripped single-line snippet.
+            code = exc.code if exc.code in (401, 403) else 401
+            message = (
+                "Authentication rejected "
+                f"({code}) — check the API key and slskd's CIDR allowlist"
+            )
+            snippet = str(exc.details).strip() if exc.details else ""
+            if snippet:
+                snippet = " ".join(snippet.split())[:200]
+            if snippet:
+                message = f"{message}: {snippet}"
+            return ServiceStatus(status="error", message=message)
         except Exception as exc:  # noqa: BLE001 - health check never raises
             return ServiceStatus(status="error", message=str(exc))
         version_block = info.get("version") if isinstance(info, dict) else None
@@ -151,8 +281,7 @@ class SlskdRepository:
 
     async def get_status(self, handle: TaskHandle) -> DownloadTaskStatus:
         transfers = await self._client.get_downloads(handle.username)
-        wanted = set(handle.filenames)
-        matched = [t for t in transfers if t.filename in wanted]
+        matched = self._match_transfers(handle, transfers)
         return self._aggregate_status(handle, matched)
 
     async def abort(self, handle: TaskHandle) -> bool:
@@ -184,14 +313,13 @@ class SlskdRepository:
 
     async def _remove_transfer_records(self, handle: TaskHandle) -> bool:
         transfers = await self._client.get_downloads(handle.username)
-        wanted = set(handle.filenames)
+        matched = self._match_transfers(handle, transfers)
         ok = True
-        for transfer in transfers:
-            if transfer.filename in wanted:
-                ok = (
-                    await self._client.cancel_transfer(handle.username, transfer.id)
-                    and ok
-                )
+        for transfer in matched:
+            ok = (
+                await self._client.cancel_transfer(handle.username, transfer.id)
+                and ok
+            )
         return ok
 
     def _downloads_mount_healthy(self) -> bool:
@@ -230,29 +358,43 @@ class SlskdRepository:
     def _locate_file(
         self, username: str, remote_filename: str, size: int | None = None
     ) -> Path | None:
-        """Resolve a finished transfer to its on-disk path inside the mounted
-        slskd downloads dir, or ``None`` if it can't be located there. Sync (runs in a
-        worker thread via ``get_file_path``); does only filesystem I/O, no awaits.
+        """Resolve a finished transfer inside the mounted slskd downloads directory.
 
-        slskd's on-disk layout varies by version and by how the peer organised
-        their share: ``{downloads}/{leaf remote folder}/{file}`` (common),
-        ``{downloads}/{username}/{file}`` or ``.../{username}/{album}/{file}``
-        (peers that file by user), or a flat dump. We try the cheap direct paths
-        first, then a username-scoped walk at any depth (scoped so a same-named
-        track from another peer can't be grabbed), and finally an exact byte-size
-        match for when slskd sanitised the on-disk filename and the basename no
-        longer matches. The remote filename is untrusted, so every candidate is
-        confined to the mount."""
-        parts = [
-            p for p in re.split(r"[\\/]", remote_filename) if p and p not in (".", "..")
-        ]
+        Exact spelling is always tried before a normalized alias, and a fuzzy
+        track-number/title fallback (steps 8-9) runs last.  Alias lookup is
+        deliberately bounded and fail-closed: it is confined to the resolved mount,
+        accepts regular files only, checks a positive expected size, and returns a
+        path only when exactly one matching on-disk file exists. When the expected
+        size is known, an exact-named hit whose bytes mismatch is a stale file
+        from another peer's folder, not this transfer: steps 1/2/4 skip it and
+        the walk fallbacks below refuse it, falling through to the
+        peer-scoped/size-aware steps (a size-only recovery under the peer's
+        folder, the size-gated whole-mount sweep) or to None. A single
+        non-exact normalized alias still resolves when the expected size
+        mismatches (search-advertised sizes are unreliable across a Unicode
+        drift); final size rejection for that case belongs to the verifier
+        (SIZE_MISMATCH), not the locator. Unknown size keeps the old
+        name-only behavior everywhere.
+        """
+        raw_parts = re.split(r"[\\/]", remote_filename)
+        if any(part == ".." for part in raw_parts):
+            return None
+        parts = [part for part in raw_parts if part and part != "."]
         if not parts:
             return None
-        mount = self._downloads_mount.resolve()
+        try:
+            mount = self._downloads_mount.resolve()
+        except (OSError, RuntimeError):
+            return None
         basename = parts[-1]
+        normalised_basename = _normalised_filename(basename)
+        expected_size = size if size is not None and size > 0 else None
 
         def _within_mount(candidate: Path) -> Path | None:
-            resolved = candidate.resolve()
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                return None
             if not resolved.is_relative_to(mount):
                 logger.warning(
                     "slskd path escapes the downloads mount: %r", remote_filename
@@ -260,40 +402,69 @@ class SlskdRepository:
                 return None
             return resolved
 
+        def _find_direct_exact(directory: Path) -> Path | None:
+            candidate = _within_mount(directory / basename)
+            if candidate is not None and candidate.is_file():
+                return candidate
+            return None
+
+        def _name_matches(entry: Path) -> bool:
+            return entry.name == basename
+
+        def _direct_hit_usable(candidate: Path) -> bool:
+            """Whether an exact-named direct hit may be this transfer (#397).
+
+            With a known expected size a byte-mismatched same-named file is a
+            stale leftover from another peer's folder, not this download: skip
+            it so lookup falls through to the peer-scoped/size-aware steps.
+            Unknown size keeps the old name-only behavior, as does an
+            unreadable size (fail open; the verifier owns that file).
+            """
+            if expected_size is None:
+                return True
+            try:
+                return candidate.stat().st_size == expected_size
+            except OSError:
+                return True
+
         # 1. slskd's common layout: {mount}/{leaf remote folder}/{filename}.
         if len(parts) >= 2:
-            leaf = _within_mount(mount / parts[-2] / basename)
-            if leaf is not None and leaf.exists():
+            leaf = _find_direct_exact(mount / parts[-2])
+            if leaf is not None and _direct_hit_usable(leaf):
                 return leaf
         # 2. Flat layout: {mount}/{filename}.
-        flat = _within_mount(mount / basename)
-        if flat is not None and flat.exists():
+        flat = _find_direct_exact(mount)
+        if flat is not None and _direct_hit_usable(flat):
             return flat
-        # 3. Peers that file by username: walk {mount}/{username}/ at any depth
-        # (covers {username}/{file} and {username}/{album}/{file}). Scoped to the
-        # peer so a same-named track from a different user can't be picked up.
+        # 3. Peers that file by username: walk {mount}/{username}/ at any depth.
+        # (covers {username}/{file} and {username}/{album}/{file}). Scoped so a
+        # same-named track from another peer cannot be picked up.
         user_root = _within_mount(mount / username) if username else None
         if user_root is not None and user_root.is_dir():
-            hit = self._walk_find(user_root, mount, lambda e: e.name == basename)
+            hit = self._walk_find(user_root, mount, _name_matches)
             if hit is not None:
                 return hit
         # 4. slskd may have sanitised the folder name - scan one level down for it.
+        # A size-mismatched hit is skipped, not returned, so a stale same-named
+        # file in one folder cannot shadow this transfer's file in another (#397).
         try:
-            for child in sorted(mount.iterdir()):
-                if child.is_dir():
-                    cand = _within_mount(child / basename)
-                    if cand is not None and cand.exists():
-                        return cand
-        except OSError as exc:
+            for child in sorted(mount.iterdir(), key=lambda path: path.name):
+                child_root = _within_mount(child)
+                if child_root is None or not child_root.is_dir():
+                    continue
+                cand = _find_direct_exact(child_root)
+                if cand is not None and _direct_hit_usable(cand):
+                    return cand
+        except (OSError, RuntimeError) as exc:
             logger.warning("Could not scan downloads mount %s: %s", mount, exc)
-        # 5. Last resort: slskd sanitised the FILENAME (illegal chars stripped), so
-        # the basename no longer matches. An exact byte-size match under the peer's
-        # folder recovers it - size is a strong key and the scope keeps it precise.
-        if size and user_root is not None and user_root.is_dir():
+        # 5. Last resort: slskd may have sanitised the filename.  An exact byte-size
+        # match under the peer's folder recovers it; this pre-existing fallback remains
+        # peer-scoped because a size-only walk across peers is unsafe.
+        if expected_size is not None and user_root is not None and user_root.is_dir():
 
             def _matches_size(entry: Path) -> bool:
                 try:
-                    return entry.stat().st_size == size
+                    return entry.stat().st_size == expected_size
                 except OSError:
                     return False
 
@@ -301,63 +472,500 @@ class SlskdRepository:
             if hit is not None:
                 return hit
 
-        # 6. Whole-mount fallback for a file nested deeper than the cheap steps look,
-        # under a folder that isn't the peer's username (e.g. {downloads}/{artist}/
-        # {album}/{file}). Exact basename match across the mount, validated by byte size
-        # when known: a name+size match is effectively the same file, so this can't grab
-        # a different same-named track - an unscoped size-ONLY walk would cross peers
-        # (step 5 stays peer-scoped on purpose). Reached only after every step missed.
+        # 6. Whole-mount exact-name fallback for a file nested deeper than the cheap
+        # steps look. Validate byte size when known.
         def _name_size_match(entry: Path) -> bool:
-            if entry.name != basename:
+            if not _name_matches(entry):
                 return False
-            if not size:
+            if expected_size is None:
                 return True
             try:
-                return entry.stat().st_size == size
+                return entry.stat().st_size == expected_size
             except OSError:
                 return False
 
         hit = self._walk_find(mount, mount, _name_size_match)
         if hit is not None:
             return hit
+
+        # 7. NFC alias fallback. Every normalized phase shares this one budget. The
+        # peer scope is attempted before the whole mount so an alias cannot cross peers
+        # merely because an unrelated same-sized file happens to be encountered first.
+        budget = _EntryBudget(_MAX_WALK_ENTRIES)
+
+        def _find_normalised_in_directory(
+            directory: Path,
+        ) -> tuple[Path | None, str | None, int]:
+            """Return one immediate normalized alias, or ambiguity/exhaustion.
+
+            Returns (hit, fail_kind, fail_count): fail_kind is None to keep
+            looking, "ambiguous" (fail_count = observed alias count) or
+            "budget" (fail_count unused).
+            """
+            root = _within_mount(directory)
+            if root is None or not root.is_dir():
+                return None, None, 0
+            matches: set[Path] = set()
+            try:
+                for entry in root.iterdir():
+                    if not budget.take():
+                        return None, "budget", 0
+                    resolved = _within_mount(entry)
+                    if resolved is None or not resolved.is_file():
+                        continue
+                    if _normalised_filename(entry.name) != normalised_basename:
+                        continue
+                    if expected_size is not None:
+                        try:
+                            if resolved.stat().st_size != expected_size:
+                                continue
+                        except OSError:
+                            continue
+                    matches.add(resolved)
+                    if len(matches) > 1:
+                        return None, "ambiguous", len(matches)
+            except (OSError, RuntimeError):
+                return None, None, 0
+            return (next(iter(matches)) if matches else None), None, 0
+
+        def _walk_find_normalised(root: Path) -> tuple[Path | None, str | None, int]:
+            """Find one normalized alias under root, confined and loop-safe.
+
+            Returns (hit, fail_kind, fail_count) like
+            `_find_normalised_in_directory`. When the size-gated set is empty
+            but the expected size is known, the already-collected in-memory
+            alias set is retried without the size gate: exactly one alias
+            resolves (size rejection is then the verifier's job), zero stays
+            not-found, several fail closed as ambiguous. No new walks, no
+            extra budget entries. Every candidate stays `_within_mount` +
+            regular-file gated. The ungated retry keeps NON-EXACT aliases
+            only: an exact-named file whose bytes mismatch is a stale file
+            from another peer's folder (#397), never a Unicode-drift alias,
+            so with a known size it is refused outright instead of resolving
+            for the verifier to reject.
+            """
+            resolved_root = _within_mount(root)
+            if resolved_root is None or not resolved_root.is_dir():
+                return None, None, 0
+            stack = [resolved_root]
+            seen_dirs: set[Path] = set()
+            matches: set[Path] = set()
+            ungated: set[Path] = set()
+            while stack:
+                current = stack.pop()
+                current = _within_mount(current)
+                if current is None or not current.is_dir() or current in seen_dirs:
+                    continue
+                seen_dirs.add(current)
+                try:
+                    entries = current.iterdir()
+                    for entry in entries:
+                        if not budget.take():
+                            return None, "budget", 0
+                        resolved = _within_mount(entry)
+                        if resolved is None:
+                            continue
+                        if resolved.is_dir():
+                            stack.append(resolved)
+                            continue
+                        if not resolved.is_file():
+                            continue
+                        if _normalised_filename(entry.name) != normalised_basename:
+                            continue
+                        if expected_size is None:
+                            matches.add(resolved)
+                        else:
+                            if entry.name != basename:
+                                # A true (non-exact) alias only: search-advertised
+                                # sizes are unreliable across a Unicode drift, so
+                                # one such alias still resolves for the verifier.
+                                # An exact-named mismatch is a stale peer file
+                                # (#397) and is refused outright.
+                                ungated.add(resolved)
+                            try:
+                                if resolved.stat().st_size != expected_size:
+                                    continue
+                            except OSError:
+                                continue
+                            matches.add(resolved)
+                        if len(matches) > 1:
+                            return None, "ambiguous", len(matches)
+                except (OSError, RuntimeError):
+                    continue
+            if matches:
+                return next(iter(matches)), None, 0
+            if expected_size is not None:
+                if len(ungated) == 1:
+                    return next(iter(ungated)), None, 0
+                if len(ungated) > 1:
+                    return None, "ambiguous", len(ungated)
+            return None, None, 0
+
+        def _log_unlocatable(kind: str, count: int = 0) -> None:
+            """Log a fail-closed miss with the minimal shape: basename, size (or
+            "unknown"), and the top-level entry count only. Ambiguity adds the
+            observed candidate count; budget exhaustion adds a flag. Never
+            candidate paths, usernames, hosts, secrets, remote full paths, or
+            exception text."""
+            try:
+                top_level = sum(1 for _ in mount.iterdir())
+            except (OSError, RuntimeError):
+                top_level = -1
+            if kind == "budget":
+                logger.warning(
+                    "slskd file not locatable on the downloads mount: %s (%s bytes); "
+                    "%d top-level entries under the mount - entry budget exhausted, "
+                    "refusing to guess",
+                    basename,
+                    size if size else "unknown",
+                    top_level,
+                )
+            elif kind == "ambiguous":
+                logger.warning(
+                    "slskd file not locatable on the downloads mount: %s (%s bytes); "
+                    "%d top-level entries under the mount - ambiguous=%d, "
+                    "refusing to guess",
+                    basename,
+                    size if size else "unknown",
+                    top_level,
+                    count,
+                )
+            else:
+                logger.warning(
+                    "slskd file not locatable on the downloads mount: %s (%s bytes); "
+                    "%d top-level entries under the mount - the on-disk layout may nest deeper "
+                    "or sanitise names beyond what get_file_path handles",
+                    basename,
+                    size if size else "unknown",
+                    top_level,
+                )
+
+        # Keep direct-directory aliases ahead of recursive fallback; these are the
+        # layouts slskd most commonly produces.
+        if len(parts) >= 2:
+            hit, fail_kind, fail_count = _find_normalised_in_directory(mount / parts[-2])
+            if hit is not None:
+                return hit
+            if fail_kind is not None:
+                _log_unlocatable(fail_kind, fail_count)
+                return None
+        hit, fail_kind, fail_count = _find_normalised_in_directory(mount)
+        if hit is not None:
+            return hit
+        if fail_kind is not None:
+            _log_unlocatable(fail_kind, fail_count)
+            return None
+
+        if user_root is not None and user_root.is_dir():
+            hit, fail_kind, fail_count = _walk_find_normalised(user_root)
+            if hit is not None:
+                return hit
+            if fail_kind is not None:
+                _log_unlocatable(fail_kind, fail_count)
+                return None
+
+        hit, fail_kind, fail_count = _walk_find_normalised(mount)
+        if hit is not None:
+            return hit
+        if fail_kind is not None:
+            _log_unlocatable(fail_kind, fail_count)
+            return None
+        # 8-9. Fuzzy basename fallback for peers that advertise a flat
+        # "Artist - Album - NN - Title" name while slskd files the download as
+        # "NN. Title" inside an album folder (issue #229). Fail-closed like the
+        # NFC phases: confined to the mount, regular files only, sharing the
+        # same budget, and a hit only when exactly one candidate matches
+        # (ambiguity or budget exhaustion returns None). The peer scope runs
+        # first so a same-titled file from another peer cannot shadow it; the
+        # mount-wide sweep stays behind a mandatory exact byte-size gate.
+        expected_fuzzy_key = _fuzzy_file_key(basename)
+
+        def _walk_find_fuzzy(
+            root: Path, require_size: bool
+        ) -> tuple[Path | None, str | None, int]:
+            """Collect fuzzy basename matches under root, confined and loop-safe.
+
+            Returns (hit, fail_kind, fail_count) like
+            `_find_normalised_in_directory`.
+            """
+            resolved_root = _within_mount(root)
+            if resolved_root is None or not resolved_root.is_dir():
+                return None, None, 0
+            stack = [resolved_root]
+            seen_dirs: set[Path] = set()
+            matches: set[Path] = set()
+            while stack:
+                current = stack.pop()
+                current = _within_mount(current)
+                if current is None or not current.is_dir() or current in seen_dirs:
+                    continue
+                seen_dirs.add(current)
+                try:
+                    entries = current.iterdir()
+                    for entry in entries:
+                        if not budget.take():
+                            return None, "budget", 0
+                        resolved = _within_mount(entry)
+                        if resolved is None:
+                            continue
+                        if resolved.is_dir():
+                            stack.append(resolved)
+                            continue
+                        if not resolved.is_file():
+                            continue
+                        if not _fuzzy_keys_match(expected_fuzzy_key, entry.name):
+                            continue
+                        if expected_size is not None:
+                            try:
+                                if resolved.stat().st_size != expected_size:
+                                    continue
+                            except OSError:
+                                continue
+                        elif require_size:
+                            continue
+                        matches.add(resolved)
+                        if len(matches) > 1:
+                            return None, "ambiguous", len(matches)
+                except (OSError, RuntimeError):
+                    continue
+            return (next(iter(matches)) if matches else None), None, 0
+
+        # 8. Peer-scoped fuzzy: size gates only when the expected size is known.
+        if user_root is not None and user_root.is_dir():
+            hit, fail_kind, fail_count = _walk_find_fuzzy(user_root, require_size=False)
+            if hit is not None:
+                return hit
+            if fail_kind is not None:
+                _log_unlocatable(fail_kind, fail_count)
+                return None
+
+        # 9. Mount-wide fuzzy: meaningless without a size gate, so skipped
+        # entirely when the expected size is unknown.
+        if expected_size is not None:
+            hit, fail_kind, fail_count = _walk_find_fuzzy(mount, require_size=True)
+            if hit is not None:
+                return hit
+            if fail_kind is not None:
+                _log_unlocatable(fail_kind, fail_count)
+                return None
+
+        _log_unlocatable("none")
+        return None
+
+    async def locate_partial(
+        self, handle: TaskHandle, remote_filename: str, size: int | None = None
+    ) -> Path | None:
+        """Basename-keyed partial fallback confined to the incomplete mount, OFF the
+        event loop.
+
+        Never called by ``get_file_path`` (which stays byte-identical): only the
+        verifier's retry-signal path consults it, and only for subset imports.
+        Returns the single matching partial file, or None when the mount is
+        unset/unusable, the name is absent, or several same-named partials exist.
+        """
+        return await asyncio.to_thread(
+            self._locate_partial, handle.username, remote_filename, size
+        )
+
+    def _locate_partial(
+        self, username: str, remote_filename: str, size: int | None = None
+    ) -> Path | None:
+        """Find stranded partial bytes by exact basename (then NFC alias at most).
+
+        ``username`` is intentionally ignored: slskd's incomplete layout
+        (``incomplete/<album>/<file>``) is not username-scoped, so the safe key
+        is the basename plus exactly-one confinement. No fuzzy phase, no
+        size-only phase. The expected size is recorded for the log line only:
+        partial files are short by definition, so an equality gate would never
+        hit. An unknown size still allows the direct probes but skips the
+        recursive sweep (the phase-9 require_size discipline).
+        """
+        root_setting = self._incomplete_mount
+        if root_setting is None:
+            return None
+        raw_parts = re.split(r"[\\/]", remote_filename)
+        if any(part == ".." for part in raw_parts):
+            return None
+        parts = [part for part in raw_parts if part and part != "."]
+        if not parts:
+            return None
         try:
-            top_level = sum(1 for _ in mount.iterdir())
-        except OSError:
-            top_level = -1
-        logger.warning(
-            "slskd file not locatable on the downloads mount: %s (%s bytes); "
-            "%d top-level entries under the mount - the on-disk layout may nest deeper "
-            "or sanitise names beyond what get_file_path handles",
+            incomplete = root_setting.resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not incomplete.is_dir() or not os.access(incomplete, os.R_OK):
+            return None
+        basename = parts[-1]
+        normalised_basename = _normalised_filename(basename)
+        size_label = size if size else "unknown"
+
+        def _within_incomplete(candidate: Path) -> Path | None:
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                return None
+            if not resolved.is_relative_to(incomplete):
+                logger.warning(
+                    "slskd path escapes the incomplete mount: %r", basename
+                )
+                return None
+            return resolved
+
+        def _log_partial(kind: str, count: int = 0) -> None:
+            """Fail-closed log with the minimal shape: basename, size (or
+            "unknown"), and the observed candidate count. Never paths,
+            usernames, hosts, secrets, or exception text."""
+            if kind == "ambiguous":
+                logger.warning(
+                    "slskd partial file not usable from the incomplete mount: %s "
+                    "(%s bytes) - ambiguous=%d, refusing to guess",
+                    basename,
+                    size_label,
+                    count,
+                )
+            elif kind == "budget":
+                logger.warning(
+                    "slskd partial file not usable from the incomplete mount: %s "
+                    "(%s bytes) - entry budget exhausted, refusing to guess",
+                    basename,
+                    size_label,
+                )
+
+        def _log_hit(path: Path) -> Path:
+            try:
+                on_disk = path.stat().st_size
+            except OSError:
+                on_disk = size_label
+            logger.info(
+                "slskd partial bytes found in the incomplete mount: %s (%s bytes)",
+                basename,
+                on_disk,
+            )
+            return path
+
+        # Direct probes: the flat file and the one-level album-dir layout
+        # (incomplete/<album>/<file>) slskd most commonly produces.
+        direct: set[Path] = set()
+        flat = _within_incomplete(incomplete / basename)
+        if flat is not None and flat.is_file():
+            direct.add(flat)
+        try:
+            children = sorted(incomplete.iterdir(), key=lambda path: path.name)
+        except (OSError, RuntimeError):
+            children = []
+        for child in children:
+            child_root = _within_incomplete(child)
+            if child_root is None or not child_root.is_dir():
+                continue
+            cand = _within_incomplete(child_root / basename)
+            if cand is not None and cand.is_file():
+                direct.add(cand)
+        if len(direct) > 1:
+            _log_partial("ambiguous", len(direct))
+            return None
+        if direct:
+            return _log_hit(next(iter(direct)))
+
+        if size is None or size <= 0:
+            logger.debug(
+                "slskd partial file not in the incomplete mount: %s (%s bytes)",
+                basename,
+                size_label,
+            )
+            return None
+
+        # Recursive exact-then-NFC sweep with its own budget (never shared with
+        # the complete-mount phases, which may already be exhausted). Exactly
+        # one basename match resolves; several fail closed as ambiguous.
+        budget = _EntryBudget(_MAX_WALK_ENTRIES)
+        exact: set[Path] = set()
+        aliased: set[Path] = set()
+        stack = [incomplete]
+        seen_dirs: set[Path] = set()
+        while stack:
+            current = stack.pop()
+            current = _within_incomplete(current)
+            if current is None or not current.is_dir() or current in seen_dirs:
+                continue
+            seen_dirs.add(current)
+            try:
+                entries = current.iterdir()
+                for entry in entries:
+                    if not budget.take():
+                        _log_partial("budget")
+                        return None
+                    resolved = _within_incomplete(entry)
+                    if resolved is None:
+                        continue
+                    if resolved.is_dir():
+                        stack.append(resolved)
+                        continue
+                    if not resolved.is_file():
+                        continue
+                    if entry.name == basename:
+                        exact.add(resolved)
+                        if len(exact) > 1:
+                            _log_partial("ambiguous", len(exact))
+                            return None
+                    elif _normalised_filename(entry.name) == normalised_basename:
+                        aliased.add(resolved)
+            except (OSError, RuntimeError):
+                continue
+        if exact:
+            return _log_hit(next(iter(exact)))
+        if len(aliased) > 1:
+            _log_partial("ambiguous", len(aliased))
+            return None
+        if aliased:
+            return _log_hit(next(iter(aliased)))
+        logger.debug(
+            "slskd partial file not in the incomplete mount: %s (%s bytes)",
             basename,
-            size if size else "unknown",
-            top_level,
+            size_label,
         )
         return None
 
     @staticmethod
     def _walk_find(root: Path, mount: Path, predicate) -> Path | None:
-        """First file under ``root`` (bounded DFS, exact-name compare so glob
-        metacharacters in filenames are harmless) for which ``predicate`` is true,
-        confined to ``mount``. The entry cap is a backstop against a pathological
-        tree or a symlink loop."""
-        max_entries = 10000
+        """Find the first matching regular file under ``root``.
+
+        Directory traversal is bounded, confined to the resolved mount, and keyed by
+        resolved directory paths so in-mount symlink loops cannot revisit forever.
+        """
         try:
-            stack = [root]
-            seen = 0
+            mount = mount.resolve()
+            root = root.resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not root.is_relative_to(mount) or not root.is_dir():
+            return None
+        stack = [root]
+        seen_dirs: set[Path] = set()
+        seen = 0
+        try:
             while stack:
-                for entry in stack.pop().iterdir():
+                current = stack.pop().resolve()
+                if (
+                    not current.is_relative_to(mount)
+                    or not current.is_dir()
+                    or current in seen_dirs
+                ):
+                    continue
+                seen_dirs.add(current)
+                for entry in current.iterdir():
                     seen += 1
-                    if seen > max_entries:
+                    if seen > _MAX_WALK_ENTRIES:
                         return None
-                    if entry.is_dir():
-                        stack.append(entry)
-                        continue
-                    if not entry.is_file() or not predicate(entry):
-                        continue
                     resolved = entry.resolve()
-                    if resolved.is_relative_to(mount):
-                        return resolved
-        except OSError:
+                    if not resolved.is_relative_to(mount):
+                        continue
+                    if resolved.is_dir():
+                        stack.append(resolved)
+                        continue
+                    if not resolved.is_file() or not predicate(entry):
+                        continue
+                    return resolved
+        except (OSError, RuntimeError):
             return None
         return None
 
@@ -422,18 +1030,33 @@ class SlskdRepository:
         hit). An unreadable or wrong-path mount returns False - that is the signal.
         Sync filesystem I/O; the caller offloads it off the event loop."""
         try:
-            stack = [self._downloads_mount]
+            mount = self._downloads_mount.resolve()
+            if not mount.is_dir():
+                return False
+            stack = [mount]
+            seen_dirs: set[Path] = set()
             seen = 0
             while stack:
-                for entry in stack.pop().iterdir():
+                current = stack.pop().resolve()
+                if (
+                    not current.is_relative_to(mount)
+                    or not current.is_dir()
+                    or current in seen_dirs
+                ):
+                    continue
+                seen_dirs.add(current)
+                for entry in current.iterdir():
                     seen += 1
                     if seen > 5000:
                         return True  # clearly not empty
-                    if entry.is_file():
+                    resolved = entry.resolve()
+                    if not resolved.is_relative_to(mount):
+                        continue
+                    if resolved.is_file():
                         return True
-                    if entry.is_dir():
-                        stack.append(entry)
-        except OSError:
+                    if resolved.is_dir():
+                        stack.append(resolved)
+        except (OSError, RuntimeError):
             return False
         return False
 
@@ -473,9 +1096,37 @@ class SlskdRepository:
         return SlskdRepository._sanitize_query(" - ".join(parts))
 
     @staticmethod
+    def _primary_artist(artist: str) -> str:
+        """First credited artist of a joined credit string.
+
+        MusicBrainz joins multi-artist credits (``"YMO, 吉沢典夫"``) but
+        Soulseek ANDs every query word, so each extra credit is another term
+        no peer path contains. Query rungs use only the primary artist - the
+        scorer still receives the full credit, so the remote-path artist
+        auto-accept gate is unaffected."""
+        first = artist.split(",", 1)[0].strip()
+        return first if first else artist
+
+    @staticmethod
+    def _stripped_album_title(album: str) -> str:
+        """Album title without edition parentheticals or a subtitle tail.
+
+        ``Euphoria (International Edition)`` -> ``Euphoria``;
+        ``Devil May Cry: Season 2 (Soundtrack from the Netflix Series)`` ->
+        ``Devil May Cry``. Last-resort rungs only: the scorer still narrows
+        the broader result set back down."""
+        stripped = re.sub(r"\([^()]*\)", " ", album)
+        stripped = re.sub(r"\[[^\[\]]*\]", " ", stripped)
+        stripped = stripped.split(":", 1)[0]
+        return " ".join(stripped.split())
+
+    @staticmethod
     def _album_query_ladder(artist: str, album: str, year: int | None) -> list[str]:
         """Most-specific-first album queries: artist+album+year -> artist+album
-        -> artist. The broadest rung relies on the preflight scorer to narrow the
+        -> edition-stripped title rungs -> artist. Every rung queries the
+        primary credited artist only: Soulseek ANDs all terms, so a full
+        multi-artist credit zeroes albums the network holds (issue #373).
+        The broadest rungs rely on the preflight scorer to narrow the
         larger result set back down - by containment title matching, and auto-accept
         additionally requires the artist to be named in a candidate's remote path
         (title tokens alone are NOT enough: a broad rung once matched a wrong-artist
@@ -486,29 +1137,46 @@ class SlskdRepository:
         because wildcards degrade matching on some clients; the wildcard
         sibling comes before broadening so a blocked artist still gets the
         most specific query that can return anything."""
-        wc = SlskdRepository._wildcard_artist(SlskdRepository._sanitize_query(artist))
-        return SlskdRepository._dedupe_queries(
+        primary = SlskdRepository._primary_artist(artist)
+        wc = SlskdRepository._wildcard_artist(SlskdRepository._sanitize_query(primary))
+        queries = [
+            SlskdRepository._build_album_query(primary, album, year),
+            SlskdRepository._build_album_query(wc, album, year),
+            SlskdRepository._build_album_query(primary, album, None),
+            SlskdRepository._build_album_query(wc, album, None),
+        ]
+        stripped = SlskdRepository._stripped_album_title(album)
+        if stripped and stripped != " ".join(album.split()):
+            queries.extend(
+                [
+                    SlskdRepository._build_album_query(primary, stripped, year),
+                    SlskdRepository._build_album_query(wc, stripped, year),
+                    SlskdRepository._build_album_query(primary, stripped, None),
+                    SlskdRepository._build_album_query(wc, stripped, None),
+                ]
+            )
+        queries.extend(
             [
-                SlskdRepository._build_album_query(artist, album, year),
-                SlskdRepository._build_album_query(wc, album, year),
-                SlskdRepository._build_album_query(artist, album, None),
-                SlskdRepository._build_album_query(wc, album, None),
-                SlskdRepository._sanitize_query(artist),
+                SlskdRepository._sanitize_query(primary),
                 wc,
             ]
         )
+        return SlskdRepository._dedupe_queries(queries)
 
     @staticmethod
     def _track_query_ladder(artist: str, track: str, album: str | None) -> list[str]:
         """Most-specific-first track queries: artist+track+album -> artist+track.
         Keeps the track title at every rung so the TrackMatcher can match.
+        Queries the primary credited artist only (same AND-zeroing defect as
+        ``_album_query_ladder``, issue #373).
         Wildcard blocked-artist variants interleave as in ``_album_query_ladder``."""
-        wc = SlskdRepository._wildcard_artist(SlskdRepository._sanitize_query(artist))
+        primary = SlskdRepository._primary_artist(artist)
+        wc = SlskdRepository._wildcard_artist(SlskdRepository._sanitize_query(primary))
         return SlskdRepository._dedupe_queries(
             [
-                SlskdRepository._build_track_query(artist, track, album),
+                SlskdRepository._build_track_query(primary, track, album),
                 SlskdRepository._build_track_query(wc, track, album),
-                SlskdRepository._build_track_query(artist, track, None),
+                SlskdRepository._build_track_query(primary, track, None),
                 SlskdRepository._build_track_query(wc, track, None),
             ]
         )
@@ -625,10 +1293,98 @@ class SlskdRepository:
         failed = set(names(result.failed))
         return [f for f in requested if f not in failed] if failed else requested
 
+    @staticmethod
+    def _transfer_recency(transfer: SlskdTransfer) -> datetime:
+        """Best-effort recency key for one transfer record: RequestedAt first,
+        falling back to StartedAt (requestedAt is absent/mixed across slskd
+        versions, PR #222). Absent or unparseable values rank as the oldest
+        possible instant, so any parseable timestamp beats a missing one; naive
+        timestamps read as UTC. slskd's ``id`` is a GUID - not monotonic - so it
+        carries no recency signal."""
+        for value in (transfer.requested_at, transfer.started_at):
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                continue
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return _NO_TIMESTAMP
+
+    @staticmethod
+    def _match_transfers(
+        handle: TaskHandle,
+        transfers: list[SlskdTransfer],
+    ) -> list[SlskdTransfer]:
+        """Match transfer records to handle filenames without merging spellings.
+
+        Each handle filename claims all records with its exact transfer path key
+        (path separators normalised, Unicode unchanged). If no exact spelling is
+        present, it may claim the NFC-equivalent records only when those records
+        have one distinct exact spelling. A transfer record can be assigned only
+        once when multiple handle filenames overlap.
+        """
+        exact: dict[str, list[int]] = {}
+        nfc: dict[str, dict[str, list[int]]] = {}
+        for index, transfer in enumerate(transfers):
+            exact_key = _exact_transfer_path(transfer.filename)
+            exact.setdefault(exact_key, []).append(index)
+            nfc_key = _normalised_path(transfer.filename)
+            nfc.setdefault(nfc_key, {}).setdefault(exact_key, []).append(index)
+
+        assigned: set[int] = set()
+        for filename in handle.filenames:
+            exact_key = _exact_transfer_path(filename)
+            exact_matches = exact.get(exact_key)
+            if exact_matches is not None:
+                assigned.update(exact_matches)
+
+        for filename in handle.filenames:
+            exact_key = _exact_transfer_path(filename)
+            if exact_key in exact:
+                continue
+            spellings = nfc.get(_normalised_path(filename), {})
+            if len(spellings) == 1:
+                assigned.update(next(iter(spellings.values())))
+
+        return [transfer for index, transfer in enumerate(transfers) if index in assigned]
+
+
+    @staticmethod
+    def _latest_transfer_per_file(
+        transfers: list[SlskdTransfer],
+    ) -> list[SlskdTransfer]:
+        """Collapse records to the LATEST attempt per unique file (#131/#253):
+        slskd appends one record per retry attempt, so raw counts double-count
+        retried files and let a stale Succeeded row shadow a newer TimedOut/
+        Errored one (and vice versa). Highest recency key wins; exact ties -
+        including two untimestamped/garbage-stamped records - fall through to
+        list order, where the later record wins. Filenames use exact transfer
+        path keys; winners keep their original input order.
+        """
+        best: dict[str, tuple[datetime, int, SlskdTransfer]] = {}
+        for index, transfer in enumerate(transfers):
+            key = _exact_transfer_path(transfer.filename)
+            recency = SlskdRepository._transfer_recency(transfer)
+            incumbent = best.get(key)
+            if incumbent is None or recency >= incumbent[0]:
+                best[key] = (recency, index, transfer)
+        return [entry[2] for entry in sorted(best.values(), key=lambda entry: entry[1])]
+
     def _aggregate_status(
         self, handle: TaskHandle, transfers: list[SlskdTransfer]
     ) -> DownloadTaskStatus:
+        """Per-file status from matched transfer records. File-level verdicts
+        (completed/failed counts, succeeded_filenames, terminal states) judge
+        each file ONLY by its LATEST attempt; byte totals deliberately stay
+        sum-over-all-records so cumulative progress keeps counting prior attempts.
+        A "succeeded" flag only counts when the transfer moved at least ``size``
+        bytes (size known positive); a short succeeded record is a truncated stub
+        (#122): failed when terminal, non-terminal when still active. Unknown or
+        non-positive sizes fail open to the flag verdict."""
         files_total = len(handle.filenames)
+        # Byte totals stay sum-over-all-records (see docstring): each attempt's bytes
+        # count toward cumulative progress, sizes likewise sum across retry attempts.
         bytes_total = sum(t.size for t in transfers)
         bytes_downloaded = sum(t.bytes_transferred for t in transfers)
         completed = 0
@@ -636,13 +1392,28 @@ class SlskdRepository:
         succeeded_filenames: list[str] = []
         has_active_transfer = False
         queue_positions: list[int] = []
-        for transfer in transfers:
+
+        # Judge each FILE by its LATEST attempt, never by raw record counts.
+        latest_per_file = SlskdRepository._latest_transfer_per_file(transfers)
+        for transfer in latest_per_file:
             flags = self._state_flags(transfer.state)
             if transfer.place_in_queue is not None and transfer.place_in_queue >= 0:
                 queue_positions.append(transfer.place_in_queue)
             if "succeeded" in flags:
-                completed += 1
-                succeeded_filenames.append(transfer.filename)
+                size = transfer.size
+                size_known = isinstance(size, (int, float)) and size > 0
+                moved = transfer.bytes_transferred
+                moved_value = moved if isinstance(moved, (int, float)) else 0
+                if size_known and moved_value < size:
+                    # Truncated stub flagged succeeded: never importable. Still
+                    # active -> stay non-terminal; terminal -> fail over/retries.
+                    if flags & {"inprogress", "initializing"}:
+                        has_active_transfer = True
+                    else:
+                        failed += 1
+                else:
+                    completed += 1
+                    succeeded_filenames.append(transfer.filename)
             elif flags & {
                 "errored",
                 "cancelled",
@@ -657,14 +1428,13 @@ class SlskdRepository:
                 failed += 1
             elif flags & {"inprogress", "initializing"}:
                 has_active_transfer = True
-
         progress = (bytes_downloaded / bytes_total * 100.0) if bytes_total else 0.0
 
         # Terminal only once every enqueued file has a terminal matched transfer,
         # so a not-yet-materialised record can't trigger a premature terminal state.
         all_terminal = (
             bool(transfers)
-            and (completed + failed) == len(transfers)
+            and (completed + failed) == len(latest_per_file)
             and (completed + failed) >= files_total > 0
         )
         if all_terminal and failed == 0 and completed == files_total:

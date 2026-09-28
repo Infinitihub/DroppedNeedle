@@ -73,6 +73,13 @@ _MAX_EMBEDDED_ART_PIXELS = 100_000_000
 _SNAPSHOT_VERSION = 1
 _ADAPTER_VERSION = "1"
 
+# F-NL-03: single shared admitted-audio-extension set (formerly the private
+# _AUDIO_SUFFIXES mirror in library_manager). Importers, upload validation,
+# and drop-import all admit exactly these containers.
+AUDIO_SUFFIXES = frozenset(
+    {".flac", ".mp3", ".m4a", ".m4b", ".mp4", ".ogg", ".oga", ".opus", ".wav"}
+)
+
 AUDIO_EXTENSION_FORMATS: dict[str, AudioContainer] = {
     ".flac": "flac",
     ".mp3": "mp3",
@@ -2321,6 +2328,23 @@ class AudioMetadataEngine:
         return restore_snapshot(self, staged_path, snapshot)
 
 
+def _lossless_bit_depth(detected_format: str | None, technical) -> int | None:
+    """Meaningful bit depth, or None when the container/codec proves nothing.
+
+    F-EDITION-04: FLAC/WAV always carry a real depth. An MP4-family file
+    (m4a/mp4/mov) is ALAC - and therefore lossless - only when the codec
+    evidence says so; AAC's synthetic 16-bit Mutagen value stays suppressed.
+    """
+    fmt = detected_format or ""
+    if fmt in {"flac", "wav"}:
+        return technical.bit_depth
+    if fmt in {"m4a", "mp4", "mov"}:
+        codec = str(getattr(technical, "codec", "") or "").lower()
+        if codec.startswith("alac"):
+            return technical.bit_depth
+    return None
+
+
 def legacy_audio_projection(
     document: ReadAudioDocument,
 ) -> tuple[AudioTag, AudioInfo]:
@@ -2342,6 +2366,12 @@ def legacy_audio_projection(
         )
 
     compilation = metadata.value_for("compilation")
+    release_type_raw = metadata.value_for("release_type")
+    if isinstance(release_type_raw, tuple):
+        release_type_raw = release_type_raw[0] if release_type_raw else None
+    release_type = (
+        release_type_raw.strip() or None if isinstance(release_type_raw, str) else None
+    )
     tag = AudioTag(
         title=scalar("title") or "",
         artist=metadata.artist_display or (artist_names[0] if artist_names else ""),
@@ -2363,6 +2393,7 @@ def legacy_audio_projection(
         musicbrainz_album_artist_id=(album_artist_ids[0] if album_artist_ids else None),
         acoustid_id=scalar("acoustid_id"),
         compilation=compilation if isinstance(compilation, bool) else False,
+        release_type=release_type,
         title_sort=scalar("title_sort"),
         artist_sort=(metadata.strings_for("artist_sort") or (None,))[0],
         album_sort=scalar("album_sort"),
@@ -2433,10 +2464,8 @@ def legacy_audio_projection(
         channels=technical.channels,
         file_format=document.probe.detected_format or "unknown",
         file_size_bytes=technical.file_size_bytes,
-        bit_depth=(
-            technical.bit_depth
-            if document.probe.detected_format in {"flac", "wav"}
-            else None
+        bit_depth=_lossless_bit_depth(
+            document.probe.detected_format, technical
         ),
     )
     return tag, info

@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { Github } from 'lucide-svelte';
+	import GitHubIcon from '$lib/components/GitHubIcon.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { getVersionQuery } from '$lib/queries/VersionQuery.svelte';
 
 	const GITHUB_URL = 'https://github.com/DroppedNeedle/DroppedNeedle';
@@ -18,7 +19,7 @@
 <footer class="ms-footer grain" aria-label="Site footer">
 	<div class="ms-footer__inner">
 		<div class="ms-footer__brand">
-			<img src="/logo_wide_white.png" alt="DroppedNeedle" class="ms-footer__logo" />
+			<img src={withBasePath('/logo_wide_white.png')} alt="DroppedNeedle" class="ms-footer__logo" />
 		</div>
 
 		<div class="ms-footer__rule" aria-hidden="true"></div>
@@ -27,7 +28,7 @@
 			<span class="ms-footer__tag">Your Music. Your Way.</span>
 			<div class="ms-footer__links">
 				<a class="ms-footer__link" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
-					<Github class="h-4 w-4" />
+					<GitHubIcon class="h-4 w-4" />
 					<span>GitHub</span>
 				</a>
 				{#if versionLabel}

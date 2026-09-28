@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { Check, Download, Headphones, Loader2, Play, Volume2 } from 'lucide-svelte';
+	import { Check, Download, Headphones, LoaderCircle, Play, Volume2 } from 'lucide-svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import { deckSampler, type SampleEntry } from '$lib/stores/deckSampler.svelte';
 	import { integrationStore } from '$lib/stores/integration';
 	import { libraryStore } from '$lib/stores/library';
-	import { requestAlbum } from '$lib/utils/albumRequest';
+	import { requestAlbum } from '$lib/queries/downloads/DownloadMutations.svelte';
 	import { albumHrefOrNull } from '$lib/utils/entityRoutes';
 	import type { HomeAlbum, HomeSection, TopPicksSection } from '$lib/types';
 	import LiveUpdatingBadge from '$lib/components/LiveUpdatingBadge.svelte';
@@ -77,15 +77,20 @@
 		deckSampler.startStation('Listening Lounge', pool.map(albumEntry));
 	}
 
+	const loungeRequest = requestAlbum();
+
 	async function requestActive() {
 		if (!activeAlbum?.mbid || requesting) return;
 		requesting = true;
 		try {
-			await requestAlbum(activeAlbum.mbid, {
-				artist: activeAlbum.artist_name ?? undefined,
-				album: activeAlbum.name,
-				artistMbid: activeAlbum.artist_mbid ?? undefined
-			});
+			await loungeRequest
+				.mutateAsync({
+					release_group_mbid: activeAlbum.mbid,
+					artist_name: activeAlbum.artist_name ?? undefined,
+					album_title: activeAlbum.name,
+					artist_mbid: activeAlbum.artist_mbid ?? undefined
+				})
+				.catch(() => null);
 		} finally {
 			requesting = false;
 		}
@@ -165,7 +170,7 @@
 								: 'group-hover/card:bg-black/25'}"
 						>
 							{#if isActive && deckSampler.status === 'loading'}
-								<Loader2 class="h-8 w-8 animate-spin text-white drop-shadow" />
+								<LoaderCircle class="h-8 w-8 animate-spin text-white drop-shadow" />
 							{:else if isActive}
 								<svg viewBox="0 0 40 40" class="h-12 w-12 -rotate-90 drop-shadow">
 									<circle
@@ -235,7 +240,7 @@
 						disabled={requesting || activeRequested}
 					>
 						{#if requesting}
-							<Loader2 class="h-3.5 w-3.5 animate-spin" />
+							<LoaderCircle class="h-3.5 w-3.5 animate-spin" />
 						{:else if activeRequested}
 							<Check class="h-3.5 w-3.5" />
 						{:else}

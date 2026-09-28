@@ -3,7 +3,7 @@
 	import type { Snippet } from 'svelte';
 	import {
 		ArrowRight,
-		CheckCircle2,
+		CircleCheckBig,
 		CircleAlert,
 		Disc3,
 		Link2,
@@ -11,6 +11,8 @@
 		RefreshCw
 	} from 'lucide-svelte';
 	import { reveal } from '$lib/actions/reveal';
+	import { withBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 
 	interface Props {
 		playlists?: SourcePlaylistSummary[];
@@ -46,6 +48,7 @@
 			.slice(0, 4)
 			.map((playlist) => playlist.cover_url)
 			.filter(Boolean)
+			.map((url) => getApiUrl(url))
 	);
 	let progressPct = $derived(totalCount > 0 ? (importedCount / totalCount) * 100 : 0);
 
@@ -158,7 +161,7 @@
 						</a>
 					{/if}
 					{#if (!hasError && (accountMode === 'shared' || totalCount === 0)) || relinkRequired}
-						<a class="btn btn-ghost btn-sm gap-2" href="/profile#media-accounts">
+						<a class="btn btn-ghost btn-sm gap-2" href={withBasePath('/profile#media-accounts')}>
 							<Link2 class="h-4 w-4" />
 							{relinkRequired
 								? `Reconnect ${sourceLabel}`
@@ -202,7 +205,7 @@
 				</svg>
 				<div class="absolute inset-0 flex items-center justify-center">
 					{#if allImported}
-						<CheckCircle2 class="h-6 w-6 text-success" />
+						<CircleCheckBig class="h-6 w-6 text-success" />
 					{:else}
 						<span class="text-xs font-bold tabular-nums text-base-content/70">
 							{importedCount}/{totalCount}

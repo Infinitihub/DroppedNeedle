@@ -13,6 +13,7 @@
 	import AudioQualityBadge from '$lib/components/AudioQualityBadge.svelte';
 	import NowPlayingIndicator from '$lib/components/NowPlayingIndicator.svelte';
 	import { getCoverUrl } from '$lib/utils/errorHandling';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { getLyricsQuery } from '$lib/queries/lyrics/LyricsQuery.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getNavidromeFolderScopeRevision } from '$lib/utils/navidromeLibraryCache';
@@ -22,7 +23,7 @@
 		Disc3,
 		Shuffle,
 		SkipBack,
-		AlertCircle,
+		CircleAlert,
 		Pause,
 		Play,
 		SkipForward,
@@ -148,16 +149,18 @@
 						<p class="text-sm font-semibold truncate">{playerStore.nowPlaying.trackName}</p>
 						<p class="text-xs opacity-60 truncate">
 							{#if isAlbumLinkable(playerStore.nowPlaying.albumId)}
-								<a href="/album/{playerStore.nowPlaying.albumId}" class="hover:underline"
-									>{playerStore.nowPlaying.albumName}</a
+								<a
+									href={withBasePath(`/album/${playerStore.nowPlaying.albumId}`)}
+									class="hover:underline">{playerStore.nowPlaying.albumName}</a
 								>
 							{:else}
 								{playerStore.nowPlaying.albumName}
 							{/if}
 							-
 							{#if playerStore.nowPlaying.artistId}
-								<a href="/artist/{playerStore.nowPlaying.artistId}" class="hover:underline"
-									>{playerStore.nowPlaying.artistName}</a
+								<a
+									href={withBasePath(`/artist/${playerStore.nowPlaying.artistId}`)}
+									class="hover:underline">{playerStore.nowPlaying.artistName}</a
 								>
 							{:else}
 								{playerStore.nowPlaying.artistName}
@@ -166,8 +169,9 @@
 					{:else}
 						<p class="text-sm font-semibold truncate">
 							{#if isAlbumLinkable(playerStore.nowPlaying.albumId)}
-								<a href="/album/{playerStore.nowPlaying.albumId}" class="hover:underline"
-									>{playerStore.nowPlaying.albumName}</a
+								<a
+									href={withBasePath(`/album/${playerStore.nowPlaying.albumId}`)}
+									class="hover:underline">{playerStore.nowPlaying.albumName}</a
 								>
 							{:else}
 								{playerStore.nowPlaying.albumName}
@@ -175,8 +179,9 @@
 						</p>
 						<p class="text-xs opacity-60 truncate">
 							{#if playerStore.nowPlaying.artistId}
-								<a href="/artist/{playerStore.nowPlaying.artistId}" class="hover:underline"
-									>{playerStore.nowPlaying.artistName}</a
+								<a
+									href={withBasePath(`/artist/${playerStore.nowPlaying.artistId}`)}
+									class="hover:underline">{playerStore.nowPlaying.artistName}</a
 								>
 							{:else}
 								{playerStore.nowPlaying.artistName}
@@ -233,7 +238,7 @@
 								: 'Play'}
 					>
 						{#if playerStore.playbackState === 'error'}
-							<AlertCircle class="h-5 w-5" />
+							<CircleAlert class="h-5 w-5" />
 						{:else if playerStore.isBuffering}
 							<span class="loading loading-spinner loading-sm"></span>
 						{:else if playerStore.isPlaying}

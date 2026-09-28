@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import {
-		AlertTriangle,
+		TriangleAlert,
 		ArrowLeft,
 		Check,
 		CircleDot,
@@ -22,11 +22,13 @@
 	import ContributionMusicBrainzReview from '$lib/components/library/ContributionMusicBrainzReview.svelte';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { getLibraryContributionQuery } from '$lib/queries/libraryContributions/LibraryContributionQueries.svelte';
+	import { invalidateLibraryCatalog } from '$lib/queries/library/LibraryCatalogInvalidation';
 	import {
 		cancelLibraryContributionMutation,
 		rebuildLibraryContributionMutation,
 		updateLibraryContributionMutation
 	} from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	let { data }: { data: PageData } = $props();
 	const contributionQuery = getLibraryContributionQuery(() => data.contributionId);
@@ -70,6 +72,33 @@
 			loadedDraft = structuredClone(contribution.draft);
 			loadedRevision = contribution.row_revision;
 		}
+	});
+
+	// Catalog views (library grid, artist pages, home, discover) change exactly
+	// once per contribution: when the album lands as `linked`. Track the observed
+	// state per contribution id so the sweep fires once on the non-linked →
+	// linked transition (poll-detected server-side verification included), and
+	// never on plain revisits of an already-linked contribution. Explicit
+	// client-initiated links also sweep via attachExistingMusicBrainzReleaseMutation.
+	let lastObservedLink: { id: string; state: string | null } = { id: '', state: null };
+	let linkCatalogSwept = false;
+	$effect(() => {
+		const id = contribution?.id ?? '';
+		const state = contribution?.state ?? null;
+		if (id !== lastObservedLink.id) {
+			lastObservedLink = { id, state };
+			return;
+		}
+		if (
+			state === 'linked' &&
+			lastObservedLink.state !== null &&
+			lastObservedLink.state !== 'linked' &&
+			!linkCatalogSwept
+		) {
+			linkCatalogSwept = true;
+			void invalidateLibraryCatalog();
+		}
+		lastObservedLink = { id, state };
 	});
 
 	function changeField(field: ReleaseTextField, value: string): void {
@@ -205,7 +234,7 @@
 	{:else if contributionQuery.isError || !contribution}
 		<div class="mx-auto max-w-xl py-20">
 			<div class="alert alert-error" role="alert">
-				<AlertTriangle class="h-5 w-5" />
+				<TriangleAlert class="h-5 w-5" />
 				<div>
 					<h1 class="font-bold">Couldn't open this contribution</h1>
 					<p class="text-sm">It may have been removed, or the album is no longer in the library.</p>
@@ -217,7 +246,7 @@
 		<div class="mb-6 flex flex-wrap items-center justify-between gap-3">
 			<button
 				class="btn btn-ghost btn-sm gap-2"
-				onclick={() => goto(`/album/${contribution.local_album_id}`)}
+				onclick={() => goto(withBasePath(`/album/${contribution.local_album_id}`))}
 			>
 				<ArrowLeft class="h-4 w-4" /> Back to album
 			</button>
@@ -548,7 +577,7 @@
 							aria-labelledby="validation-title"
 						>
 							<h2 id="validation-title" class="flex items-center gap-2 font-bold">
-								<AlertTriangle class="h-4 w-4 text-warning" /> Still needed
+								<TriangleAlert class="h-4 w-4 text-warning" /> Still needed
 							</h2>
 							<ul class="mt-2 list-inside list-disc text-sm text-base-content/65">
 								{#each contribution.validation as issue (issue.code + issue.field)}

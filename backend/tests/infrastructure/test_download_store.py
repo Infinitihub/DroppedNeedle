@@ -4,8 +4,8 @@ user_id -> auth_users ON DELETE CASCADE foreign key (AUD-6)."""
 
 import sqlite3
 import threading
+import unicodedata
 from pathlib import Path
-
 import pytest
 
 from infrastructure.persistence.download_store import DownloadStore
@@ -72,6 +72,8 @@ def test_migration_is_idempotent(tmp_path: Path):
         "attempt_total",
         "has_next_source",
         "release_track_mbid",
+        "wrong_product_verdict_at",
+        "wrong_product_detail",
     } <= task_columns
     assert {
         "reason_detail",
@@ -79,6 +81,7 @@ def test_migration_is_idempotent(tmp_path: Path):
         "management_retry_count",
         "management_next_retry_at",
         "file_cleanup_completed_at",
+        "expected_duration_seconds",
     } <= held_columns
     assert activity_tables == {
         "download_activity_global_revision",
@@ -114,6 +117,22 @@ async def test_create_task_returns_uuid(store):
     fetched = await store.get_task(task.id)
     assert fetched is not None
     assert fetched.release_group_mbid == "rg-1"
+
+
+@pytest.mark.asyncio
+async def test_create_task_persists_manual_quality_override(store):
+    task = await store.create_task(
+        user_id="user-a",
+        release_group_mbid="rg-override",
+        artist_name="A",
+        album_title="B",
+        manual_quality_override=True,
+    )
+
+    assert task.manual_quality_override is True
+    fetched = await store.get_task(task.id)
+    assert fetched is not None
+    assert fetched.manual_quality_override is True
 
 
 @pytest.mark.asyncio
@@ -322,6 +341,44 @@ async def test_quarantine_set_roundtrip(store):
     quarantine = await store.load_quarantine_set()
     assert ("soulseek", soulseek_identity("peerX", "bad.flac")) in quarantine
     assert isinstance(quarantine, set)
+
+
+@pytest.mark.asyncio
+async def test_quarantine_soulseek_identity_canonicalizes_writer_and_reader(store):
+    from models.download_identity import soulseek_identity
+
+    username = unicodedata.normalize("NFD", "péer")
+    filename = unicodedata.normalize("NFD", "Album\\01 - Héroes.flac")
+    raw_identity = f"{username}\x1f{filename}"
+    await store.record_quarantine(
+        source="soulseek",
+        identity=raw_identity,
+        reason="verify_failed",
+        release_group_mbid="rg-nfc",
+    )
+
+    canonical = soulseek_identity("péer", "Album/01 - Héroes.flac")
+    assert ("soulseek", canonical) in await store.load_quarantine_set()
+    row = (await store.list_quarantine())[0]
+    assert row["identity"] == canonical
+    assert row["filename"] == "Album/01 - Héroes.flac"
+
+
+@pytest.mark.asyncio
+async def test_quarantine_load_canonicalizes_legacy_encoded_identity(store):
+    from models.download_identity import soulseek_identity
+
+    raw_identity = "peer\x1fAlbum\\01 - He\u0301roes.flac"
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO download_quarantine "
+            "(source, identity, reason, quarantined_at) VALUES (?, ?, ?, ?)",
+            ("soulseek", raw_identity, "verify_failed", 4_000_000_000.0),
+        )
+        conn.commit()
+
+    canonical = soulseek_identity("peer", "Album/01 - Héroes.flac")
+    assert ("soulseek", canonical) in await store.load_quarantine_set()
 
 
 @pytest.mark.asyncio
@@ -828,6 +885,131 @@ async def test_list_retryable_tasks_excludes_target_whose_latest_succeeded(store
     assert result == []
 
 
+def _set_created_at(db_path: Path, task_id: str, created_at: float) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE download_tasks SET created_at = ? WHERE id = ?",
+            (created_at, task_id),
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_newest_failed_tasks_returns_newest_per_target(store, tmp_path):
+    """Only the newest failed task per (user, download_type, rg, recording) target is
+    returned; older failures for the same target and failures superseded by a newer
+    task of ANY status (queued/cancelled/completed) are suppressed."""
+    db_path = tmp_path / "library.db"
+
+    old = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A",
+        album_title="B", status="failed",
+    )
+    mid = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A",
+        album_title="B", status="failed",
+    )
+    newest = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A",
+        album_title="B", status="failed",
+    )
+    other_target = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-2", artist_name="A",
+        album_title="C", status="failed",
+    )
+    queued_suppressed = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-3", artist_name="A",
+        album_title="D", status="failed",
+    )
+    queued_newer = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-3", artist_name="A",
+        album_title="D", status="queued",
+    )
+    cancelled_suppressed = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-4", artist_name="A",
+        album_title="E", status="failed",
+    )
+    cancelled_newer = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-4", artist_name="A",
+        album_title="E", status="cancelled",
+    )
+    completed_suppressed = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-5", artist_name="A",
+        album_title="F", status="failed",
+    )
+    completed_newer = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-5", artist_name="A",
+        album_title="F", status="completed",
+    )
+    track = await store.create_task(
+        user_id="user-a", download_type="track", release_group_mbid="rg-1",
+        recording_mbid="rec-1", artist_name="A", album_title="B",
+        track_title="T", status="failed",
+    )
+    upgrade = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-6", artist_name="A",
+        album_title="G", status="failed", origin="upgrade",
+    )
+    tie_first = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-7", artist_name="A",
+        album_title="H", status="failed",
+    )
+    tie_second = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-7", artist_name="A",
+        album_title="H", status="failed",
+    )
+    user_suppressed_by_upgrade = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-8", artist_name="A",
+        album_title="I", status="failed",
+    )
+    upgrade_suppressor = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-8", artist_name="A",
+        album_title="I", status="queued", origin="upgrade",
+    )
+
+    stamps = {
+        old.id: 100.0, mid.id: 200.0, newest.id: 300.0,
+        other_target.id: 150.0,
+        queued_suppressed.id: 100.0, queued_newer.id: 400.0,
+        cancelled_suppressed.id: 100.0, cancelled_newer.id: 400.0,
+        completed_suppressed.id: 100.0, completed_newer.id: 400.0,
+        track.id: 250.0, upgrade.id: 350.0,
+        tie_first.id: 500.0, tie_second.id: 500.0,
+        user_suppressed_by_upgrade.id: 100.0, upgrade_suppressor.id: 600.0,
+    }
+    for task_id, ts in stamps.items():
+        _set_created_at(db_path, task_id, ts)
+
+    result = await store.list_newest_failed_tasks("user-a", "user")
+    # Same-rg track is its own target; the newest failed upgrade stays retryable.
+    # Equal created_at breaks the tie by rowid (insertion order); suppression
+    # crosses origins, so the queued upgrade hides the older user failure.
+    assert {t.id for t in result} == {
+        newest.id, other_target.id, track.id, upgrade.id, tie_second.id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_newest_failed_tasks_is_user_scoped(store):
+    """Non-admins see only their own newest failures; admins span all users; a
+    missing user_id fails closed with no query."""
+    mine = await store.create_task(
+        user_id="user-a", release_group_mbid="rg-1", artist_name="A",
+        album_title="B", status="failed",
+    )
+    theirs = await store.create_task(
+        user_id="user-b", release_group_mbid="rg-2", artist_name="A",
+        album_title="C", status="failed",
+    )
+
+    assert {t.id for t in await store.list_newest_failed_tasks("user-a", "user")} == {
+        mine.id
+    }
+    assert {
+        t.id for t in await store.list_newest_failed_tasks("admin-1", "admin")
+    } == {mine.id, theirs.id}
+    assert await store.list_newest_failed_tasks(None, "user") == []
+
+
 # -- held imports ("import anyway" review queue) --
 
 
@@ -881,6 +1063,8 @@ async def test_held_import_record_list_get_ownership(store):
     # the album-artist MBID round-trips so "import anyway" can stamp the real artist
     assert got.artist_mbid == "678d88b2-87b0-403b-b63d-5da7465aecc3"
     assert await store.get_held_import(hid, "user-b", "user") is None  # not the owner
+    admin_got = await store.get_held_import(hid, "admin-1", "admin")
+    assert admin_got is not None and admin_got.track_title == "You Shook Me"
     # album scoping (the album page)
     assert (
         len(await store.list_held_imports("user-a", "user", release_group_mbid="rg-1"))
@@ -889,6 +1073,24 @@ async def test_held_import_record_list_get_ownership(store):
     assert (
         await store.list_held_imports("user-a", "user", release_group_mbid="rg-x") == []
     )
+
+
+@pytest.mark.asyncio
+async def test_held_import_expected_duration_round_trips(store):
+    hid = await store.record_held_import(
+        **_held_kwargs(expected_duration_seconds=390.0)
+    )
+    got = await store.get_held_import(hid, "user-a", "user")
+    assert got is not None and got.expected_duration_seconds == 390.0
+    listed = await store.list_held_imports("user-a", "user")
+    assert listed[0].expected_duration_seconds == 390.0
+
+
+@pytest.mark.asyncio
+async def test_held_import_expected_duration_defaults_null_for_legacy(store):
+    hid = await store.record_held_import(**_held_kwargs())
+    got = await store.get_held_import(hid, "user-a", "user")
+    assert got is not None and got.expected_duration_seconds is None
 
 
 @pytest.mark.asyncio
@@ -973,6 +1175,49 @@ async def test_discarded_file_cleanup_debt_is_durable_and_clears_once(store):
     await store.complete_held_file_cleanup([held_id])
 
     assert await store.list_pending_discard_file_cleanups() == []
+
+
+@pytest.mark.asyncio
+async def test_held_import_lookup_and_resolve_ignore_terminal_rows(store):
+    imported_id = await store.record_held_import(
+        **_held_kwargs(track_number=4, held_path="/held/imported.flac")
+    )
+    discarded_id = await store.record_held_import(
+        **_held_kwargs(track_number=5, held_path="/held/discarded.flac")
+    )
+    assert isinstance(imported_id, int)
+    assert isinstance(discarded_id, int)
+
+    await store.resolve_held_import(imported_id, "imported")
+    await store.resolve_held_import(discarded_id, "discarded")
+
+    assert await store.get_held_import(imported_id, "user-a", "user") is None
+    assert await store.get_held_import(imported_id, "admin-1", "admin") is None
+    assert await store.get_held_import(discarded_id, "user-a", "user") is None
+    assert await store.get_held_import(discarded_id, "admin-1", "admin") is None
+    assert await store.list_held_imports("user-a", "user") == []
+    assert await store.list_held_imports("admin-1", "admin") == []
+
+    with sqlite3.connect(store.db_path) as conn:
+        terminal_state = conn.execute(
+            "SELECT id, status, resolved_at FROM held_imports "
+            "WHERE id IN (?, ?) ORDER BY id",
+            (imported_id, discarded_id),
+        ).fetchall()
+
+    # Stale/repeated actions must not overwrite a terminal state.
+    await store.resolve_held_import(imported_id, "discarded")
+    await store.resolve_held_import(discarded_id, "imported")
+
+    with sqlite3.connect(store.db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT id, status, resolved_at FROM held_imports "
+                "WHERE id IN (?, ?) ORDER BY id",
+                (imported_id, discarded_id),
+            ).fetchall()
+            == terminal_state
+        )
 
 
 @pytest.mark.asyncio
@@ -1271,3 +1516,48 @@ async def test_held_import_pause_and_resolve(store):
     assert await store.has_unresolved_held_for_task("task-9") is False
     assert await store.task_ids_with_unresolved_held("user-a", "user") == set()
     assert await store.list_held_imports("user-a", "user") == []
+
+
+@pytest.mark.asyncio
+async def test_wrong_product_verdict_record_clear_first_wins(store):
+    task = await store.create_task(
+        user_id="user-a", album_title="Flux - Sessions", artist_name="Poppy"
+    )
+    assert task.wrong_product_verdict_at is None
+
+    await store.record_wrong_product_verdict(task.id, "2021. Flux")
+    reread = await store.get_task(task.id)
+    assert reread.wrong_product_verdict_at is not None
+    assert reread.wrong_product_detail == "2021. Flux"
+
+    # A later import run never overwrites the original verdict.
+    await store.record_wrong_product_verdict(task.id, "Flux (2021)")
+    assert (await store.get_task(task.id)).wrong_product_detail == "2021. Flux"
+
+    await store.clear_wrong_product_verdict(task.id)
+    cleared = await store.get_task(task.id)
+    assert cleared.wrong_product_verdict_at is None
+    assert cleared.wrong_product_detail is None
+
+
+@pytest.mark.asyncio
+async def test_folder_exclusion_round_trips_and_clears_by_album(store):
+    from models.download_identity import (
+        canonical_soulseek_identity,
+        soulseek_folder_identity,
+    )
+
+    identity = soulseek_folder_identity("RG-1", "flux")
+    assert identity == "folder:rg-1:flux"  # RG casefolded into the key
+    assert canonical_soulseek_identity(identity) == identity  # stable round-trip
+
+    await store.record_quarantine(
+        source="soulseek",
+        identity=identity,
+        reason="verify_failed",
+        release_group_mbid="RG-1",
+    )
+    assert ("soulseek", identity) in await store.load_quarantine_set()
+    # A manual re-request clears album rows (covering folder rows too).
+    assert await store.delete_quarantine_for_album("RG-1") == 1
+    assert ("soulseek", identity) not in await store.load_quarantine_set()

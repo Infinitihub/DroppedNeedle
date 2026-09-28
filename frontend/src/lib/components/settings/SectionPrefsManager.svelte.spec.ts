@@ -64,7 +64,7 @@ describe('SectionPrefsManager', () => {
 	});
 
 	it('renders sections grouped by zone with toggles', async () => {
-		render(SectionPrefsManager, {
+		await render(SectionPrefsManager, {
 			props: { page: 'home', title: 'Home', description: 'Pick sections.' }
 		} as Parameters<typeof render<typeof SectionPrefsManager>>[1]);
 
@@ -77,16 +77,40 @@ describe('SectionPrefsManager', () => {
 	});
 
 	it('unavailable sections show a connect link and a disabled toggle', async () => {
-		render(SectionPrefsManager, {
+		await render(SectionPrefsManager, {
 			props: { page: 'home', title: 'Home', description: 'Pick sections.' }
 		} as Parameters<typeof render<typeof SectionPrefsManager>>[1]);
 
 		const connectLink = page.getByRole('link', { name: /Connect ListenBrainz/ });
 		await expect.element(connectLink).toBeVisible();
+		await expect.element(connectLink).toHaveAttribute('href', '/profile#scrobbling');
+	});
+
+	it('lastfm-requiring sections link to profile scrobbling', async () => {
+		mockPrefs.pages.discover.push({
+			key: 'similar_artists',
+			title: 'Similar Artists',
+			description: 'Artists similar to your Last.fm history.',
+			zone: 'For You',
+			enabled: true,
+			available: false,
+			requires: 'lastfm'
+		});
+		try {
+			await render(SectionPrefsManager, {
+				props: { page: 'discover', title: 'Discover', description: 'Pick sections.' }
+			} as Parameters<typeof render<typeof SectionPrefsManager>>[1]);
+
+			const connectLink = page.getByRole('link', { name: /Connect Last\.fm/ });
+			await expect.element(connectLink).toBeVisible();
+			await expect.element(connectLink).toHaveAttribute('href', '/profile#scrobbling');
+		} finally {
+			mockPrefs.pages.discover.pop();
+		}
 	});
 
 	it('toggling a section saves the page after the debounce', async () => {
-		render(SectionPrefsManager, {
+		await render(SectionPrefsManager, {
 			props: { page: 'home', title: 'Home', description: 'Pick sections.' }
 		} as Parameters<typeof render<typeof SectionPrefsManager>>[1]);
 
@@ -108,7 +132,7 @@ describe('SectionPrefsManager', () => {
 	});
 
 	it('master toggle disables every section', async () => {
-		render(SectionPrefsManager, {
+		await render(SectionPrefsManager, {
 			props: { page: 'home', title: 'Home', description: 'Pick sections.' }
 		} as Parameters<typeof render<typeof SectionPrefsManager>>[1]);
 

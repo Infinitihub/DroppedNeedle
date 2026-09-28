@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ArtistReleases } from '$lib/types';
 
@@ -8,6 +8,16 @@ vi.mock('@tanstack/svelte-query', () => ({
 	queryOptions: vi.fn((options: unknown) => options)
 }));
 
+const authState = vi.hoisted(() => ({ userId: null as string | null }));
+
+vi.mock('$lib/stores/authStore.svelte', () => ({
+	authStore: {
+		get user() {
+			return authState.userId ? { id: authState.userId } : null;
+		}
+	}
+}));
+
 const mockGet = vi.fn();
 vi.mock('$lib/api/client', () => ({
 	api: { global: { get: (...args: unknown[]) => mockGet(...args) } }
@@ -15,9 +25,17 @@ vi.mock('$lib/api/client', () => ({
 
 vi.mock('../QueryClient', () => ({ setQueryDataWithPersister: vi.fn() }));
 
+beforeEach(() => {
+	authState.userId = null;
+	mockGet.mockReset();
+});
+
 import {
 	getArtistReleasesInfiniteQuery,
-	getExtendedArtistQueryOptions
+	getArtistTopAlbumsQuery,
+	getArtistTopSongsQuery,
+	getExtendedArtistQueryOptions,
+	getSimilarArtistsQuery
 } from './ArtistQueries.svelte';
 
 function releasePage(overrides: Partial<ArtistReleases> = {}): ArtistReleases {
@@ -57,6 +75,161 @@ describe('artist release pagination query', () => {
 			undefined
 		);
 	});
+
+	it('keeps next_offset/has_more math unchanged for mid-warm partial pages (A3)', () => {
+		const query = getArtistReleasesInfiniteQuery(() => 'artist-1') as unknown as {
+			getNextPageParam: (lastPage: ArtistReleases) => number | undefined;
+		};
+
+		// mid-warm page 1 beyond the known slice: no trustworthy total, but pagination
+		// math must not change shape
+		const warmPartial = releasePage({
+			warming: true,
+			source_total_count: null,
+			next_offset: null,
+			has_more: true
+		});
+		expect(query.getNextPageParam(warmPartial)).toBe(undefined);
+
+		const warmWithOffset = releasePage({
+			warming: true,
+			source_total_count: null,
+			next_offset: 50,
+			has_more: true
+		});
+		expect(query.getNextPageParam(warmWithOffset)).toBe(50);
+	});
+
+	it('polls only while the cached page-0 payload reports warming (A3)', () => {
+		const query = getArtistReleasesInfiniteQuery(() => 'artist-1') as unknown as {
+			refetchInterval: (q: {
+				state: { data?: { pages?: Array<{ warming?: boolean }> } };
+			}) => number | false;
+		};
+
+		const state = (warming?: boolean) => ({
+			state: { data: { pages: [{ warming }] } }
+		});
+
+		expect(query.refetchInterval(state(true))).toBe(2_000);
+		// first response with warming false/absent stops the poll entirely
+		expect(query.refetchInterval(state(false))).toBe(false);
+		expect(query.refetchInterval(state(undefined))).toBe(false);
+		// pre-A3 payloads and empty caches never poll
+		expect(query.refetchInterval({ state: { data: undefined } })).toBe(false);
+		expect(query.refetchInterval({ state: {} })).toBe(false);
+	});
+
+	it('caps warming polls at 30 per artist key, resetting on cool-down or key change (T9)', () => {
+		let artistId = 'artist-1';
+		const query = getArtistReleasesInfiniteQuery(() => artistId) as unknown as {
+			refetchInterval: (q: {
+				state: { data?: { pages?: Array<{ warming?: boolean }> } };
+			}) => number | false;
+		};
+
+		const state = (warming?: boolean) => ({
+			state: { data: { pages: [{ warming }] } }
+		});
+
+		for (let i = 0; i < 30; i += 1) {
+			expect(query.refetchInterval(state(true))).toBe(2_000);
+		}
+		expect(query.refetchInterval(state(true))).toBe(false);
+
+		// warming:false resets the budget
+		expect(query.refetchInterval(state(false))).toBe(false);
+		expect(query.refetchInterval(state(true))).toBe(2_000);
+
+		// artist-key change resets the budget
+		artistId = 'artist-2';
+		for (let i = 0; i < 30; i += 1) {
+			expect(query.refetchInterval(state(true))).toBe(2_000);
+		}
+		expect(query.refetchInterval(state(true))).toBe(false);
+	});
+});
+
+describe('source-dependent artist discovery queries', () => {
+	type DiscoveryQuery = {
+		enabled: boolean;
+		queryKey: readonly unknown[];
+		queryFn: (context: { signal: AbortSignal }) => Promise<unknown>;
+	};
+
+	it('fetches ListenBrainz top songs from the source-specific endpoint', async () => {
+		const query = getArtistTopSongsQuery(() => ({
+			artistId: 'artist-1',
+			source: 'listenbrainz'
+		})) as unknown as DiscoveryQuery;
+		const signal = new AbortController().signal;
+
+		await query.queryFn({ signal });
+
+		expect(mockGet).toHaveBeenCalledWith(
+			'/api/v1/artists/artist-1/top-songs?count=10&source=listenbrainz',
+			{ signal }
+		);
+		expect(query.queryKey).toContainEqual({ source: 'listenbrainz' });
+	});
+
+	it('fetches ListenBrainz top albums and similar artists from source-specific endpoints', async () => {
+		const signal = new AbortController().signal;
+		const queries = [
+			getArtistTopAlbumsQuery(() => ({ artistId: 'artist-1', source: 'listenbrainz' })),
+			getSimilarArtistsQuery(() => ({ artistId: 'artist-1', source: 'listenbrainz' }))
+		] as unknown as DiscoveryQuery[];
+
+		for (const query of queries) await query.queryFn({ signal });
+
+		expect(mockGet).toHaveBeenNthCalledWith(
+			1,
+			'/api/v1/artists/artist-1/top-albums?count=10&source=listenbrainz',
+			{ signal }
+		);
+		expect(mockGet).toHaveBeenNthCalledWith(
+			2,
+			'/api/v1/artists/artist-1/similar?count=15&source=listenbrainz',
+			{ signal }
+		);
+	});
+	it('keeps all source-dependent queries disabled when explicitly gated', () => {
+		const queries = [
+			getSimilarArtistsQuery(() => ({
+				artistId: 'artist-1',
+				source: 'listenbrainz',
+				enabled: false
+			})),
+			getArtistTopAlbumsQuery(() => ({
+				artistId: 'artist-1',
+				source: 'listenbrainz',
+				enabled: false
+			})),
+			getArtistTopSongsQuery(() => ({
+				artistId: 'artist-1',
+				source: 'listenbrainz',
+				enabled: false
+			}))
+		] as unknown as DiscoveryQuery[];
+
+		expect(queries.every((query) => query.enabled === false)).toBe(true);
+	});
+});
+
+it('includes the authenticated user in every source-dependent discovery key', () => {
+	authState.userId = 'user-a';
+	const userA = getArtistTopSongsQuery(() => ({
+		artistId: 'artist-1',
+		source: 'listenbrainz'
+	})) as unknown as { queryKey: readonly unknown[] };
+
+	authState.userId = 'user-b';
+	const userB = getArtistTopSongsQuery(() => ({
+		artistId: 'artist-1',
+		source: 'listenbrainz'
+	})) as unknown as { queryKey: readonly unknown[] };
+
+	expect(userA.queryKey).not.toEqual(userB.queryKey);
 });
 
 describe('extended artist query', () => {
@@ -64,6 +237,11 @@ describe('extended artist query', () => {
 		const query = getExtendedArtistQueryOptions('artist-1');
 
 		expect(query.notifyOnChangeProps).toBe('all');
-		expect(query.queryKey).toEqual(['artist', 'artist-1', 'extended']);
+		expect(query.queryKey).toEqual([
+			'artist',
+			{ user_id: null, source_mode: 'brainzmash', source_id: '', generation: 0 },
+			'artist-1',
+			'extended'
+		]);
 	});
 });

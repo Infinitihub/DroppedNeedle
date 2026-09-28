@@ -6,11 +6,13 @@ import msgspec
 import pytest
 from fastapi import FastAPI, HTTPException
 
-from api.v1.routes.library import router as legacy_library_router
+# F-NL-03 removed api.v1.routes.library; the direct-writer guard now checks
+# the target router only.
 from api.v1.routes.library_management import router
 from api.v1.routes.library_target import router as target_library_router
 from api.v1.schemas.library_management import (
     PICARD_ORGANIZER_PROFILE_ID,
+    LibraryManagementRootAssignment,
     LibraryManagementSettings,
 )
 from api.v1.schemas.library_management_preview import (
@@ -20,11 +22,13 @@ from api.v1.schemas.library_management_preview import (
     LibraryManagementPlanItemPageResponse,
     LibraryManagementPreviewCreatedResponse,
     LibraryManagementPreviewDetailResponse,
+    LibraryManagementPreviewReissueResponse,
     LibraryManagementResultPageResponse,
     LibraryManagementTagEditorContextResponse,
 )
 from api.v1.schemas.library_operations import OperationResponse
 from core.config import Settings
+from core.exceptions import ConflictError, ResourceNotFoundError
 from core.dependencies import (
     get_edition_conversion_service,
     get_library_management_duplicate_service,
@@ -117,6 +121,14 @@ def route_services(
     preview.history.return_value = LibraryManagementOperationHistoryResponse(items=[])
     preview.apply.return_value = OperationResponse(
         id="job-1", kind="library_management", state="queued"
+    )
+    preview.reissue_preview_token.return_value = (
+        LibraryManagementPreviewReissueResponse(
+            job_id="job-1",
+            preview_token="opaque",
+            created_at=1.0,
+            expires_at=2.0,
+        )
     )
     preview.discard.return_value = _preview_detail()
     preview.confirm_activation.return_value = profile.get_settings()
@@ -457,6 +469,7 @@ def test_recovery_diagnostics_are_bounded_admin_state(app: FastAPI) -> None:
         "cleanup_pending_count": 1,
         "oldest_updated_at": 10.0,
         "state_counts": {"cleanup_pending": 1, "needs_attention": 1},
+        "needs_attention_bundles": [],
     }
 
 
@@ -558,6 +571,33 @@ def test_discard_preview_route_forwards_exact_operation_revision(
     assert request.expected_operation_row_revision == 7
 
 
+def test_reissue_preview_route_returns_sealed_token_to_owner_admin(
+    app: FastAPI,
+    route_services: tuple[LibraryManagementProfileService, AsyncMock],
+) -> None:
+    _, preview = route_services
+    override_admin_auth(app)
+
+    response = build_test_client(app).post("/library/management/previews/job-1/reissue")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "job_id": "job-1",
+        "preview_token": "opaque",
+        "created_at": 1.0,
+        "expires_at": 2.0,
+    }
+    preview.reissue_preview_token.assert_awaited_once_with("job-1", "test-admin-id")
+
+
+def test_reissue_preview_route_has_no_get_method(app: FastAPI) -> None:
+    override_admin_auth(app)
+
+    response = build_test_client(app).get("/library/management/previews/job-1/reissue")
+
+    assert response.status_code == 405
+
+
 def test_undo_preview_route_forwards_source_revision_and_actor(app: FastAPI) -> None:
     override_admin_auth(app)
     response = build_test_client(app).post(
@@ -653,6 +693,10 @@ def test_management_routes_are_admin_only(app: FastAPI) -> None:
     assert client.get("/settings/library-management").status_code == 403
     assert client.get("/library/management/previews/job-1").status_code == 403
     assert client.get("/library/management/recovery/diagnostics").status_code == 403
+    assert (
+        client.post("/library/management/recovery/import-bundles/b-1/resolve").status_code
+        == 403
+    )
 
     unauthenticated = FastAPI()
     unauthenticated.include_router(router)
@@ -660,6 +704,10 @@ def test_management_routes_are_admin_only(app: FastAPI) -> None:
     assert client.get("/settings/library-management").status_code == 401
     assert client.get("/library/management/previews/job-1").status_code == 401
     assert client.get("/library/management/recovery/diagnostics").status_code == 401
+    assert (
+        client.post("/library/management/recovery/import-bundles/b-1/resolve").status_code
+        == 401
+    )
 
 
 def test_preview_route_uses_fixed_5xx_copy(
@@ -739,6 +787,7 @@ def test_management_route_inventory_is_complete() -> None:
         ("POST", "/settings/library-management/activation-previews"),
         ("GET", "/settings/library-management/activation-previews/{job_id}"),
         ("POST", "/settings/library-management/activation-confirmations"),
+        ("GET", "/settings/library-management/activation-health"),
         ("POST", "/library/management/previews"),
         ("GET", "/library/management/tracks/{track_id}/tag-editor"),
         ("POST", "/library/management/tag-edit-previews"),
@@ -750,6 +799,7 @@ def test_management_route_inventory_is_complete() -> None:
             "/library/management/previews/{job_id}/items/{ordinal}/artwork/{sha256}",
         ),
         ("POST", "/library/management/previews/{job_id}/apply"),
+        ("POST", "/library/management/previews/{job_id}/reissue"),
         ("GET", "/library/management/operations"),
         ("GET", "/library/management/operations/{job_id}"),
         ("GET", "/library/management/operations/{job_id}/results"),
@@ -759,15 +809,153 @@ def test_management_route_inventory_is_complete() -> None:
         ("POST", "/library/management/baselines/purge-impact"),
         ("POST", "/library/management/baselines/purge"),
         ("GET", "/library/management/recovery/diagnostics"),
+        (
+            "POST",
+            "/library/management/recovery/import-bundles/{bundle_id}/resolve",
+        ),
     }
 
 
-@pytest.mark.parametrize(
-    "library_router", [legacy_library_router, target_library_router]
-)
-def test_direct_track_tag_writer_is_not_exposed(library_router: object) -> None:
-    assert not any(
-        route.path == "/library/tracks/{track_id}"
-        and "POST" in getattr(route, "methods", set())
-        for route in library_router.routes
+def test_target_library_route_inventory_is_complete() -> None:
+    """The exact (method, path) surface of the target library router: ANY new
+    route here fails this test, so a direct-write endpoint (e.g. a POST tag
+    writer bypassing the staged publisher) cannot ship unnoticed."""
+    inventory = {
+        (method, route.path)
+        for route in target_library_router.routes
+        for method in getattr(route, "methods", set())
+        if method in {"GET", "POST", "PUT", "DELETE", "PATCH"}
+    }
+    assert inventory == {
+        ("DELETE", "/library/album/{album_id}"),
+        ("DELETE", "/library/albums/{local_album_id}/edition"),
+        ("DELETE", "/library/tracks/{track_id}"),
+        ("GET", "/library/albums"),
+        ("GET", "/library/full-albums"),
+        ("PUT", "/library/albums/{album_id}/full"),
+        ("GET", "/library/albums/{album_id}"),
+        ("GET", "/library/albums/{album_id}/artwork/cached"),
+        ("GET", "/library/albums/{album_id}/copies"),
+        ("GET", "/library/albums/{album_id}/reidentification/releases"),
+        ("GET", "/library/albums/{album_id}/status"),
+        ("GET", "/library/albums/{album_id}/tracks"),
+        ("GET", "/library/albums/{local_album_id}/edition"),
+        ("GET", "/library/artists"),
+        ("GET", "/library/artists/{artist_id}"),
+        ("GET", "/library/artists/{artist_id}/albums"),
+        ("GET", "/library/artists/{artist_id}/appearances"),
+        ("GET", "/library/edition-conversions/{job_id}"),
+        ("GET", "/library/mbids"),
+        ("GET", "/library/recently-added"),
+        ("GET", "/library/stats"),
+        ("GET", "/library/tracks"),
+        ("GET", "/library/tracks/{track_id}/tags"),
+        ("POST", "/library/albums/{album_id}/edition-conversions/preflight"),
+        ("POST", "/library/albums/{album_id}/management/re-enable"),
+        ("POST", "/library/albums/{album_id}/rescan"),
+        ("POST", "/library/edition-conversions/{job_id}/cancel"),
+        ("POST", "/library/edition-conversions/{job_id}/preview"),
+        ("POST", "/library/edition-conversions/{job_id}/recheck"),
+        ("POST", "/library/edition-conversions/{job_id}/retry"),
+        ("POST", "/library/edition-conversions/{job_id}/start"),
+        ("POST", "/library/membership"),
+        ("POST", "/library/resolve-tracks"),
+        ("PUT", "/library/albums/{local_album_id}/edition"),
+    }
+
+
+def _resolve_recovery(app: FastAPI) -> AsyncMock:
+    recovery = AsyncMock(spec=LibraryManagementRecoveryService)
+    app.dependency_overrides[get_library_management_recovery_service] = (
+        lambda: recovery
     )
+    return recovery
+
+
+def test_activation_health_route_reports_stale_roots(
+    app: FastAPI,
+    route_services: tuple[LibraryManagementProfileService, AsyncMock],
+) -> None:
+    profile_service, _ = route_services
+    override_admin_auth(app)
+    client = build_test_client(app)
+
+    fresh = client.get("/settings/library-management/activation-health")
+    assert fresh.status_code == 200
+    assert fresh.json() == {
+        "stale_root_ids": [],
+        "blocked_root_ids": [],
+        "blocked_reason": None,
+    }
+
+    prefs = profile_service._preferences
+    root_id = prefs.get_typed_library_settings_raw().library_roots[0].id
+    current = profile_service.get_settings()
+    proposed = prefs.get_library_management_settings_raw()
+    proposed.root_assignments = [
+        LibraryManagementRootAssignment(
+            root_id=root_id,
+            enabled=True,
+            automatic_acquisitions=True,
+        )
+    ]
+    prefs.save_library_management_settings_if_current(
+        proposed,
+        expected_settings_revision=current.settings_revision,
+    )
+
+    stale = client.get("/settings/library-management/activation-health")
+    assert stale.status_code == 200
+    assert stale.json() == {
+        "stale_root_ids": [root_id],
+        "blocked_root_ids": [],
+        "blocked_reason": None,
+    }
+
+
+def test_resolve_import_bundle_returns_contract_shape(app: FastAPI) -> None:
+    recovery = _resolve_recovery(app)
+    recovery.resolve_import_bundle.return_value = {
+        "bundle_id": "bundle-1",
+        "state": "resolved",
+        "verified_files": 2,
+        "total_files": 2,
+    }
+    override_admin_auth(app)
+
+    response = build_test_client(app).post(
+        "/library/management/recovery/import-bundles/bundle-1/resolve"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "bundle_id": "bundle-1",
+        "state": "resolved",
+        "verified_files": 2,
+        "total_files": 2,
+    }
+    recovery.resolve_import_bundle.assert_awaited_once_with("bundle-1")
+
+
+def test_resolve_import_bundle_maps_domain_errors(app: FastAPI) -> None:
+    recovery = _resolve_recovery(app)
+    override_admin_auth(app)
+    client = build_test_client(app)
+
+    recovery.resolve_import_bundle.side_effect = ResourceNotFoundError(
+        "Import publication bundle not found."
+    )
+    missing = client.post(
+        "/library/management/recovery/import-bundles/bundle-1/resolve"
+    )
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "NOT_FOUND"
+
+    recovery.resolve_import_bundle.side_effect = ConflictError(
+        "Only an import bundle needing attention can be resolved."
+    )
+    conflict = client.post(
+        "/library/management/recovery/import-bundles/bundle-1/resolve"
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "CONFLICT"

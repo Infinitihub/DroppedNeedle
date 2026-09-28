@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import inspect
 import logging
 import re
 import unicodedata
@@ -19,6 +20,8 @@ from core.exceptions import (
 )
 from infrastructure.cache.cache_keys import SOURCE_RESOLUTION_PREFIX
 from infrastructure.cache.memory_cache import CacheInterface
+from infrastructure.degradation import try_get_degradation_context
+from infrastructure.integration_result import IntegrationResult
 from infrastructure.persistence.auth_store import AuthStore, UserRecord
 from repositories.async_playlist_repository import AsyncPlaylistRepository
 from repositories.playlist_repository import (
@@ -90,6 +93,11 @@ _SOURCE_TYPE_ALIASES = {
     "": "",
 }
 
+# Best-source order for healing empty (Spotify-imported Unknown) rows. Mirrors
+# _LINK_SOURCE_PRIORITY in api/v1/routes/spotify.py so resolve-time promotion
+# picks the same winner the import auto-link would have.
+_LINK_SOURCE_PRIORITY = ["local", "jellyfin", "navidrome", "plex"]
+
 
 def _normalize_source_map(by_num: dict) -> dict[tuple[int, int], tuple[str, str]]:
     """Ensure source map keys are (disc_number, track_number) tuples.
@@ -153,6 +161,34 @@ def _library_candidate_score(track: PlaylistTrackRecord, candidate: object) -> t
         None, _match_text(track.album_name), _match_text(getattr(candidate, "album_name", ""))
     ).ratio()
     return title_score * 0.65 + artist_score * 0.25 + album_score * 0.10, title_score, artist_score
+
+
+async def _is_backend_configured(service: object) -> bool:
+    """Duck-typed configured check; missing/broken checks default to configured."""
+    check = getattr(service, "is_configured", None)
+    if check is None:
+        return True
+    try:
+        result = check()
+    except Exception:  # noqa: BLE001
+        return True
+    if inspect.isawaitable(result):
+        try:
+            result = await result
+        except Exception:  # noqa: BLE001
+            return True
+    return bool(result)
+
+
+def _record_backend_skip(source: str, album_id: str) -> None:
+    ctx = try_get_degradation_context()
+    if ctx is not None:
+        ctx.record(
+            IntegrationResult.error(
+                source=source,
+                msg=f"{source} not configured; skipped album {album_id}",
+            )
+        )
 
 
 class PlaylistService:
@@ -912,8 +948,28 @@ class PlaylistService:
                 else []
             )
 
+        # Heal Spotify-imported Unknown rows (#381): entries stored with an empty
+        # source_type stay unplayable after their album is downloaded. Promote them
+        # to the best resolved source. Rows that already have a source are never
+        # clobbered. A navidrome win under a folder scope is left alone, mirroring
+        # the persist guard below (scope-specific results are not stored).
+        resolve_user_id = requesting.id if requesting is not None else "background"
+        promotions: dict[str, str] = {}
+        for t in tracks:
+            resolved = result.get(t.id)
+            if not resolved or t.source_type:
+                continue
+            best = next((s for s in _LINK_SOURCE_PRIORITY if s in resolved), None)
+            if best is None:
+                continue
+            if best == "navidrome" and navidrome_folder_ids is not None:
+                continue
+            promotions[t.id] = best
+        by_id = {t.id: t for t in tracks}
         persist_updates: dict[str, list[str]] = {}
         for t in tracks:
+            if t.id in promotions:
+                continue
             resolved = result.get(t.id)
             if not resolved:
                 continue
@@ -926,6 +982,47 @@ class PlaylistService:
             )
         if file_links:
             await self._repo.batch_link_library_files(playlist_id, file_links)
+        for track_id, best in promotions.items():
+            track = by_id[track_id]
+            try:
+                new_source_id, new_plex_rating_key = await self._resolve_new_source_id(
+                    track,
+                    best,
+                    jf_service,
+                    local_service,
+                    nd_service,
+                    plex_service,
+                    resolve_user_id,
+                    navidrome_folder_ids,
+                )
+            except Exception:  # noqa: BLE001
+                # Healing is best-effort; the track keeps its stored row and the
+                # resolved sources are still returned to the caller.
+                logger.debug(
+                    "Skipping source promotion for track %s", track_id, exc_info=True
+                )
+                continue
+            repo_kwargs: dict[str, Any] = {"track_source_id": new_source_id}
+            if best == "local":
+                repo_kwargs["library_file_id"] = new_source_id
+            if best == "plex":
+                repo_kwargs["plex_rating_key"] = new_plex_rating_key
+            persist_sources = result[track_id]
+            if navidrome_folder_ids is not None:
+                # Scoped Navidrome matches are folder-specific and must never be
+                # stored globally; the batch path above already skips all
+                # available_sources persists under a scope. Promotion heals the
+                # local row but strips the scoped source from what it stores.
+                persist_sources = [s for s in persist_sources if s != "navidrome"]
+                if not persist_sources and best == "local":
+                    persist_sources = [best]
+            await self._repo.update_track_source(
+                playlist_id,
+                track_id,
+                best,
+                persist_sources,
+                **repo_kwargs,
+            )
 
         return result
 
@@ -964,25 +1061,47 @@ class PlaylistService:
             cached = await self._cache.get(cache_key)
             if cached is not None:
                 if len(cached) == 2:
-                    return (
+                    cached_maps = (
                         _normalize_source_map(cached[0]),
                         _normalize_source_map(cached[1]),
                         {},
                         {},
                     )
-                if len(cached) == 3:
-                    return (
+                elif len(cached) == 3:
+                    cached_maps = (
                         _normalize_source_map(cached[0]),
                         _normalize_source_map(cached[1]),
                         _normalize_source_map(cached[2]),
                         {},
                     )
-                return (
-                    _normalize_source_map(cached[0]),
-                    _normalize_source_map(cached[1]),
-                    _normalize_source_map(cached[2]),
-                    _normalize_source_map(cached[3]),
-                )
+                else:
+                    cached_maps = (
+                        _normalize_source_map(cached[0]),
+                        _normalize_source_map(cached[1]),
+                        _normalize_source_map(cached[2]),
+                        _normalize_source_map(cached[3]),
+                    )
+                jf_by_num, local_by_num, nd_by_num, plex_by_num = cached_maps
+                if (
+                    not local_by_num
+                    and local_service is not None
+                    and await _is_backend_configured(local_service)
+                ):
+                    # Targeted healing (#381): an entry cached before a download
+                    # has no local tracks and would block promotion until the TTL
+                    # expires. Re-check local files only and merge the result back
+                    # into the cached entry; other backends keep cached results.
+                    refreshed = await self._refresh_cached_local_sources(
+                        album_id, jf_service, local_service
+                    )
+                    if refreshed:
+                        local_by_num.update(refreshed)
+                        await self._cache.set(
+                            cache_key,
+                            (jf_by_num, local_by_num, nd_by_num, plex_by_num),
+                            ttl_seconds=3600,
+                        )
+                return (jf_by_num, local_by_num, nd_by_num, plex_by_num)
 
         jf_by_num: dict[tuple[int, int], tuple[str, str]] = {}
         local_by_num: dict[tuple[int, int], tuple[str, str]] = {}
@@ -994,7 +1113,7 @@ class PlaylistService:
         # via the album's provider ids so legacy rows resolve without a
         # migration. The cache key above stays the original album_id.
         match_album_id = album_id
-        if jf_service is not None:
+        if jf_service is not None and await _is_backend_configured(jf_service):
             try:
                 match = await jf_service.match_album_by_mbid(album_id)
                 if not match.found:
@@ -1016,8 +1135,9 @@ class PlaylistService:
                     album_id,
                     exc_info=True,
                 )
-
-        if local_service is not None:
+        elif jf_service is not None:
+            _record_backend_skip("jellyfin", album_id)
+        if local_service is not None and await _is_backend_configured(local_service):
             try:
                 match = await local_service.match_album_by_mbid(match_album_id)
                 if match.found:
@@ -1033,8 +1153,10 @@ class PlaylistService:
                     album_id,
                     exc_info=True,
                 )
+        elif local_service is not None:
+            _record_backend_skip("local", album_id)
 
-        if nd_service is not None:
+        if nd_service is not None and await _is_backend_configured(nd_service):
             try:
                 match = await nd_service.get_album_match(
                     album_id=album_id,
@@ -1056,8 +1178,10 @@ class PlaylistService:
                     album_id,
                     exc_info=True,
                 )
+        elif nd_service is not None:
+            _record_backend_skip("navidrome", album_id)
 
-        if plex_service is not None:
+        if plex_service is not None and await _is_backend_configured(plex_service):
             try:
                 match = await plex_service.get_album_match(
                     album_id=album_id,
@@ -1079,11 +1203,55 @@ class PlaylistService:
                     album_id,
                     exc_info=True,
                 )
+        elif plex_service is not None:
+            _record_backend_skip("plex", album_id)
 
         resolved = (jf_by_num, local_by_num, nd_by_num, plex_by_num)
         if self._cache:
             await self._cache.set(cache_key, resolved, ttl_seconds=3600)
         return resolved
+
+    async def _refresh_cached_local_sources(
+        self,
+        album_id: str,
+        jf_service: object,
+        local_service: object,
+    ) -> dict[tuple[int, int], tuple[str, str]]:
+        """Re-check local files for a cached album with no local tracks."""
+        match_album_id = album_id
+        if jf_service is not None and await _is_backend_configured(jf_service):
+            try:
+                match = await jf_service.match_album_by_mbid(album_id)
+                if not match.found:
+                    mbid = await jf_service.resolve_album_mbid(album_id)
+                    if isinstance(mbid, str) and mbid and mbid != album_id:
+                        match_album_id = mbid
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Local refresh re-key failed for album %s",
+                    album_id,
+                    exc_info=True,
+                )
+        try:
+            match = await local_service.match_album_by_mbid(match_album_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Local source refresh failed for album %s",
+                album_id,
+                exc_info=True,
+            )
+            return {}
+        if not match.found:
+            return {}
+        refreshed: dict[tuple[int, int], tuple[str, str]] = {}
+        for t in match.tracks:
+            key = _safe_track_number(t.track_number)
+            if key is not None:
+                refreshed[(getattr(t, "disc_number", None) or 1, key)] = (
+                    t.title,
+                    str(t.track_file_id),
+                )
+        return refreshed
 
     async def _resolve_new_source_id(
         self,
@@ -1165,6 +1333,52 @@ class PlaylistService:
         content_type: str,
     ) -> str:
         await self._load_owned_or_raise(playlist_id, requesting)
+        path = await self._persist_cover_bytes(playlist_id, data, content_type)
+        await self._repo.update_playlist(
+            playlist_id,
+            cover_image_path=path,
+        )
+        return f"/api/v1/playlists/{playlist_id}/cover"
+
+    async def set_imported_cover(
+        self,
+        playlist_id: str,
+        owner_id: str,
+        data: bytes,
+        content_type: str,
+    ) -> bool:
+        """Persist a provider-imported cover (e.g. Spotify playlist artwork).
+
+        Ownership-aware like :meth:`upload_cover` (owner-only mutation; admins
+        included cannot touch another user's playlist, D4/AMU-2) and fill-only:
+        when the playlist already has ANY explicit cover - user upload or a
+        previous import - it is preserved untouched, so a reimport never
+        overwrites the user's cover. Storage rules are identical to uploads.
+        Returns True when bytes were stored, False when an existing cover won.
+        """
+        playlist = await self._repo.get_playlist(playlist_id)
+        if playlist is None:
+            raise PlaylistNotFoundError(f"Playlist {playlist_id} not found")
+        if playlist.user_id != owner_id:
+            raise PermissionDeniedError(
+                "You do not have permission to modify this playlist"
+            )
+        if playlist.cover_image_path:
+            return False
+
+        path = await self._persist_cover_bytes(playlist_id, data, content_type)
+        await self._repo.update_playlist(
+            playlist_id,
+            cover_image_path=path,
+        )
+        return True
+
+    async def _persist_cover_bytes(
+        self, playlist_id: str, data: bytes, content_type: str
+    ) -> str:
+        """Validate and write cover bytes under the shared cover dir - the one
+        place that owns MIME/size rules and atomic file replacement for BOTH
+        user uploads and importer-set covers. Returns the stored path."""
         self._validate_cover_id(playlist_id)
 
         if content_type not in ALLOWED_IMAGE_TYPES:
@@ -1187,15 +1401,7 @@ class PlaylistService:
             file_path.write_bytes(data)
 
         await asyncio.to_thread(_write_cover)
-
-        cover_path = str(file_path)
-        await self._repo.update_playlist(
-            playlist_id,
-            cover_image_path=cover_path,
-        )
-
-        cover_url = f"/api/v1/playlists/{playlist_id}/cover"
-        return cover_url
+        return str(file_path)
 
     async def get_cover_path(
         self, playlist_id: str, requesting: UserRecord

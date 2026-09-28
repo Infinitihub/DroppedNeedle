@@ -19,16 +19,34 @@ original) are penalised x0.3.
 
 import logging
 import re
-import unicodedata
 from collections import Counter, defaultdict
 
 import msgspec
 from rapidfuzz import fuzz
-from unidecode import unidecode
 
 from infrastructure.persistence.download_store import DownloadStore
+from models.acquisition_quality import (
+    AcquisitionQualitySnapshot,
+    AudioQualityEvidence,
+    CodecFamily,
+    EvidenceCertainty,
+    EvidenceProvenance,
+)
 from models.download import ScoredCandidate, TargetAlbum
-from models.download_identity import soulseek_identity
+from models.download_identity import (
+    canonical_soulseek_identity,
+    soulseek_folder_identity,
+    soulseek_identity,
+)
+from models.download_manifest import ExpectedTrack
+from models.acquisition_quality import (
+    AudioQualityEvidence,
+    CodecFamily,
+    EvidenceCertainty,
+    EvidenceProvenance,
+    QualityDecision,
+)
+from services.native.acquisition import quality as acq_quality
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.acquisition import pipeline
 from services.native.acquisition.context import build_context
@@ -38,6 +56,15 @@ from services.native.acquisition.decision import (
     Reject,
     RejectCode,
     SpecPolicy,
+)
+from services.native.acquisition.scoring_core import (
+    artist_from_path as _artist_from_path,  # noqa: F401 - re-exported for tests/callers
+    artist_words as _artist_words,
+    file_confidence as _core_file_confidence,
+    normalize_folder_identity as _normalize_folder_identity,
+    normalize_for_match as _normalize_for_match,
+    strip_edition_suffix as _strip_edition_suffix,
+    tracklist_overlap as _core_tracklist_overlap,
 )
 from services.native.acquisition.specs.quarantine import quarantine
 from services.native.title_match import (
@@ -52,55 +79,16 @@ from services.native.quality_tiers import (
     folder_hires_key,
     is_audio,
     is_flac_or_mp3,
+    tier_for,
     tier_rank,
 )
 
-_EDITION_SUFFIXES = re.compile(
-    r"\b(deluxe|remastered|remaster|edition|anniversary|special|expanded|"
-    r"complete|bonus|acoustic|live|demo|radio edit|extended|instrumental)\b",
-    re.IGNORECASE,
-)
-_VERSION_MARKERS = re.compile(
-    r"\b(remix|live|acoustic|instrumental|demo|radio edit|karaoke|cover|commentary)\b",
-    re.IGNORECASE,
-)
-_CJK_RANGES = (
-    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
-    (0x3040, 0x309F),  # Hiragana
-    (0x30A0, 0x30FF),  # Katakana
-    (0x3400, 0x4DBF),  # CJK Extension A
-)
 _JUNK_KEYWORDS = ("various", "unknown album", "untitled", "misc")
 _LEADING_RELEASE_YEAR = re.compile(r"^\s*(?:\[\d{4}\]|\(\d{4}\)|\d{4}\s*[-–]\s*)\s*")
 
 logger = logging.getLogger(__name__)
 
 _ACCEPTANCE_RANK = {"rejected": 0, "manual": 1, "auto": 2}
-
-
-def _has_cjk(text: str) -> bool:
-    for char in text:
-        codepoint = ord(char)
-        for low, high in _CJK_RANGES:
-            if low <= codepoint <= high:
-                return True
-    return False
-
-
-def _normalize_for_match(text: str) -> str:
-    """NFC + lowercase + unidecode, but never mangle CJK."""
-    text = unicodedata.normalize("NFC", text or "").lower()
-    if _has_cjk(text):
-        return text
-    return unidecode(text)
-
-
-def _strip_edition_suffix(title: str) -> str:
-    return _EDITION_SUFFIXES.sub("", title or "").strip()
-
-
-def _version_markers(text: str) -> frozenset[str]:
-    return frozenset(marker.lower() for marker in _VERSION_MARKERS.findall(text or ""))
 
 
 def _ext_from_filename(filename: str) -> str:
@@ -155,7 +143,65 @@ def _availability_key(candidate: ScoredCandidate) -> tuple[int, int, int, int, i
     )
 
 
-def _candidate_rank_key(candidate: ScoredCandidate) -> tuple[int | float, ...]:
+def _file_evidence(file: DownloadSearchResult) -> AudioQualityEvidence:
+    """Per-file source-metadata projection with exact axes when fully present."""
+    ext = _effective_extension(file)
+    tier = tier_for(ext, file.bitrate, file.bit_depth)
+    family = (
+        CodecFamily.LOSSLESS
+        if tier == "lossless"
+        else CodecFamily.LOSSY
+        if tier in {"low", "mp3_192", "mp3_256", "mp3_320"}
+        else CodecFamily.UNKNOWN
+    )
+    exact = (
+        family is CodecFamily.LOSSY and file.bitrate is not None and file.bitrate > 0
+    ) or (
+        family is CodecFamily.LOSSLESS
+        and file.bit_depth is not None
+        and file.bit_depth > 0
+        and file.sample_rate is not None
+        and file.sample_rate > 0
+    )
+    return AudioQualityEvidence(
+        extension=ext,
+        codec_family=family,
+        bitrate_kbps=file.bitrate,
+        bit_depth=file.bit_depth,
+        sample_rate_hz=file.sample_rate,
+        total_bytes=file.size,
+        audio_file_count=1,
+        mixed_format=False,
+        mixed_quality=False,
+        certainty=EvidenceCertainty.EXACT if exact else EvidenceCertainty.PARTIAL,
+        provenance=EvidenceProvenance.SOURCE_METADATA,
+    )
+
+
+def _legacy_candidate_rank_key(
+    candidate: ScoredCandidate,
+    snapshot: AcquisitionQualitySnapshot | None = None,
+):
+    if snapshot is not None and acq_quality.is_recipe_snapshot(snapshot):
+        decision = candidate.quality_decision
+        if decision is None and candidate.files:
+            decision = acq_quality.evaluate_worst(
+                snapshot, [_file_evidence(file) for file in candidate.files]
+            )
+        step = (
+            decision.preference_step
+            if decision is not None and decision.preference_step is not None
+            else len(snapshot.quality_recipe) + 1
+        )
+        evidence = decision.evidence if decision is not None else AudioQualityEvidence()
+        refinement = acq_quality.recipe_refinement_key(snapshot, evidence)
+        return (
+            _ACCEPTANCE_RANK.get(candidate.tier, 0),
+            -step,
+            *(-value for value in refinement),
+            *_availability_key(candidate),
+            candidate.final_score,
+        )
     return (
         _ACCEPTANCE_RANK.get(candidate.tier, 0),
         tier_rank(candidate_tier(candidate.files)),
@@ -166,7 +212,9 @@ def _candidate_rank_key(candidate: ScoredCandidate) -> tuple[int | float, ...]:
 
 
 def rank_stored_candidates(
-    target: TargetAlbum, candidates: list[ScoredCandidate]
+    target: TargetAlbum,
+    candidates: list[ScoredCandidate],
+    snapshot: AcquisitionQualitySnapshot | None = None,
 ) -> list[ScoredCandidate]:
     """Apply current safety and ranking rules to a read-only review projection.
 
@@ -183,6 +231,24 @@ def rank_stored_candidates(
             _album_identity_text(target, candidate.parent_directory, candidate.files),
         ):
             continue
+        if snapshot is not None and acq_quality.is_recipe_snapshot(snapshot):
+            if source == "soulseek" and candidate.files:
+                evidence = [_file_evidence(file) for file in candidate.files]
+                decision = acq_quality.evaluate_worst(snapshot, evidence)
+                if not decision.eligible and acq_quality.is_hard_quality_rejection(
+                    decision
+                ):
+                    continue
+                candidate = msgspec.structs.replace(
+                    candidate,
+                    tier=(
+                        "manual"
+                        if not decision.eligible and candidate.tier == "auto"
+                        else candidate.tier
+                    ),
+                    quality_evidence=decision.evidence,
+                    quality_decision=decision,
+                )
         if source not in by_source:
             by_source[source] = []
             source_order.append(source)
@@ -193,24 +259,13 @@ def rank_stored_candidates(
     projected: list[ScoredCandidate] = []
     for source in source_order:
         projected.extend(
-            sorted(by_source[source], key=_candidate_rank_key, reverse=True)
+            sorted(
+                by_source[source],
+                key=lambda candidate: _legacy_candidate_rank_key(candidate, snapshot),
+                reverse=True,
+            )
         )
     return projected
-
-
-def _artist_from_path(parent_directory: str, target_artist: str = "") -> str:
-    """Heuristic artist extraction: try "Artist - Album", then a "Artist/Album"
-    layout (first path component), then the target artist, else ""."""
-    if not parent_directory:
-        return ""
-    if " - " in parent_directory:
-        return parent_directory.split(" - ", 1)[0].strip()
-    parts = [p for p in re.split(r"[\\/]", parent_directory) if p]
-    if len(parts) >= 2:
-        return parts[0].strip()
-    if target_artist:
-        return target_artist
-    return parts[0].strip() if parts else ""
 
 
 def _file_confidence(
@@ -223,97 +278,71 @@ def _file_confidence(
 ) -> float:
     """Per-file confidence (shared by the album scorer and the track matcher).
 
-    ``(0.55*title + 0.20*artist + 0.25*duration) * version_penalty`` when a target
-    duration is available, else the duration term drops and weights redistribute
-    to ``0.65*title + 0.35*artist``.
-
-    ``strict_title`` (the track matcher + 1-track album fallbacks, P3.4): the title
-    term becomes CONTAINMENT-based - a filename must name the target and nothing
-    else. ``token_set_ratio`` ignored extra tokens, so "the arrival" scored 0.78
-    against "02. Arrival in Ashford" and 1.0 against "Arrival - The Waking Hour" -
-    both real auto-tier candidates in the 2026-07-05 incident's search job. The
-    artist's own words are excluded from the foreign-token penalty ("01 - Yan Qing -
-    the arrival.flac" is not naming another work). Deliberately OFF for multi-track
-    albums: their per-file names are TRACK titles, and comparing those to the ALBUM
-    title is uniform noise under any metric - the replay corpus showed containment's
-    lower noise floor demoting legitimate albums (Inferno, 0.801 -> 0.698), so the
-    calibrated token_set noise stays. CJK titles always keep token_set (containment
-    tokenisation needs word boundaries)."""
-    file_title = re.split(r"[\\/]", file.filename)[-1]
-    file_title = re.sub(r"\.\w+$", "", file_title)
-
-    if strict_title and not (_has_cjk(target_title) or _has_cjk(file_title)):
-        artist_words = frozenset(
-            t for t in _normalize_for_match(target_artist).split() if len(t) >= 2
-        )
-        title_score = title_containment_score(
-            _strip_edition_suffix(target_title), file_title, ignore=artist_words
-        )
-    else:
-        title_score = (
-            fuzz.token_set_ratio(
-                _normalize_for_match(_strip_edition_suffix(target_title)),
-                _normalize_for_match(_strip_edition_suffix(file_title)),
-            )
-            / 100.0
-        )
-
-    file_artist = _artist_from_path(file.parent_directory, target_artist)
-    artist_score = (
-        fuzz.token_set_ratio(
-            _normalize_for_match(target_artist),
-            _normalize_for_match(file_artist),
-        )
-        / 100.0
-        if file_artist
-        else 0.0
+    Thin compat wrapper over ``scoring_core.file_confidence``; the formula lives
+    there so plugins score with identical calibration. See its docstring for the
+    weighting / strict_title / version-penalty contract.
+    """
+    return _core_file_confidence(
+        target_title,
+        target_artist,
+        target_duration,
+        file.filename,
+        file.parent_directory,
+        file.duration,
+        strict_title=strict_title,
     )
-
-    # penalise when exactly one side carries a version marker
-    version_penalty = (
-        0.3 if _version_markers(target_title) != _version_markers(file_title) else 1.0
-    )
-
-    if target_duration and file.duration:
-        diff = abs(file.duration - target_duration)
-        duration_score = 1.0 if diff <= 15 else (0.5 if diff <= 25 else 0.0)
-        base = 0.55 * title_score + 0.20 * artist_score + 0.25 * duration_score
-    else:
-        base = 0.65 * title_score + 0.35 * artist_score
-
-    return base * version_penalty
 
 
 class AlbumPreflightScorer:
-    def __init__(
-        self,
-        download_store: DownloadStore,
-        *,
-        quality_min: str = DEFAULT_QUALITY_MIN,
-        quality_max: str = DEFAULT_QUALITY_MAX,
-        flac_mp3_only: bool = True,
-        policy: SpecPolicy | None = None,
-    ):
+    """Quality moves EXCLUSIVELY through the per-call ``AcquisitionQualitySnapshot``
+    (spec Snapshot rule). Non-quality spec gates ride ``spec_extras`` supplied
+    fresh by the caller so a stale singleton can never hide them."""
+
+    def __init__(self, download_store: DownloadStore):
         self._store = download_store
-        self._flac_mp3_only = flac_mp3_only
-        # The full spec policy: passed by the composition root (built from
-        # DownloadPolicySettings) or derived from the quality kwargs in tests. The size/
-        # term/age gates default off, so a quality-only construction is behaviour-unchanged.
-        self._policy = policy or SpecPolicy(
-            quality_min=quality_min, quality_max=quality_max
-        )
 
     async def rank(
         self,
         target: TargetAlbum,
         results: list[DownloadSearchResult],
         *,
+        snapshot: AcquisitionQualitySnapshot,
+        spec_extras: "SpecPolicy | None" = None,
         auto_accept_threshold: float = 0.70,
         manual_threshold: float = 0.50,
         held_tier: str | None = None,
+        expected_tracks: list["ExpectedTrack"] | None = None,
+        release_group_mbid: str | None = None,
     ) -> list[ScoredCandidate]:
         context = await build_context(self._store, held_tier=held_tier)
-        policy = self._policy
+        # Canonical quality endpoints come from the SNAPSHOT; non-quality gates
+        # (max size / terms / retention) arrive via spec_extras, fresh per call.
+        policy = SpecPolicy(
+            quality_min=(
+                "low"
+                if acq_quality.is_recipe_snapshot(snapshot)
+                else snapshot.quality_preference_order[-1]
+            ),
+            quality_max=(
+                "lossless"
+                if acq_quality.is_recipe_snapshot(snapshot)
+                else snapshot.quality_preference_order[0]
+            ),
+        )
+        if spec_extras is not None:
+            import msgspec as _ms
+
+            policy = _ms.structs.replace(
+                policy,
+                max_size_mb=spec_extras.max_size_mb,
+                ignored_terms=tuple(spec_extras.ignored_terms),
+                required_terms=tuple(spec_extras.required_terms),
+                usenet_retention_days=spec_extras.usenet_retention_days,
+                usenet_min_age_minutes=getattr(
+                    spec_extras, "usenet_min_age_minutes", 0
+                ),
+            )
+        flac_mp3_only = snapshot.flac_mp3_only
         # Soulseek quarantine is file-granular (a peer may have just one bad file): apply
         # it as a pool pre-filter via the shared spec, so a quarantined file is dropped
         # before grouping while the folder's other files survive.
@@ -338,9 +367,55 @@ class AlbumPreflightScorer:
         for result in filtered:
             groups[(result.username, result.parent_directory)].append(result)
 
+        # Peer-folder exhaustion (#255 defect 2): a clean import that still
+        # under-delivers records a BARE-username quarantine row, which can never
+        # match a per-file (username, filename) identity. Consult it here at
+        # folder level - the grouping key already is (username, directory) - and
+        # drop that peer's folders for this release group. A manual re-request
+        # clears album-scoped rows by RG (covering bare rows too), restoring it.
+        exhausted = {
+            key
+            for key in groups
+            if ("soulseek", canonical_soulseek_identity(key[0]))
+            in context.quarantine_set
+        }
+        drop_peer_exhausted = len(exhausted)
+        for key in exhausted:
+            del groups[key]
+
+        # Wrong-product exclusions (Slice 3): folders whose normalized album
+        # identity proved content-wrong for THIS release group drop before
+        # scoring, however the peer named the folder ("2021. Flux",
+        # "Flux (2021)" and "Flux" are one key). RG-scoped by construction
+        # (the RG is in the key); without an RG the consult cannot run and
+        # every folder survives (manual searches pass none today).
+        drop_folder_excluded = 0
+        if release_group_mbid:
+            folder_artist_words = _artist_words(target.artist_name)
+            folder_excluded = {
+                key
+                for key in groups
+                if (
+                    "soulseek",
+                    soulseek_folder_identity(
+                        release_group_mbid,
+                        _normalize_folder_identity(
+                            key[1], artist_words=folder_artist_words
+                        ),
+                    ),
+                )
+                in context.quarantine_set
+            }
+            drop_folder_excluded = len(folder_excluded)
+            for key in folder_excluded:
+                del groups[key]
+
         scored: list[ScoredCandidate] = []
         drop_no_audio = drop_codec = 0
         pipeline_drops: Counter[RejectCode] = Counter()
+        # Overlap title judging ignores the artist's own words (same rule as
+        # the strict file-confidence path): "Poppy - Kitty" names Kitty.
+        overlap_ignore = _artist_words(target.artist_name)
         for (username, parent), files in groups.items():
             # A folder search returns the album's sidecars (cover art, cue, log, m3u)
             # alongside the tracks; gate, score and enqueue on the AUDIO files only -
@@ -352,7 +427,7 @@ class AlbumPreflightScorer:
                 continue
             # a folder is rated by its worst audio file (downloaded whole): drop on a
             # disallowed codec before the shared pipeline judges identity + quality range.
-            if self._flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
+            if flac_mp3_only and not all(is_flac_or_mp3(f) for f in audio):
                 drop_codec += 1
                 continue
             # Positive artist evidence lets the wrong-album spec judge the album-level
@@ -431,7 +506,30 @@ class AlbumPreflightScorer:
             # availability, which is how the incident candidate crossed 0.70. The 5:3
             # coherence:confidence ratio is preserved and the scale stays 0..1, so the
             # persisted preflight_score_auto_accept keeps meaning what it always meant.
-            final = 0.625 * coherence + 0.375 * avg_confidence
+            base_final = 0.625 * coherence + 0.375 * avg_confidence
+
+            # Grab-time tracklist overlap: when the pinned edition's tracklist is
+            # known, a folder whose NAMED files don't cover it is the wrong
+            # product wearing the right folder name (Flux vs Flux - Sessions) -
+            # discount it multiplicatively (perfect overlap scores exactly as
+            # before, so unknown/absent tracklists change nothing).
+            overlap = (
+                _core_tracklist_overlap(
+                    [(f.filename, f.duration) for f in audio],
+                    [
+                        (t.track_number, t.title, t.duration_seconds)
+                        for t in expected_tracks
+                    ],
+                    ignore=overlap_ignore,
+                )
+                if expected_tracks
+                else None
+            )
+            final = (
+                base_final * (0.5 + 0.5 * overlap)
+                if overlap is not None
+                else base_final
+            )
 
             if final >= auto_accept_threshold and has_evidence:
                 tier = "auto"
@@ -448,7 +546,52 @@ class AlbumPreflightScorer:
                     )
             else:
                 tier = "rejected"
+            if (
+                overlap is not None
+                and tier == "rejected"
+                and base_final >= manual_threshold
+                and coherence >= manual_threshold
+            ):
+                # Overlap demotion floors at manual: the pick endpoint refuses
+                # rejected-tier candidates, so a floor keeps the "pick a
+                # release" escape hatch open (worst case parks for review,
+                # never a dead end). The sub-threshold score stays honest.
+                tier = "manual"
 
+            if tier == "auto" and target.track_count and target.track_count > 1:
+                count_ratio = len(audio) / target.track_count
+                if count_ratio < 0.5:
+                    if final >= manual_threshold and coherence >= manual_threshold:
+                        tier = "manual"
+                        logger.info(
+                            "preflight.completeness_capped",
+                            extra={
+                                "parent_directory": parent,
+                                "final_score": round(final, 4),
+                                "count_ratio": round(count_ratio, 4),
+                                "track_count": target.track_count,
+                            },
+                        )
+                    else:
+                        tier = "rejected"
+            # Folder-worst evidence from per-file projections; attached so the
+            # orchestrator's stored-snapshot recheck and the review UI reuse the
+            # SAME evaluation instead of re-deriving from raw files.
+            file_evidence = [_file_evidence(f) for f in audio]
+            folder_decision = acq_quality.evaluate_worst(snapshot, file_evidence)
+            if (
+                acq_quality.is_recipe_snapshot(snapshot)
+                and not folder_decision.eligible
+                and acq_quality.is_hard_quality_rejection(folder_decision)
+            ):
+                pipeline_drops[RejectCode.QUALITY_REJECTED] += 1
+                continue
+            if (
+                acq_quality.is_recipe_snapshot(snapshot)
+                and not folder_decision.eligible
+                and tier == "auto"
+            ):
+                tier = "manual"
             scored.append(
                 ScoredCandidate(
                     username=username,
@@ -458,15 +601,75 @@ class AlbumPreflightScorer:
                     file_confidence=avg_confidence,
                     final_score=final,
                     tier=tier,
+                    track_overlap=overlap,
+                    quality_evidence=folder_decision.evidence,
+                    quality_decision=folder_decision,
                 )
             )
 
-        # Eligibility is absolute: a rejected/manual hi-res folder must never hide a
-        # safe automatic result. Once candidates pass the same safety tier, quality
-        # and resolution are absolute. Complete-folder availability (free slot,
-        # slowest queue, slowest advertised speed, then size) breaks quality ties.
-        scored.sort(key=_candidate_rank_key, reverse=True)
+        def _rank_key(candidate: ScoredCandidate):
+            if acq_quality.is_recipe_snapshot(snapshot):
+                decision = candidate.quality_decision
+                step = (
+                    decision.preference_step
+                    if decision is not None and decision.preference_step is not None
+                    else len(snapshot.quality_recipe) + 1
+                )
+                evidence = (
+                    decision.evidence
+                    if decision is not None
+                    else AudioQualityEvidence()
+                )
+                refinement = acq_quality.recipe_refinement_key(snapshot, evidence)
+                return (
+                    _ACCEPTANCE_RANK.get(candidate.tier, 0),
+                    -step,
+                    *(-value for value in refinement),
+                    *_availability_key(candidate),
+                    candidate.final_score,
+                )
+            step = None
+            dist = None
+            certainty = EvidenceCertainty.PARTIAL
+            if candidate.quality_decision is not None:
+                step = candidate.quality_decision.preference_step
+                certainty = candidate.quality_evidence.certainty
+                if (
+                    snapshot.lossy_target_kbps is not None
+                    and candidate.quality_evidence.codec_family is CodecFamily.LOSSY
+                ):
+                    dist = acq_quality.lossy_target_distance(
+                        snapshot, candidate.quality_evidence
+                    )
+            worst_step = len(snapshot.quality_preference_order) + 2
+            return (
+                # Identity band FIRST (legacy guarantee: a rejected/manual
+                # hi-res folder must never hide a safe automatic result),
+                _ACCEPTANCE_RANK.get(candidate.tier, 0),
+                # Preference STEP, smaller = preferred; encoded NEGATIVE so
+                # reverse=True ranks the smallest step first.
+                -(step if step is not None else worst_step),
+                -acq_quality.CERTAINTY_RANK[certainty],
+                -(dist if dist is not None else -1),
+                # Availability tuple and identity score are already
+                # bigger-is-better for the descending comparison.
+                *_availability_key(candidate),
+                candidate.final_score,
+            )
+
+        scored.sort(key=_rank_key, reverse=True)
         ranked = scored[:50]
+        # grab-time overlap diagnosis (keys present only when the rank knew
+        # the tracklist) - the next wrong-product incident reads here.
+        overlap_extras: dict = {}
+        overlaps = [c.track_overlap for c in ranked if c.track_overlap is not None]
+        if overlaps:
+            overlap_extras = {
+                "overlap_scored": len(overlaps),
+                "overlap_min": round(min(overlaps), 4),
+            }
+            if ranked[0].track_overlap is not None:
+                overlap_extras["overlap_top"] = round(ranked[0].track_overlap, 4)
         logger.info(
             "preflight.ranked",
             extra={
@@ -474,12 +677,15 @@ class AlbumPreflightScorer:
                 "top_score": ranked[0].final_score if ranked else 0.0,
                 "auto_count": sum(1 for c in ranked if c.tier == "auto"),
                 "manual_count": sum(1 for c in ranked if c.tier == "manual"),
+                **overlap_extras,
                 # why folders were dropped before scoring - a candidates_count of 0
                 # with a non-zero results_count is explained entirely by these. The
                 # inline gates (no_audio/codec) plus one key per shared-spec reject code.
                 "groups_total": len(groups),
                 "dropped_no_audio": drop_no_audio,
                 "dropped_codec": drop_codec,
+                "dropped_peer_exhausted": drop_peer_exhausted,
+                "dropped_folder_excluded": drop_folder_excluded,
                 **{f"dropped_{code.value}": n for code, n in pipeline_drops.items()},
             },
         )

@@ -10,6 +10,7 @@ from api.v1.routes import downloads
 from core.dependencies import get_download_service
 from core.exceptions import (
     ConflictError,
+    AutomaticManagementHoldError,
     ConfigurationError,
     PermissionDeniedError,
     ResourceNotFoundError,
@@ -477,9 +478,6 @@ def test_get_files_returns_file_list():
     assert body["files"][0]["size"] == 123
 
 
-# -- held-track audio preview --
-
-
 def _held(held_path: str):
     from models.held_import import HeldImport
 
@@ -511,6 +509,110 @@ def test_list_held_returns_durable_management_retry_schedule():
     assert response.status_code == 200
     assert response.json()["items"][0]["management_retry_count"] == 2
     assert response.json()["items"][0]["management_next_retry_at"] == 1234.0
+
+
+def test_list_held_exposes_expected_duration():
+    service = AsyncMock()
+    item = msgspec.structs.replace(_held("/held/track.flac"), expected_duration_seconds=390.0)
+    service.list_held.return_value = [item]
+
+    response = build_test_client(_app(service)).get("/downloads/held")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["expected_duration_seconds"] == 390.0
+
+
+def test_list_held_exposes_null_expected_duration_for_legacy_rows():
+    service = AsyncMock()
+    service.list_held.return_value = [_held("/held/track.flac")]
+
+    response = build_test_client(_app(service)).get("/downloads/held")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["expected_duration_seconds"] is None
+
+
+def test_reverify_held_imports_through_service_verdict():
+    service = AsyncMock()
+    service.reverify_held.return_value = ("imported", "/music/track.flac")
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/reverify")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "imported", "final_path": "/music/track.flac"}
+    service.reverify_held.assert_awaited_once_with(1, "u1", "user")
+
+
+def test_reverify_held_reports_still_held():
+    service = AsyncMock()
+    service.reverify_held.return_value = ("still_held", None)
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/reverify")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "still_held", "final_path": None}
+
+
+def test_reverify_held_unknown_id_is_404():
+    service = AsyncMock()
+    service.reverify_held.side_effect = ResourceNotFoundError("Held track not found")
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/reverify")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_reverify_held_management_hold_is_400():
+    service = AsyncMock()
+    service.reverify_held.side_effect = ValidationError(
+        "Library Management holds must be retried as one complete acquisition unit"
+    )
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/reverify")
+
+    assert response.status_code == 400
+
+
+def test_reverify_held_bulk_returns_per_id_results():
+    service = AsyncMock()
+    service.reverify_held_bulk.return_value = [
+        {"held_id": 1, "status": "imported", "final_path": "/music/a.flac", "message": None},
+        {"held_id": 2, "status": "still_held", "final_path": None, "message": None},
+        {
+            "held_id": 3,
+            "status": "skipped",
+            "final_path": None,
+            "message": "Only fingerprint-held tracks can be re-checked",
+        },
+    ]
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/reverify", json={}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["held_id"] for item in body["results"]] == [1, 2, 3]
+    assert [item["status"] for item in body["results"]] == [
+        "imported",
+        "still_held",
+        "skipped",
+    ]
+    service.reverify_held_bulk.assert_awaited_once_with("u1", "user", None)
+
+
+def test_reverify_held_bulk_forwards_held_ids():
+    service = AsyncMock()
+    service.reverify_held_bulk.return_value = []
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/reverify", json={"held_ids": [1, 2]}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+    service.reverify_held_bulk.assert_awaited_once_with("u1", "user", [1, 2])
 
 
 def test_retry_management_hold_returns_album_level_result():
@@ -554,6 +656,28 @@ def test_import_held_without_library_root_is_400_configuration_error():
     assert "library root" in body["message"]
 
 
+def test_automatic_management_hold_returns_safe_conflict_envelope():
+    service = AsyncMock()
+    dynamic_message = (
+        "Provider script /srv/private/music/profile-secret.py rejected "
+        "destination /library/hidden-track.flac"
+    )
+    service.import_held.side_effect = AutomaticManagementHoldError(
+        "TRACK_NOT_MAPPED", dynamic_message
+    )
+
+    response = build_test_client(_app(service)).post("/downloads/held/1/import")
+
+    assert response.status_code == 409
+    assert response.json()["error"] == {
+        "code": "AUTOMATIC_MANAGEMENT_HOLD",
+        "message": "Import blocked by a Library Management safety check.",
+        "details": {"reason_code": "TRACK_NOT_MAPPED"},
+    }
+    assert dynamic_message not in response.text
+    service.import_held.assert_awaited_once_with(1, "u1", "user")
+
+
 def test_held_audio_streams_file_and_supports_range(tmp_path):
     f = tmp_path / "held.flac"
     f.write_bytes(b"FLACDATA-0123456789")
@@ -589,7 +713,7 @@ def test_held_audio_not_owned_is_404():
     assert resp.status_code == 404
 
 
-# --- Quality upgrades (CollectionManagement Feature B, admin/trusted D18) ------
+# collection-management feature B quality-upgrade routes: admin/trusted curator gate (D18)
 
 
 def _curator_app(service, *, role: str = "admin") -> FastAPI:
@@ -671,6 +795,39 @@ def test_cutoff_unmet_returns_worklist_for_curator():
     assert body["items"][0]["current_tier"] == "mp3_192"
 
 
+def test_cutoff_unmet_serializes_normalized_artist_fields_for_target_rows():
+    """NEW-TARGET-01: target-shaped store rows reach the wire with the shared
+    artist_name/artist_mbid keys populated from the normalized repository
+    contract."""
+    service = AsyncMock()
+    service.list_cutoff_unmet.return_value = [
+        {
+            "release_group_mbid": "target-rg",
+            "current_tier": "mp3_320",
+            "track_count": 7,
+            # Target-shaped row: legacy keys absent; normalized keys present.
+            "album_artist_name": "Target Artist",
+            "artist_name": "Target Artist",
+            "provider_artist_mbid": "provider-artist-1",
+            "artist_mbid": "provider-artist-1",
+            "album_title": "Target Album",
+            "year": 2024,
+        }
+    ]
+    service.quality_cutoff = "lossless"
+    service.upgrade_allowed = True
+
+    resp = build_test_client(_curator_app(service, role="trusted")).get(
+        "/downloads/cutoff-unmet"
+    )
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["artist_name"] == "Target Artist"
+    assert item["artist_mbid"] == "provider-artist-1"
+    assert item["current_tier"] == "mp3_320"
+
+
 def test_upgrade_album_route_queues_and_maps_sentinel():
     from services.native.download_service import ALREADY_IN_LIBRARY
 
@@ -698,3 +855,41 @@ def test_upgrade_track_route_queues():
     assert resp.status_code == 200
     assert resp.json() == {"status": "queued", "task_id": "task-t"}
     assert service.request_upgrade_track.call_args.kwargs["recording_mbid"] == "rec-1"
+
+
+def test_discard_held_verdict_returns_task_level_result():
+    service = AsyncMock()
+    service.discard_held_for_task.return_value = 15
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/verdict/t1/discard"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "discarded", "files": 15}
+    service.discard_held_for_task.assert_awaited_once_with("t1", "u1", "user")
+
+
+def test_discard_held_verdict_without_held_is_404():
+    service = AsyncMock()
+    service.discard_held_for_task.side_effect = ResourceNotFoundError(
+        "No held tracks found for this download"
+    )
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/verdict/t1/discard"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_discard_held_verdict_non_owner_is_403():
+    service = AsyncMock()
+    service.discard_held_for_task.side_effect = PermissionDeniedError("nope")
+
+    response = build_test_client(_app(service)).post(
+        "/downloads/held/verdict/t1/discard"
+    )
+
+    assert response.status_code == 403

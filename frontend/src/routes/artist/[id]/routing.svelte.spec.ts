@@ -6,6 +6,8 @@ const h = vi.hoisted(() => ({
 	cache: vi.fn().mockResolvedValue(undefined),
 	localView: vi.fn(),
 	providerView: vi.fn(),
+	localDetailRequest: vi.fn(),
+	localDetail404: false,
 	artist: {
 		id: 'local-artist-id',
 		musicbrainz_artist_id: 'provider-artist-id' as string | null
@@ -25,8 +27,8 @@ vi.mock('./LocalArtistPage.svelte', () => {
 });
 
 vi.mock('./ProviderArtistPage.svelte', () => {
-	const Component = function () {
-		h.providerView();
+	const Component = function (_anchor: unknown, props: { data: unknown; localArtist?: unknown }) {
+		h.providerView(props);
 	};
 	Component.prototype = {};
 	return { default: Component };
@@ -34,10 +36,12 @@ vi.mock('./ProviderArtistPage.svelte', () => {
 
 vi.mock('$lib/queries/library/LibraryQueries.svelte', async (importOriginal) => ({
 	...(await importOriginal<typeof import('$lib/queries/library/LibraryQueries.svelte')>()),
-	getLibraryArtistDetailQuery: () => ({
-		data: h.artist,
-		isLoading: false
-	}),
+	getLibraryArtistDetailQuery: (...args: unknown[]) => {
+		h.localDetailRequest(...args);
+		return h.localDetail404
+			? { data: undefined, isLoading: false, isError: true, error: new Error('404') }
+			: { data: h.artist, isLoading: false, isError: false, error: null };
+	},
 	cacheCanonicalLibraryArtistDetail: (...args: unknown[]) => h.cache(...args)
 }));
 
@@ -47,10 +51,11 @@ import ArtistPage from './+page.svelte';
 beforeEach(() => {
 	vi.clearAllMocks();
 	h.artist.musicbrainz_artist_id = 'provider-artist-id';
+	h.localDetail404 = false;
 });
 
 it('keeps a linked artist on its MusicBrainz route', async () => {
-	render(ArtistPage, {
+	await render(ArtistPage, {
 		props: {
 			data: {
 				artistId: 'provider-artist-id',
@@ -61,12 +66,28 @@ it('keeps a linked artist on its MusicBrainz route', async () => {
 
 	await vi.waitFor(() => expect(h.goto).not.toHaveBeenCalled());
 	expect(h.cache).not.toHaveBeenCalled();
-	expect(h.providerView).toHaveBeenCalled();
+	expect(h.providerView).toHaveBeenCalledWith(expect.objectContaining({ localArtist: h.artist }));
 	expect(h.localView).not.toHaveBeenCalled();
 });
 
+it('mounts the provider once when local detail returns 404', async () => {
+	h.localDetail404 = true;
+	await render(ArtistPage, {
+		props: {
+			data: {
+				artistId: 'provider-artist-id',
+				primarySource: 'listenbrainz' as MusicSource
+			}
+		}
+	} as unknown as Parameters<typeof render>[1]);
+
+	await vi.waitFor(() => expect(h.providerView).toHaveBeenCalledTimes(1));
+	expect(h.localDetailRequest).toHaveBeenCalledTimes(1);
+	expect(h.providerView).toHaveBeenCalledWith(expect.objectContaining({ localArtist: undefined }));
+});
+
 it('replaces a linked local route with its MusicBrainz route', async () => {
-	render(ArtistPage, {
+	await render(ArtistPage, {
 		props: {
 			data: {
 				artistId: 'local-artist-id',
@@ -87,7 +108,7 @@ it('replaces a linked local route with its MusicBrainz route', async () => {
 
 it('keeps a local-only artist on its local route', async () => {
 	h.artist.musicbrainz_artist_id = null;
-	render(ArtistPage, {
+	await render(ArtistPage, {
 		props: {
 			data: {
 				artistId: 'local-artist-id',

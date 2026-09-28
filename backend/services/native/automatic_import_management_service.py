@@ -25,6 +25,7 @@ from core.exceptions import (
     StaleRevisionError,
     ValidationError,
 )
+from repositories.musicbrainz_base import MbSourceContext, capture_mb_source_context
 from infrastructure.audio.metadata_engine import (
     AUDIO_EXTENSION_FORMATS,
     AudioMetadataEngine,
@@ -129,8 +130,12 @@ class AutomaticImportManagementService:
         self._replaygain = replaygain
 
     async def prepare(
-        self, bundle: LibraryManagementImportBundle
+        self,
+        bundle: LibraryManagementImportBundle,
+        *,
+        source_context: MbSourceContext | None = None,
     ) -> LibraryManagementImportBundle:
+        source_context = source_context or capture_mb_source_context()
         managed = [value.pinned_profile is not None for value in bundle.files]
         if managed and all(managed):
             return bundle
@@ -143,7 +148,21 @@ class AutomaticImportManagementService:
         prepared = list(bundle.files)
         automatic: dict[int, tuple[object, object]] = {}
         try:
-            for request in bundle.files:
+            # F-NL-01 (DECISIONS-LIVE): an unmapped bonus file is imported
+            # unmanaged by default and must not hold the mapped part of the
+            # unit. Only management-eligible requests resolve a profile; the
+            # identity check below stays at the managed-request boundary.
+            managed_requests = [
+                request
+                for request in bundle.files
+                if (
+                    request.authoritative_mapping
+                    and request.release_group_mbid
+                    and request.release_mbid
+                )
+                or trigger == "edition_conversion"
+            ]
+            for request in managed_requests:
                 root_id = (
                     request.replacement_root_id
                     if request.conversion_recycle_only
@@ -174,7 +193,10 @@ class AutomaticImportManagementService:
                 )
             if not automatic:
                 return bundle
-            if len(automatic) != len(bundle.files):
+            if any(
+                value.conversion_recycle_only and value.ordinal not in automatic
+                for value in bundle.files
+            ):
                 raise ConfigurationError(
                     "One import unit cannot cross automatic and unmanaged root assignments."
                 )
@@ -194,6 +216,7 @@ class AutomaticImportManagementService:
                     not request.authoritative_mapping
                     or not request.release_group_mbid
                     or not request.release_mbid
+                    or not request.release_track_mbid
                 ):
                     raise ProviderIdentityRequiredError(
                         "Every automatic import file needs an accepted release-track mapping."
@@ -248,6 +271,7 @@ class AutomaticImportManagementService:
                     mappings=mappings,
                     profile=profile,
                     priority=RequestPriority.BACKGROUND_SYNC,
+                    source_context=source_context,
                 )
                 canonical_tracks = {
                     track.local_track_id: track
@@ -375,7 +399,11 @@ class AutomaticImportManagementService:
                         management_warnings=management_warnings,
                         artifacts=tuple(artifacts),
                     )
-                assert sidecars_added
+                # F-109: validated-input contracts must not vanish under -O.
+                if not sidecars_added:
+                    raise ValidationError(
+                        "A conversion import lost its sealed sidecar artifacts."
+                    )
                 for request in sorted(
                     (value for value in bundle.files if value.conversion_recycle_only),
                     key=lambda value: value.ordinal,
@@ -577,14 +605,20 @@ class AutomaticImportManagementService:
             canonical_available=True,
         )
         desired_metadata = self._metadata_document(effective)
+        # F-PERF-07: one bounded pass cache per automatic import so the
+        # projection reuses this inspection instead of walking twice.
+        artwork_pass_cache = self._artwork.new_pass_cache()
         existing_external = await self._artwork.inspect_existing_external(
-            profile.artwork, Path(request.input_path).parent
+            profile.artwork,
+            Path(request.input_path).parent,
+            pass_cache=artwork_pass_cache,
         )
         artwork = await self._artwork.project(
             settings=profile.artwork,
             release_mbid=canonical_release.identifiers.release_mbid,
             release_group_mbid=canonical_release.identifiers.release_group_mbid,
             album_directory=Path(request.input_path).parent,
+            pass_cache=artwork_pass_cache,
             existing_embedded=tuple(
                 ExistingArtworkDescriptor(
                     image_type=value.image_type,
@@ -718,16 +752,11 @@ class AutomaticImportManagementService:
                 )
             else:
                 stem = "cover" if output.image_type == "front" else output.image_type
-                rendered = self._naming.format_management_path(
+                rendered = self._naming.format_management_literal_path(
                     (parent / f"{stem}.{extension}").as_posix(),
-                    named,
                     pinned.profile.organization.compatibility,
                     script_name="Default external artwork naming",
                     root=root,
-                    artwork_type=output.image_type,
-                    artwork_comment=output.description,
-                    artwork_extension=extension,
-                    artwork_format=output.format,
                 )
             if rendered.collision_key in collision_keys:
                 raise AutomaticManagementHoldError(
@@ -776,7 +805,13 @@ class AutomaticImportManagementService:
                 if artifact.content is not None:
                     size = len(artifact.content)
                 else:
-                    assert artifact.source_path is not None
+                    if artifact.source_path is None:
+                        # F-109: contract check must survive python -O; the
+                        # hold outcome is the honest classification here.
+                        raise AutomaticManagementHoldError(
+                            ROOT_UNAVAILABLE,
+                            "An automatic import sidecar is unavailable.",
+                        )
                     try:
                         size = (
                             await asyncio.to_thread(Path(artifact.source_path).stat)

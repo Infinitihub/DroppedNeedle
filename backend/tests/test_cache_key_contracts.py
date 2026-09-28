@@ -8,7 +8,10 @@ from infrastructure.cache.cache_keys import (
     LIBRARY_REQUESTED_PREFIX,
     MB_ALBUM_SEARCH_PREFIX,
     MB_ARTIST_DETAIL_PREFIX,
+    MB_ARTIST_RGS_PREFIX,
     MB_ARTIST_SEARCH_PREFIX,
+    MB_ISRC_PREFIX,
+    MB_REDIRECT_PREFIX,
     MB_RELEASE_DETAIL_PREFIX,
     MB_RELEASE_EDITION_SEARCH_PREFIX,
     MB_RG_DETAIL_PREFIX,
@@ -27,7 +30,10 @@ from infrastructure.cache.cache_keys import (
     library_status_key,
     mb_album_search_key,
     mb_artist_detail_key,
+    mb_artist_rgs_page_key,
     mb_artist_search_key,
+    mb_isrc_key,
+    mb_redirect_key,
     mb_release_group_key,
     mb_release_edition_search_key,
     mb_release_key,
@@ -43,6 +49,9 @@ from infrastructure.cache.cache_keys import (
     [
         (mb_artist_search_key("test", 10, 0), MB_ARTIST_SEARCH_PREFIX),
         (mb_artist_detail_key("abc-123"), MB_ARTIST_DETAIL_PREFIX),
+        (mb_artist_rgs_page_key("abc-123", 100, 0), MB_ARTIST_RGS_PREFIX),
+        (mb_redirect_key("release", "abc-123"), MB_REDIRECT_PREFIX),
+        (mb_isrc_key("USRC17607839"), MB_ISRC_PREFIX),
         (mb_album_search_key("test", 10, 0), MB_ALBUM_SEARCH_PREFIX),
         (mb_release_group_key("abc"), MB_RG_DETAIL_PREFIX),
         (mb_release_key("abc"), MB_RELEASE_DETAIL_PREFIX),
@@ -68,6 +77,9 @@ from infrastructure.cache.cache_keys import (
     ids=[
         "mb_artist_search",
         "mb_artist_detail",
+        "mb_artist_rgs_page",
+        "mb_redirect",
+        "mb_isrc",
         "mb_album_search",
         "mb_release_group",
         "mb_release",
@@ -89,9 +101,9 @@ from infrastructure.cache.cache_keys import (
     ],
 )
 def test_key_starts_with_prefix(generated_key: str, expected_prefix: str):
-    assert generated_key.startswith(
-        expected_prefix
-    ), f"Key {generated_key!r} does not start with prefix {expected_prefix!r}"
+    assert generated_key.startswith(expected_prefix), (
+        f"Key {generated_key!r} does not start with prefix {expected_prefix!r}"
+    )
 
 
 def test_release_edition_cache_key_keeps_artist_and_title_boundaries() -> None:
@@ -122,6 +134,34 @@ def test_invalidation_groups_return_list_of_strings(group_fn: str):
     result = fn()
     assert isinstance(result, list)
     assert len(result) > 0, f"{group_fn}() returned an empty list"
-    assert all(
-        isinstance(p, str) for p in result
-    ), f"{group_fn}() contains non-string entries"
+    assert all(isinstance(p, str) for p in result), (
+        f"{group_fn}() contains non-string entries"
+    )
+
+
+def test_musicbrainz_prefixes_cover_all_registered_prefix_constants():
+    from infrastructure.cache import cache_keys
+
+    registered = {
+        value
+        for name, value in vars(cache_keys).items()
+        if name.startswith("MB_") and name.endswith("_PREFIX")
+    }
+    composites = {
+        cache_keys.ARTIST_INFO_PREFIX,
+        cache_keys.HOME_RESPONSE_PREFIX,
+        cache_keys.DISCOVER_RESPONSE_PREFIX,
+        cache_keys.ALBUM_INFO_PREFIX,
+        cache_keys.ALBUM_TRACKS_INFO_PREFIX,
+        cache_keys.DISCOVER_QUEUE_ENRICH_PREFIX,
+        cache_keys.ARTIST_DISCOVERY_TOP_SONGS_PREFIX,
+        cache_keys.ARTIST_DISCOVERY_TOP_ALBUMS_PREFIX,
+    }
+    actual = set(cache_keys.musicbrainz_prefixes())
+
+    assert registered <= actual, (
+        f"Missing registered MusicBrainz prefixes: {registered - actual}"
+    )
+    assert composites <= actual, (
+        f"Missing composite MusicBrainz prefixes: {composites - actual}"
+    )

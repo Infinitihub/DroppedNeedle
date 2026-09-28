@@ -11,6 +11,7 @@ a P1, not a curiosity. See .dev-notes/Plans/FreeMusic/00-PLAN.md.
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -21,7 +22,11 @@ from typing import TYPE_CHECKING
 from core.exceptions import ResourceNotFoundError, ValidationError
 from models.download_manifest import DownloadManifest, ExpectedTrack
 from models.free_music import FreeMusicCandidate, FreeMusicStatus, FreeMusicTask
-from services.native.quality_tiers import tier_for, tier_rank
+from services.native.acquisition import quality as acq_quality
+from services.native.acquisition.local_probe import (
+    expected_vs_actual_copy,
+    probe_files_sync,
+)
 from services.native.title_match import title_containment_score
 
 if TYPE_CHECKING:
@@ -54,6 +59,7 @@ class FreeMusicService:
         preferences_service: "PreferencesService",
         sse_publisher: "SSEPublisher",
         file_processor: "FileProcessor | None" = None,
+        probe_tagger=None,  # shared AudioTagger for local quality probes (None in tests)
     ) -> None:
         self._store = store
         self._archive = archive
@@ -61,11 +67,12 @@ class FreeMusicService:
         self._prefs = preferences_service
         self._sse = sse_publisher
         self._file_processor = file_processor
+        self._probe_tagger = probe_tagger
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancels: dict[str, asyncio.Event] = {}
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}
 
-    # -- public API (mirrors DownloadService's dispatch surface) --
+    # mirrors DownloadService's dispatch surface
 
     def is_ready(self) -> bool:
         return self._prefs.get_free_music_settings().enabled
@@ -200,8 +207,6 @@ class FreeMusicService:
         if failed:
             logger.info("free_music.stale_failed", extra={"tasks": failed})
 
-    # -- task lifecycle --
-
     async def _start(
         self,
         *,
@@ -245,7 +250,13 @@ class FreeMusicService:
             track_number=track_number,
             disc_number=disc_number,
         )
-        # the row exists before we return: the caller links the request to this id
+        # The policy snapshot is pinned at CREATION and never refreshed by later
+        # settings saves (retry keeps it; the native restart action refreshes).
+        snapshot = acq_quality.build_snapshot(self._prefs.get_download_policy())
+        blob = acq_quality.encode_snapshot(snapshot)
+        task.quality_snapshot_json = blob
+        task.quality_snapshot_hash = snapshot.snapshot_hash
+        task.quality_snapshot_summary = snapshot.summary
         await self._store.create(
             task_id,
             user_id,
@@ -263,6 +274,9 @@ class FreeMusicService:
             album_title=album_title,
             track_number=track_number,
             disc_number=disc_number,
+            quality_snapshot_json=blob,
+            quality_snapshot_hash=snapshot.snapshot_hash,
+            quality_snapshot_summary=snapshot.summary,
         )
         self._spawn(task_id, task)
         return task_id
@@ -299,7 +313,7 @@ class FreeMusicService:
             await self._run(task_id, task, cancel, lifecycle_lock)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - task boundary records failure instead of raising
             logger.exception("Free Music task %s failed", task_id)
             await self._fail(task_id, task.user_id, "Something went wrong. Try again.")
 
@@ -311,7 +325,14 @@ class FreeMusicService:
         lifecycle_lock: asyncio.Lock,
     ) -> None:
         try:
-            candidates = await self._find_candidates(task, task.track_count)
+            snapshot = self._task_snapshot(task)
+            candidates = await self._find_candidates(task, task.track_count, snapshot)
+        except ValidationError:
+            logger.warning("free_music.snapshot_invalid task=%s", task.id)
+            await self._fail(
+                task_id, task.user_id, "Stored quality policy snapshot is invalid."
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             logger.warning("free_music.search_failed mbid=%s: %s", task.mbid, exc)
             await self._fail(
@@ -319,6 +340,22 @@ class FreeMusicService:
             )
             return
 
+        filtered: list[FreeMusicCandidate] = []
+        for candidate in candidates:
+            evidence = acq_quality.evidence_from_archive_format(candidate.format)
+            if snapshot.flac_mp3_only and evidence.extension not in {"flac", "mp3"}:
+                continue
+            decision = acq_quality.evaluate(snapshot, evidence)
+            # Keep soft outside-policy/review candidates provisionally: an exact
+            # local probe may prove that the archive label understated quality.
+            # Unknown-rejected and hard importability/cap failures never spend
+            # bytes, regardless of whether the snapshot is v1 or v2.
+            if (
+                decision.disposition != "unknown_rejected"
+                and not acq_quality.is_hard_quality_rejection(decision)
+            ):
+                filtered.append(candidate)
+        candidates = filtered
         if not candidates:
             await self._fail(
                 task_id, task.user_id, "No source has this - try buying it instead."
@@ -327,36 +364,156 @@ class FreeMusicService:
         if cancel.is_set():
             return
 
-        best = candidates[0]
-        downloading = await self._store.update(
-            task_id,
-            status=FreeMusicStatus.DOWNLOADING,
-            identifier=best.identifier,
-            licence_url=best.licence_url,
-            format=best.extension,
-            files_total=len(best.filenames),
-            bytes_total=best.size_bytes,
-            expected_statuses=(FreeMusicStatus.SEARCHING,),
-        )
-        if not downloading:
-            return
-        await self._publish(task.user_id, task_id, FreeMusicStatus.DOWNLOADING)
-
-        dest = self._drop_import.incoming_dir() / f"free-{task_id}"
+        stored_raw = task.tried_candidates_json or "[]"
         try:
-            files = await self._download_with_retry(task_id, task, best, dest, cancel)
-        except _Cancelled:
-            await asyncio.to_thread(shutil.rmtree, dest, True)
+            tried: list[dict] = json.loads(stored_raw)
+        except (TypeError, ValueError) as exc:
+            logger.warning("free_music.ladder_decode_failed task=%s", task.id)
+            await self._fail(
+                task_id, task.user_id, "Stored candidate history is invalid."
+            )
             return
-        except Exception as exc:  # noqa: BLE001 - the user is waiting; report it
-            logger.warning("free_music.download_failed task=%s: %s", task_id, exc)
-            await asyncio.to_thread(shutil.rmtree, dest, True)
-            await self._fail(task_id, task.user_id, "The download failed. Try again.")
+        if not isinstance(tried, list) or any(
+            not isinstance(item, dict) for item in tried
+        ):
+            await self._fail(
+                task_id, task.user_id, "Stored candidate history is invalid."
+            )
             return
+        if tried:
+            candidates = self._order_candidates_from_ladder(candidates, tried)
+            if not candidates:
+                await self._fail(task_id, task.user_id, "No remaining source has this.")
+                return
+        await self._persist_candidate_ladder(task_id, task, candidates)
+        if not tried:
+            tried = [
+                {"identifier": candidate.identifier, "format": candidate.format}
+                for candidate in candidates
+            ]
 
-        if not files:
+        excluded = {
+            (entry.get("identifier"), entry.get("format"))
+            for entry in tried
+            if entry.get("reason")
+            or entry.get("outcome")
+            in {
+                "completed",
+                "post_download_quality_mismatch",
+                "quality_probe_unavailable",
+            }
+        }
+        queue = [c for c in candidates if (c.identifier, c.format) not in excluded]
+
+        last_quality_note: str | None = None
+        dest = self._drop_import.incoming_dir() / f"free-{task_id}"
+        files: list[Path] | None = None
+        best: FreeMusicCandidate | None = None
+
+        while queue and not cancel.is_set() and files is None:
+            candidate = queue.pop(0)
+            downloading = await self._store.update(
+                task_id,
+                status=FreeMusicStatus.DOWNLOADING,
+                identifier=candidate.identifier,
+                licence_url=candidate.licence_url,
+                format=candidate.extension,
+                files_total=len(candidate.filenames),
+                bytes_total=candidate.size_bytes,
+                attempts=1,
+                expected_statuses=(
+                    FreeMusicStatus.SEARCHING,
+                    FreeMusicStatus.DOWNLOADING,
+                ),
+            )
+            if not downloading:
+                return
+            await self._publish(task.user_id, task_id, FreeMusicStatus.DOWNLOADING)
+
+            try:
+                downloaded = await self._download_with_retry(
+                    task_id, task, candidate, dest, cancel
+                )
+            except _Cancelled:
+                await asyncio.to_thread(shutil.rmtree, dest, True)
+                return
+            except Exception as exc:  # noqa: BLE001 - user is waiting; report it
+                logger.warning("free_music.download_failed task=%s: %s", task_id, exc)
+                await asyncio.to_thread(shutil.rmtree, dest, True)
+                await self._fail(
+                    task_id, task.user_id, "The download failed. Try again."
+                )
+                return
+
+            if not downloaded:
+                await asyncio.to_thread(shutil.rmtree, dest, True)
+                continue  # move on to the next candidate/format
+
+            expected_evidence = acq_quality.evidence_from_archive_format(
+                candidate.format
+            )
+            expected_decision = acq_quality.evaluate(snapshot, expected_evidence)
+            requires_exact_probe = expected_decision.disposition in {
+                "needs_review",
+                "outside_policy",
+            }
+            probed = self._probe_downloaded(downloaded)
+            if requires_exact_probe and probed is None:
+                last_quality_note = (
+                    "Downloaded copy could not be locally quality-verified; "
+                    "trying the next source."
+                )
+                self._record_candidate_outcome(
+                    tried, candidate, "quality_probe_unavailable"
+                )
+                await self._store.update(
+                    task_id,
+                    tried_candidates_json=json.dumps(tried),
+                    bytes_downloaded=0,
+                    expected_statuses=(FreeMusicStatus.DOWNLOADING,),
+                )
+                await asyncio.to_thread(shutil.rmtree, dest, True)
+                continue
+            if probed is not None:
+                from services.native.acquisition.local_probe import quality_mismatch
+
+                if quality_mismatch(snapshot, expected_decision, probed):
+                    logger.info(
+                        "free_music.quality_mismatch task=%s fmt=%s",
+                        task_id,
+                        candidate.format,
+                    )
+                    last_quality_note = (
+                        "Downloaded copy didn't match the server's quality "
+                        f"policy ({expected_vs_actual_copy(expected_decision, probed)})"
+                    )
+                    self._record_candidate_outcome(
+                        tried, candidate, "post_download_quality_mismatch"
+                    )
+                    await self._store.update(
+                        task_id,
+                        tried_candidates_json=json.dumps(tried),
+                        bytes_downloaded=0,
+                        expected_statuses=(FreeMusicStatus.DOWNLOADING,),
+                    )
+                    await asyncio.to_thread(shutil.rmtree, dest, True)
+                    continue
+
+            self._record_candidate_outcome(tried, candidate, "completed")
+            await self._store.update(
+                task_id,
+                tried_candidates_json=json.dumps(tried),
+                expected_statuses=(FreeMusicStatus.DOWNLOADING,),
+            )
+            files = downloaded
+            best = candidate
+
+        if cancel.is_set():
+            return
+        if files is None or best is None:
+            message = last_quality_note or "The download produced no files."
             await asyncio.to_thread(shutil.rmtree, dest, True)
-            await self._fail(task_id, task.user_id, "The download produced no files.")
+            await self._fail(task_id, task.user_id, message)
             return
 
         async with lifecycle_lock:
@@ -416,8 +573,8 @@ class FreeMusicService:
                         "Free Music could not verify the requested recording."
                     )
             else:
-                # The drop importer identifies, tags, organises, resolves the request,
-                # and notifies the requester, as it does for a dropped Bandcamp zip.
+                # The drop importer identifies, tags, organises, resolves the
+                # request, and notifies the requester.
                 await self._drop_import.create_job(
                     user_id=task.user_id,
                     user_name="Free Music",
@@ -443,13 +600,81 @@ class FreeMusicService:
             },
         )
 
-    # -- candidates --
+    def _probe_downloaded(self, files: list[Path]):
+        """Local codec-aware probe before publication. Returns None (probe
+        skipped) only when no tagger was wired - tests build the service that
+        way; production composition always passes one."""
+        if self._probe_tagger is None:
+            return None
+        return probe_files_sync(files, self._probe_tagger)
+
+    @staticmethod
+    def _order_candidates_from_ladder(
+        candidates: list[FreeMusicCandidate], ladder: list[dict]
+    ) -> list[FreeMusicCandidate]:
+        """Use the persisted candidate order; never let a fresh search reorder it."""
+        by_key: dict[tuple[str, str], list[FreeMusicCandidate]] = {}
+        for candidate in candidates:
+            by_key.setdefault((candidate.identifier, candidate.format), []).append(
+                candidate
+            )
+        ordered: list[FreeMusicCandidate] = []
+        for entry in ladder:
+            key = (entry.get("identifier"), entry.get("format"))
+            matches = by_key.get(key)
+            if matches:
+                ordered.append(matches.pop(0))
+        return ordered
+
+    @staticmethod
+    def _record_candidate_outcome(
+        ladder: list[dict],
+        candidate: FreeMusicCandidate,
+        outcome: str,
+    ) -> None:
+        key = (candidate.identifier, candidate.format)
+        for entry in ladder:
+            if (entry.get("identifier"), entry.get("format")) == key:
+                entry["outcome"] = outcome
+                entry.pop("reason", None)
+                return
+        # Preserve compatibility with an older row whose ladder omitted this
+        # candidate; never reorder or replace the entries already persisted.
+        ladder.append({"identifier": key[0], "format": key[1], "outcome": outcome})
+
+    async def _persist_candidate_ladder(
+        self,
+        task_id: str,
+        task: FreeMusicTask,
+        candidates: list[FreeMusicCandidate],
+    ) -> None:
+        """Write the ranked ladder once, before the first byte moves."""
+        if task.tried_candidates_json and task.tried_candidates_json != "[]":
+            return
+        ladder = [{"identifier": c.identifier, "format": c.format} for c in candidates]
+        await self._store.update(
+            task_id,
+            tried_candidates_json=json.dumps(ladder),
+            expected_statuses=(FreeMusicStatus.SEARCHING,),
+        )
+
+    def _select_files(self, task: FreeMusicTask, entries: list) -> list:
+        """An album takes every file of its format; a track takes the one whose
+        title matches."""
+        if task.kind == "album":
+            return sorted(entries, key=lambda e: (e.track or 0, e.name))
+        best = None
+        best_score = 0.0
+        for entry in entries:
+            score = title_containment_score(task.title, entry.title or entry.name)
+            if score > best_score:
+                best, best_score = entry, score
+        return [best] if best is not None and best_score >= _TITLE_MATCH_FLOOR else []
 
     async def _find_candidates(
-        self, task: FreeMusicTask, track_count: int
+        self, task: FreeMusicTask, track_count: int, snapshot
     ) -> list[FreeMusicCandidate]:
         items = await self._archive.search_audio(task.artist, task.title)
-        preferred = self._prefs.get_free_music_settings().preferred_format.lower()
 
         candidates: list[FreeMusicCandidate] = []
         for item in items:
@@ -484,39 +709,46 @@ class FreeMusicService:
                     )
                 )
 
-        candidates.sort(key=lambda c: self._rank(c, preferred, track_count))
+        candidates.sort(key=lambda c: self._quality_sort_key(c, snapshot, track_count))
         return candidates
 
-    def _select_files(self, task: FreeMusicTask, entries: list) -> list:
-        """An album takes every file of its format; a track takes the one whose
-        title matches."""
-        if task.kind == "album":
-            return sorted(entries, key=lambda e: (e.track or 0, e.name))
-        best = None
-        best_score = 0.0
-        for entry in entries:
-            score = title_containment_score(task.title, entry.title or entry.name)
-            if score > best_score:
-                best, best_score = entry, score
-        return [best] if best is not None and best_score >= _TITLE_MATCH_FLOOR else []
-
     @staticmethod
-    def _rank(candidate: FreeMusicCandidate, preferred: str, track_count: int) -> tuple:
+    def _quality_sort_key(
+        candidate: FreeMusicCandidate, snapshot, track_count: int
+    ) -> tuple:
         """Lower sorts first.
 
-        Agreement with MusicBrainz's track count comes FIRST: getting the right
-        record matters more than getting it in the right format, and the Archive
-        is full of two-track samplers of ten-track albums. Only then the admin's
-        preferred format, the quality tier, and finally the larger (better-encoded)
-        copy. With no MusicBrainz track count the first key is flat and format
-        preference decides.
-        """
+        MusicBrainz track-count agreement stays FIRST (owner-signed authority).
+        The admin format preference (`free_music.preferred_format`) is no
+        longer read for ranking - order comes from the task's stored quality
+        snapshot: global preference step, then evidence certainty, then size.
+        Outside-policy/rejected candidates get a step past the unknown slot so
+        they are only reached after every acceptable option is exhausted."""
         count_delta = abs(candidate.track_count - track_count) if track_count else 0
-        not_preferred = 0 if candidate.extension == preferred else 1
-        quality = -tier_rank(tier_for(candidate.extension, None))
-        return (count_delta, not_preferred, quality, -candidate.size_bytes)
+        evidence = acq_quality.evidence_from_archive_format(candidate.format)
+        decision = acq_quality.evaluate(snapshot, evidence)
+        step = decision.preference_step
+        if step is None:
+            step = (
+                len(snapshot.quality_recipe) + 2
+                if acq_quality.is_recipe_snapshot(snapshot)
+                else len(snapshot.quality_preference_order) + 2
+            )
+        certainty = acq_quality.CERTAINTY_RANK[evidence.certainty]
+        return (count_delta, step, -certainty, -candidate.size_bytes)
 
-    # -- download --
+    def _task_snapshot(self, task: FreeMusicTask):
+        """Return the stored snapshot, migrating only a NULL legacy row."""
+        raw = task.quality_snapshot_json
+        if raw is not None:
+            try:
+                return acq_quality.decode_snapshot(raw)
+            except acq_quality.SnapshotValidationError as exc:
+                logger.warning("free_music.snapshot_decode_failed task=%s", task.id)
+                raise ValidationError(
+                    "Stored quality policy snapshot is invalid"
+                ) from exc
+        return acq_quality.migration_snapshot(self._prefs.get_download_policy())
 
     async def _download_with_retry(
         self,
@@ -604,8 +836,6 @@ class FreeMusicService:
         if not updated:
             raise _Cancelled
         return written
-
-    # -- helpers --
 
     async def _fail(self, task_id: str, user_id: str, message: str) -> None:
         failed = await self._store.update(

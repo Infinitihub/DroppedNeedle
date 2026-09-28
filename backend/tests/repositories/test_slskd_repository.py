@@ -3,9 +3,11 @@ slskd JSON -> DownloadSearchResult translation, query building, path parsing,
 and (username, filenames) status/cancel correlation."""
 
 import asyncio
+import logging
 import threading
+import unicodedata
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import httpx
 import pytest
@@ -243,6 +245,80 @@ def test_album_query_ladder_skips_wildcards_for_unwildcardable_artist():
     assert ladder == ["U2 Pop 1997", "U2 Pop", "U2"]
 
 
+def test_primary_artist_takes_first_comma_segment():
+    assert SlskdRepository._primary_artist("YELLOW MAGIC ORCHESTRA, 吉沢典夫") == (
+        "YELLOW MAGIC ORCHESTRA"
+    )
+    assert SlskdRepository._primary_artist("Artist") == "Artist"
+    assert SlskdRepository._primary_artist("  spaced  , other") == "spaced"
+    # empty first segment falls back to the full credit rather than blanking queries.
+    assert SlskdRepository._primary_artist(", other") == ", other"
+
+
+def test_stripped_album_title_drops_edition_and_subtitle():
+    assert (
+        SlskdRepository._stripped_album_title("Euphoria (International Edition)")
+        == "Euphoria"
+    )
+    assert (
+        SlskdRepository._stripped_album_title(
+            "Devil May Cry: Season 2 (Soundtrack from the Netflix Series)"
+        )
+        == "Devil May Cry"
+    )
+    assert SlskdRepository._stripped_album_title("Solid State Survivor") == (
+        "Solid State Survivor"
+    )
+    assert SlskdRepository._stripped_album_title("(Bonus)") == ""
+
+
+def test_album_query_ladder_queries_primary_artist_only():
+    # issue #373: the full comma-joined credit AND-zeroes the search on Soulseek.
+    ladder = SlskdRepository._album_query_ladder(
+        "YELLOW MAGIC ORCHESTRA, 吉沢典夫", "Solid State Survivor", 1979
+    )
+    assert ladder == [
+        "YELLOW MAGIC ORCHESTRA Solid State Survivor 1979",
+        "*ELLOW *AGIC *RCHESTRA Solid State Survivor 1979",
+        "YELLOW MAGIC ORCHESTRA Solid State Survivor",
+        "*ELLOW *AGIC *RCHESTRA Solid State Survivor",
+        "YELLOW MAGIC ORCHESTRA",
+        "*ELLOW *AGIC *RCHESTRA",
+    ]
+    assert all("吉沢典夫" not in query for query in ladder)
+
+
+def test_album_query_ladder_appends_edition_stripped_rungs_last():
+    ladder = SlskdRepository._album_query_ladder(
+        "Papa Roach", "Devil May Cry: Season 2 (Soundtrack from the Netflix Series)", None
+    )
+    assert ladder == [
+        "Papa Roach Devil May Cry: Season 2 Soundtrack from the Netflix Series",
+        "*apa *oach Devil May Cry: Season 2 Soundtrack from the Netflix Series",
+        "Papa Roach Devil May Cry",
+        "*apa *oach Devil May Cry",
+        "Papa Roach",
+        "*apa *oach",
+    ]
+
+
+def test_track_query_ladder_queries_primary_artist_only():
+    ladder = SlskdRepository._track_query_ladder("Artist, Featured", "Track", "Album")
+    assert ladder[0] == "Artist Track Album"
+    assert all("Featured" not in query for query in ladder)
+
+
+@pytest.mark.asyncio
+async def test_search_album_issues_primary_artist_query_first():
+    fake = _LadderFake({})
+    repo = SlskdRepository(
+        client=fake, url="u", api_key="k", downloads_mount=Path("/dl")
+    )
+    assert await repo.search_album("Artist, Featured", "Album", 2000) == []
+    assert fake.queries[0] == "Artist Album 2000"
+    assert all("Featured" not in query for query in fake.queries)
+
+
 @pytest.mark.asyncio
 async def test_search_album_stops_at_first_nonempty():
     q0 = SlskdRepository._build_album_query("Artist", "Album", 2000)
@@ -349,6 +425,83 @@ async def test_get_status_correlates_by_filename(mock_repo):
     assert status.status == "completed"
 
 
+@pytest.mark.asyncio
+async def test_status_keeps_nfc_equivalent_requested_files_separate():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfc", nfc, "Completed, Succeeded"),
+        _attempt("nfd", nfd, "Completed, Succeeded"),
+    ]
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+
+    status = await repo.get_status(_h("alice", [nfc, nfd]))
+
+    assert status.status == "completed"
+    assert status.files_total == 2
+    assert status.files_completed == 2
+    assert status.files_failed == 0
+    assert status.matched_transfers == 2
+
+
+@pytest.mark.asyncio
+async def test_status_and_abort_prefer_exact_unicode_spelling():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfd", nfd, "Completed, Errored"),
+        _attempt("nfc", nfc, "Completed, Succeeded"),
+    ]
+    client.cancel_transfer.return_value = True
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+    handle = _h("alice", [nfc])
+
+    status = await repo.get_status(handle)
+    assert status.status == "completed"
+    assert status.files_completed == 1
+    assert status.matched_transfers == 1
+
+    assert await repo.abort(handle) is True
+    assert client.cancel_transfer.await_args_list == [call("alice", "nfc")]
+
+
+@pytest.mark.asyncio
+async def test_status_falls_back_to_lone_alternate_unicode_spelling():
+    client = AsyncMock()
+    base = "dir/café.flac"
+    nfc = unicodedata.normalize("NFC", base)
+    nfd = unicodedata.normalize("NFD", base)
+    client.get_downloads.return_value = [
+        _attempt("nfd", nfd, "Completed, Succeeded"),
+    ]
+    repo = SlskdRepository(
+        client=client,
+        url="u",
+        api_key="k",
+        downloads_mount=Path("/dl"),
+    )
+
+    status = await repo.get_status(_h("alice", [nfc]))
+
+    assert status.status == "completed"
+    assert status.files_completed == 1
+    assert status.matched_transfers == 1
+
+
 def test_status_aggregates_live_queue_position_range():
     repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
     handle = _h("alice", ["dir/1.flac", "dir/2.flac", "dir/3.flac"])
@@ -381,6 +534,253 @@ def test_status_aggregates_live_queue_position_range():
     assert status.status == "queued"
     assert status.queue_position_start == 91
     assert status.queue_position_end == 100
+
+
+def _attempt(id_, filename, state, requested_at=None, started_at=None):
+    """One slskd transfer record. slskd appends ONE RECORD PER RETRY ATTEMPT per
+    file (#131/#253), so these tests stack several records per filename."""
+    return SlskdTransfer(
+        id=id_,
+        username="alice",
+        filename=filename,
+        state=state,
+        requested_at=requested_at,
+        started_at=started_at,
+    )
+
+
+def test_status_judges_latest_attempt_not_stale_success():
+    # Bug #131/#253 headline case: slskd keeps one record PER RETRY ATTEMPT, so a
+    # stale "Completed, Succeeded" row must NOT shadow a newer TimedOut one - the
+    # file counts failed by its latest attempt and never lands in succeeded_filenames.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("old", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="2026-08-01T10:00:00Z"),
+        _attempt("new", "dir/1.flac", "Completed, TimedOut",
+                 requested_at="2026-08-01T12:00:00Z"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 0
+    assert status.files_failed == 1
+    assert status.succeeded_filenames == []
+    assert status.status == "failed"
+    assert status.matched_transfers == 2  # raw record count stays observable
+
+
+def test_status_recovered_success_after_error_counts_succeeded():
+    # Mirror image: a newer successful attempt overrides an older Errored one
+    # (exercises the StartedAt fallback - only StartedAt carries timestamps here).
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("old", "dir/1.flac", "Completed, Errored",
+                 started_at="2026-08-01T10:00:00Z"),
+        _attempt("new", "dir/1.flac", "Completed, Succeeded",
+                 started_at="2026-08-01T11:00:00Z"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.files_failed == 0
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.status == "completed"
+
+
+def test_status_timestamped_attempt_beats_absent_or_garbage_timestamps():
+    # PR #222: requestedAt is absent/unparseable on some slskd versions. Any
+    # parseable timestamp outranks an absent or garbage one; among records with no
+    # usable timestamp the later list position wins (list-order tie-break).
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="2026-08-01T10:00:00Z"),
+        _attempt("b", "dir/1.flac", "Completed, Errored"),  # later, but no timestamps
+    ]
+    status = repo._aggregate_status(handle, transfers)
+    assert status.files_completed == 1
+    assert status.succeeded_filenames == ["dir/1.flac"]
+
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Errored"),
+        _attempt("b", "dir/1.flac", "Completed, Succeeded"),
+    ]
+    status = repo._aggregate_status(handle, transfers)
+    assert status.files_completed == 1  # untimestamped tie -> later record wins
+    assert status.succeeded_filenames == ["dir/1.flac"]
+
+
+def test_status_completed_errored_is_terminal_failed_not_uncounted():
+    """#292: slskd writes mid-transfer failures as 'Completed, Errored' - the file
+    must count FAILED (terminal) under the dedup, never fall through every branch
+    and stall the task until the watchdogs fire."""
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac", "dir/2.flac"])
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="2026-08-01T10:00:00Z"),
+        _attempt("b", "dir/2.flac", "Completed, Errored",
+                 requested_at="2026-08-01T10:01:00Z"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.files_failed == 1
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.status == "partial"
+
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded",
+                 requested_at="not-a-timestamp"),
+        _attempt("b", "dir/1.flac", "Completed, TimedOut"),
+    ]
+    status = repo._aggregate_status(handle, transfers)
+    assert status.files_failed == 1  # garbage timestamp ranks oldest -> b wins
+    assert status.succeeded_filenames == []
+
+
+def test_status_identical_duplicate_records_collapse_to_one_file():
+    # The same attempt surfaced twice must not double the completed count or
+    # duplicate the entry in succeeded_filenames.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("a", "dir/1.flac", "Completed, Succeeded"),
+        _attempt("b", "dir/1.flac", "Completed, Succeeded"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.files_failed == 0
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.matched_transfers == 2
+
+
+def test_status_dedupe_keys_normalise_path_separators():
+    # The same file reported once with backslashes and once with forward slashes is
+    # ONE file: separator-normalised keys, like every filename comparison here.
+    # Without normalisation the stale-success shadow would yield "partial".
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        _attempt("a", "dir\\1.flac", "Completed, Succeeded"),
+        _attempt("b", "dir/1.flac", "Completed, TimedOut"),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 0
+    assert status.files_failed == 1
+    assert status.status == "failed"
+    assert status.matched_transfers == 2
+
+
+def test_status_single_record_per_file_behaviour_unchanged():
+    # The plain case - one record per file - aggregates exactly as before dedup:
+    # terminal mix, active flag, queue positions and byte math are untouched.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac", "dir/2.flac"])
+    transfers = [
+        SlskdTransfer(
+            id="1",
+            username="alice",
+            filename="dir/1.flac",
+            state="Completed, Succeeded",
+            size=100,
+            bytes_transferred=100,
+        ),
+        SlskdTransfer(
+            id="2",
+            username="alice",
+            filename="dir/2.flac",
+            state="Queued",
+            place_in_queue=7,
+        ),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.status == "downloading"
+    assert status.files_total == 2
+    assert status.files_completed == 1
+    assert status.files_failed == 0
+    assert status.has_active_transfer is False
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.queue_position_start == 7
+    assert status.queue_position_end == 7
+    assert status.bytes_total == 100
+
+
+def test_status_truncated_succeeded_is_not_completed():
+    # #122 part 2: slskd flags a truncated transfer succeeded; a short
+    # succeeded record (25% of size) must never count as completed or land in
+    # succeeded_filenames. Terminal short -> failed so it fails over/retries.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        SlskdTransfer(
+            id="1",
+            username="alice",
+            filename="dir/1.flac",
+            state="Completed, Succeeded",
+            size=100,
+            bytes_transferred=25,
+        ),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 0
+    assert status.succeeded_filenames == []
+    assert status.files_failed == 1
+    assert status.status == "failed"
+    # Byte totals stay sum-over-all-records even for the stub.
+    assert status.bytes_total == 100
+    assert status.bytes_downloaded == 25
+
+
+def test_status_full_bytes_succeeded_still_completes():
+    # bytes_transferred == size keeps the pre-fix verdict.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [
+        SlskdTransfer(
+            id="1",
+            username="alice",
+            filename="dir/1.flac",
+            state="Completed, Succeeded",
+            size=100,
+            bytes_transferred=100,
+        ),
+    ]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.files_failed == 0
+    assert status.status == "completed"
+
+
+def test_status_unknown_size_succeeded_fails_open():
+    # Size unknown (default 0) keeps the pre-fix verdict: flag alone decides.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=Path("/dl"))
+    handle = _h("alice", ["dir/1.flac"])
+    transfers = [_attempt("a", "dir/1.flac", "Completed, Succeeded")]
+
+    status = repo._aggregate_status(handle, transfers)
+
+    assert status.files_completed == 1
+    assert status.succeeded_filenames == ["dir/1.flac"]
+    assert status.files_failed == 0
+    assert status.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -516,6 +916,211 @@ async def test_get_file_path_deep_nested_non_username_folder(tmp_path):
     )
     assert path == f.resolve()
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_form", "disk_form"),
+    [("NFC", "NFD"), ("NFD", "NFC")],
+)
+async def test_get_file_path_normalised_nested_alias_returns_real_path(
+    tmp_path, remote_form, disk_form
+):
+    visible_name = "05 - Héroes Del Sábado.flac"
+    remote_name = unicodedata.normalize(remote_form, visible_name)
+    disk_name = unicodedata.normalize(disk_form, visible_name)
+    folder = tmp_path / "Artist" / "Album"
+    folder.mkdir(parents=True)
+    file_path = folder / disk_name
+    file_path.write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"@@peer\\Music\\Album\\{remote_name}", size=10
+    )
+
+    assert path == file_path.resolve()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_form", "disk_form"),
+    [("NFC", "NFD"), ("NFD", "NFC")],
+)
+async def test_get_file_path_normalised_nested_alias_wrong_size_still_resolves(
+    tmp_path, remote_form, disk_form
+):
+    # A wrong search-advertised size must not veto the alias: the locator
+    # returns the single normalized match and the verifier (not the locator)
+    # owns the SIZE_MISMATCH rejection.
+    visible_name = "05 - Héroes Del Sábado.flac"
+    remote_name = unicodedata.normalize(remote_form, visible_name)
+    disk_name = unicodedata.normalize(disk_form, visible_name)
+    folder = tmp_path / "Artist" / "Album"
+    folder.mkdir(parents=True)
+    file_path = folder / disk_name
+    file_path.write_bytes(b"abcdefghij")  # 10 bytes on disk, 999 advertised
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"@@peer\\Music\\Album\\{remote_name}", size=999
+    )
+
+    assert path == file_path.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_ambiguity_fails_closed(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    remote_name = unicodedata.normalize("NFC", visible_name)
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    for folder_name in ("Artist A", "Artist B"):
+        folder = tmp_path / folder_name
+        folder.mkdir()
+        (folder / disk_name).write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(_h("peer1"), f"Music/{remote_name}", size=10) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_ambiguity_logs_count(tmp_path, caplog):
+    # Two same-size normalized aliases fail closed and log the candidate
+    # count instead of the generic not-found message; no username leaks.
+    visible_name = "01 - Héroes.flac"
+    remote_name = unicodedata.normalize("NFC", visible_name)
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    for folder_name in ("Artist A", "Artist B"):
+        folder = tmp_path / folder_name
+        folder.mkdir()
+        (folder / disk_name).write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    with caplog.at_level(
+        logging.WARNING, logger="repositories.slskd.slskd_repository"
+    ):
+        assert (
+            await repo.get_file_path(_h("peer1"), f"Music/{remote_name}", size=10)
+            is None
+        )
+    assert "ambiguous=2" in caplog.text
+    assert "budget exhausted" not in caplog.text
+    assert "peer1" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_fallback_budget_exhaustion_logs_budget(
+    tmp_path, monkeypatch, caplog
+):
+    # An exhausted entry budget fails closed with the budget message instead
+    # of the generic not-found message.
+    import repositories.slskd.slskd_repository as slskd_repository
+
+    monkeypatch.setattr(slskd_repository, "_MAX_WALK_ENTRIES", 1)
+    folder = tmp_path / "peer1"
+    folder.mkdir()
+    (folder / "noise.txt").write_bytes(b"x")
+    alias = unicodedata.normalize("NFD", "01 - Héroes.flac")
+    (folder / alias).write_bytes(b"abcdefghij")
+
+    original_iterdir = Path.iterdir
+
+    def _iterdir_in_test_order(path):
+        entries = list(original_iterdir(path))
+        if path == folder:
+            entries.sort(key=lambda entry: entry.name != "noise.txt")
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir_in_test_order)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    with caplog.at_level(
+        logging.WARNING, logger="repositories.slskd.slskd_repository"
+    ):
+        assert (
+            await repo.get_file_path(
+                _h("peer1"),
+                "peer1/01 - Héroes.flac",
+            )
+            is None
+        )
+    assert "budget exhausted" in caplog.text
+    assert "ambiguous=" not in caplog.text
+    assert "peer1" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_prefers_peer_scope(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    peer_file = tmp_path / "peer1" / "Album" / disk_name
+    peer_file.parent.mkdir(parents=True)
+    peer_file.write_bytes(b"abcdefghij")
+    other_file = tmp_path / "Other Artist" / disk_name
+    other_file.parent.mkdir()
+    other_file.write_bytes(b"abcdefghij")
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), f"Music/Album/{unicodedata.normalize('NFC', visible_name)}", size=10
+    )
+
+    assert path == peer_file.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_alias_skips_outside_symlink(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / disk_name).write_bytes(b"abcdefghij")
+    (tmp_path / "peer1").mkdir()
+    (tmp_path / "peer1" / "escaped").symlink_to(outside, target_is_directory=True)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"),
+            f"Music/Album/{unicodedata.normalize('NFC', visible_name)}",
+            size=10,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_normalised_fallback_shares_entry_bound(
+    tmp_path, monkeypatch
+):
+    import repositories.slskd.slskd_repository as slskd_repository
+
+    monkeypatch.setattr(slskd_repository, "_MAX_WALK_ENTRIES", 1)
+    folder = tmp_path / "peer1"
+    folder.mkdir()
+    (folder / "noise.txt").write_bytes(b"x")
+    alias = unicodedata.normalize("NFD", "01 - Héroes.flac")
+    (folder / alias).write_bytes(b"abcdefghij")
+
+    original_iterdir = Path.iterdir
+
+    def _iterdir_in_test_order(path):
+        entries = list(original_iterdir(path))
+        if path == folder:
+            entries.sort(key=lambda entry: entry.name != "noise.txt")
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir_in_test_order)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"),
+            "peer1/01 - Héroes.flac",
+        )
+        is None
+    )
+
 
 @pytest.mark.asyncio
 async def test_get_file_path_whole_mount_fallback_disambiguates_by_size(tmp_path):
@@ -533,6 +1138,256 @@ async def test_get_file_path_whole_mount_fallback_disambiguates_by_size(tmp_path
         _h("peer1"), "@@p\\X\\AlbumB\\01 - Track.flac", size=10
     )
     assert path == right.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_stale_same_named_hit_with_known_size_returns_none(
+    tmp_path,
+):
+    # Issue #397: the previous peer's same-named leftover must not verify as the
+    # current peer's transfer. With a known expected size the cheap exact steps
+    # (leaf dir, one-level scan) skip a byte-mismatched hit and the walk
+    # fallbacks refuse an exact-named mismatch, so lookup ends at None and the
+    # file_processor (c)-path raises SOURCE_FILE_MISSING (local fault, never
+    # quarantined) instead of SIZE_MISMATCH against the wrong peer.
+    leaf = tmp_path / "AlbumX"
+    leaf.mkdir()
+    (leaf / "01 - Track.flac").write_bytes(b"x" * 10)  # stale, 10 bytes
+    other = tmp_path / "PrevPeerAlbum"
+    other.mkdir()
+    (other / "02 - Other.flac").write_bytes(b"y" * 10)  # stale, other leaf
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peerB"), "peerB\\AlbumX\\01 - Track.flac", size=999
+        )
+        is None
+    )
+    assert (
+        await repo.get_file_path(
+            _h("peerB"), "peerB\\AlbumX\\02 - Other.flac", size=999
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_matching_size_leaf_hit_still_resolves(tmp_path):
+    # The current peer's own same-named file (bytes match the advertised size)
+    # still resolves through the cheap leaf step.
+    leaf = tmp_path / "AlbumX"
+    leaf.mkdir()
+    current = leaf / "01 - Track.flac"
+    current.write_bytes(b"x" * 999)
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peerB"), "peerB\\AlbumX\\01 - Track.flac", size=999
+    )
+    assert path == current.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_unknown_size_keeps_name_only_leaf_hit(tmp_path):
+    # Unknown expected size keeps the old name-only behavior: a same-named hit
+    # resolves without any byte comparison.
+    leaf = tmp_path / "AlbumX"
+    leaf.mkdir()
+    stale = leaf / "01 - Track.flac"
+    stale.write_bytes(b"x" * 10)
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(_h("peerB"), "peerB\\AlbumX\\01 - Track.flac")
+    assert path == stale.resolve()
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_resolves_album_folder_track_prefixed_punctuation_variant(
+    tmp_path,
+):
+    # Issue #229: the peer advertises a flat "Artist - Album - NN - Title.mp3"
+    # name but slskd files the download as "NN. Title.mp3" inside an album
+    # folder with no username dir, so every exact/NFC step misses.
+    folder = tmp_path / "Hollywood Vampires - Rise"
+    folder.mkdir()
+    disk = folder / "01. I Want My Now.mp3"
+    disk.write_bytes(b"x" * 12345)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("somepeer"),
+        "PeerShare\\Hollywood Vampires - Rise - 01 - I Want My Now.mp3",
+        size=12345,
+    )
+
+    assert path == disk.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_peer_scoped_resolves_with_size(tmp_path):
+    # Same divergence filed under the peer's folder: the pre-existing peer
+    # size fallback already recovers the lone same-size file; the fuzzy step
+    # must agree with it rather than shadow or contradict it.
+    folder = tmp_path / "peer1" / "Some Album"
+    folder.mkdir(parents=True)
+    disk = folder / "01. Title Here.mp3"
+    disk.write_bytes(b"y" * 200)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), "Share\\Artist - Album - 01 - Title Here.mp3", size=200
+    )
+
+    assert path == disk.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_peer_scoped_unique_resolves_without_size(tmp_path):
+    # Size unknown skips the peer size fallback entirely; a unique fuzzy match
+    # under the peer's folder still resolves.
+    folder = tmp_path / "peer1" / "Some Album"
+    folder.mkdir(parents=True)
+    disk = folder / "01. Title Here.mp3"
+    disk.write_bytes(b"y" * 200)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), "Share\\Artist - Album - 01 - Title Here.mp3"
+    )
+
+    assert path == disk.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_mount_wide_requires_size(tmp_path):
+    # No peer dir: without a known size the mount-wide fuzzy sweep is skipped
+    # (no size gate to keep it honest); with the size it resolves, and a
+    # wrong size still misses.
+    folder = tmp_path / "Some Album"
+    folder.mkdir()
+    disk = folder / "01. Title Here.mp3"
+    disk.write_bytes(b"z" * 300)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    remote = "Share\\Artist - Album - 01 - Title Here.mp3"
+    assert await repo.get_file_path(_h("peer9"), remote) is None
+    assert await repo.get_file_path(_h("peer9"), remote, size=301) is None
+    assert await repo.get_file_path(_h("peer9"), remote, size=300) == disk.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_ambiguity_fails_closed(tmp_path):
+    # Two same-titled fuzzy candidates must not resolve to either one: the
+    # mount-wide sweep (same size, no peer dir) and the peer-scoped sweep
+    # (unique names aside, size unknown) both fail closed.
+    for folder_name in ("AlbumA", "AlbumB"):
+        folder = tmp_path / folder_name
+        folder.mkdir()
+        (folder / "01. Title Here.mp3").write_bytes(b"w" * 400)
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer9"), "Share\\Artist - Album - 01 - Title Here.mp3", size=400
+        )
+        is None
+    )
+
+    for folder_name in ("peer2/AlbumA", "peer2/AlbumB"):
+        folder = tmp_path / folder_name
+        folder.mkdir(parents=True)
+        (folder / "02. Other Title.mp3").write_bytes(b"v" * 150)
+    assert (
+        await repo.get_file_path(
+            _h("peer2"), "Share\\Artist - Album - 02 - Other Title.mp3"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_ignores_cross_peer_same_size_decoy(tmp_path):
+    # A same-size same-titled file under another peer must not shadow the
+    # requesting peer's own folder: the peer-scoped attempt runs first.
+    peer_folder = tmp_path / "peer1" / "Album"
+    peer_folder.mkdir(parents=True)
+    peer_disk = peer_folder / "01. Title Here.mp3"
+    peer_disk.write_bytes(b"u" * 500)
+    decoy_folder = tmp_path / "other" / "Album"
+    decoy_folder.mkdir(parents=True)
+    (decoy_folder / "01. Title Here.mp3").write_bytes(b"u" * 500)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    path = await repo.get_file_path(
+        _h("peer1"), "Share\\Artist - Album - 01 - Title Here.mp3", size=500
+    )
+
+    assert path == peer_disk.resolve()
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_extension_mismatch_returns_none(tmp_path):
+    # Same track number and title core but a different container is a
+    # different artifact, never a fuzzy hit.
+    folder = tmp_path / "Some Album"
+    folder.mkdir()
+    (folder / "01. Title Here.flac").write_bytes(b"t" * 600)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer9"), "Share\\Artist - Album - 01 - Title Here.mp3", size=600
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_truly_absent_still_returns_none(tmp_path):
+    # A genuinely missing download still yields None (SOURCE_FILE_MISSING),
+    # even when the remote name has the fuzzy-shaped prefix.
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer9"), "Share\\Artist - Album - 01 - Title Here.mp3", size=700
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_skips_outside_symlink(tmp_path):
+    # A fuzzy-named file outside the mount, linked in, must stay invisible.
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "01. Title Here.mp3").write_bytes(b"q" * 800)
+    (tmp_path / "peer1").mkdir()
+    (tmp_path / "peer1" / "escaped").symlink_to(outside, target_is_directory=True)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer1"), "Share\\Artist - Album - 01 - Title Here.mp3", size=800
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_path_fuzzy_shares_entry_budget(tmp_path, monkeypatch):
+    # The fuzzy sweeps share the NFC phases' entry budget: exhaustion anywhere
+    # fails closed instead of falling through to a guess.
+    import repositories.slskd.slskd_repository as slskd_repository
+
+    monkeypatch.setattr(slskd_repository, "_MAX_WALK_ENTRIES", 2)
+    folder = tmp_path / "Some Album"
+    folder.mkdir()
+    (folder / "01. Title Here.mp3").write_bytes(b"s" * 900)
+
+    repo = SlskdRepository(client=None, url="", api_key="", downloads_mount=tmp_path)
+    assert (
+        await repo.get_file_path(
+            _h("peer9"), "Share\\Artist - Album - 01 - Title Here.mp3", size=900
+        )
+        is None
+    )
+
 
 
 def _completed(filename, username="peer"):
@@ -705,3 +1560,306 @@ def test_wildcard_artist_first_letter_and_apostrophe_absorption():
 def test_build_album_query_joins_with_separator():
     query = SlskdRepository._build_album_query("Radiohead", "OK Computer", 1997)
     assert query == "Radiohead OK Computer 1997"
+
+
+def _partial_repo(
+    complete: Path, incomplete: Path | None = None
+) -> SlskdRepository:
+    """Repo with separate complete/incomplete mounts for the #292 fallback tests."""
+    return SlskdRepository(
+        client=None,
+        url="",
+        api_key="",
+        downloads_mount=complete,
+        incomplete_mount=incomplete,
+    )
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_resolves_short_album_file_get_file_path_stays_none(
+    tmp_path,
+):
+    # The stranded-bytes case: 7 bytes on disk against a 12345-byte expectation.
+    # No equality gate may veto it (partials are short by definition).
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    album = tmp_path / "incomplete" / "4x4=12 (2010)"
+    album.mkdir(parents=True)
+    partial = album / "02-06 - Everything Before.flac"
+    partial.write_bytes(b"partial")
+    repo = _partial_repo(complete, tmp_path / "incomplete")
+    remote = "GunplaGuy\\edm_music\\deadmau5\\02-06 - Everything Before.flac"
+    assert await repo.get_file_path(_h("GunplaGuy"), remote, size=12345) is None
+    assert await repo.locate_partial(_h("GunplaGuy"), remote, size=12345) == (
+        partial.resolve()
+    )
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_truly_absent_returns_none(tmp_path):
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    repo = _partial_repo(complete, incomplete)
+    assert await repo.locate_partial(_h("peer"), "A\\missing.flac", size=10) is None
+    assert await repo.get_file_path(_h("peer"), "A\\missing.flac", size=10) is None
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_ambiguous_fails_closed(tmp_path, caplog):
+    # Same basename stranded under two album dirs (retry generations): refuse
+    # to guess, and log the count rather than either path.
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    for folder_name in ("AlbumA", "AlbumB"):
+        folder = tmp_path / "incomplete" / folder_name
+        folder.mkdir(parents=True)
+        (folder / "01 - Track.flac").write_bytes(b"short")
+    repo = _partial_repo(complete, tmp_path / "incomplete")
+    with caplog.at_level(
+        logging.WARNING, logger="repositories.slskd.slskd_repository"
+    ):
+        assert (
+            await repo.locate_partial(_h("peer"), "Share\\01 - Track.flac", size=999)
+            is None
+        )
+    assert "ambiguous=2" in caplog.text
+    assert "AlbumA" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_unset_mount_skips_fallback(tmp_path):
+    # No new config = byte-identical behaviour: the fallback never runs even
+    # when partial bytes sit where the mount would point.
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    album = tmp_path / "incomplete" / "Album"
+    album.mkdir(parents=True)
+    (album / "01 - Track.flac").write_bytes(b"short")
+    repo = _partial_repo(complete)
+    assert (
+        await repo.locate_partial(_h("peer"), "Share\\01 - Track.flac", size=999)
+        is None
+    )
+    assert (
+        await repo.get_file_path(_h("peer"), "Share\\01 - Track.flac", size=999)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_unusable_mount_fails_closed(tmp_path):
+    # A missing dir, or a file where the dir should be, disables the fallback.
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    (tmp_path / "not-a-dir").write_bytes(b"x")
+    for bad in (tmp_path / "no-such-dir", tmp_path / "not-a-dir"):
+        repo = _partial_repo(complete, bad)
+        assert (
+            await repo.locate_partial(_h("peer"), "Share\\01 - Track.flac", size=999)
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_unknown_size_skips_recursive_sweep(tmp_path):
+    # Direct probes work without a known size; a file nested deeper than one
+    # level stays invisible until the size is known.
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    deep = tmp_path / "incomplete" / "nested" / "Album"
+    deep.mkdir(parents=True)
+    target = deep / "01 - Deep.flac"
+    target.write_bytes(b"short")
+    repo = _partial_repo(complete, tmp_path / "incomplete")
+    remote = "Share\\Album\\01 - Deep.flac"
+    assert await repo.locate_partial(_h("peer"), remote) is None
+    assert await repo.locate_partial(_h("peer"), remote, size=999) == target.resolve()
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_nfc_alias_resolves_without_size_gate(tmp_path):
+    visible_name = "01 - Héroes.flac"
+    remote_name = unicodedata.normalize("NFC", visible_name)
+    disk_name = unicodedata.normalize("NFD", visible_name)
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    album = tmp_path / "incomplete" / "Album"
+    album.mkdir(parents=True)
+    target = album / disk_name
+    target.write_bytes(b"short")
+    repo = _partial_repo(complete, tmp_path / "incomplete")
+    assert await repo.locate_partial(
+        _h("peer"), f"Share\\Album\\{remote_name}", size=999
+    ) == target.resolve()
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_rejects_traversal_and_has_no_size_only_phase(tmp_path):
+    # ".." never resolves, and a same-size file under a DIFFERENT basename is
+    # not a hit (no phase-5-style size matching under incomplete).
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    album = tmp_path / "incomplete" / "Album"
+    album.mkdir(parents=True)
+    (album / "other.flac").write_bytes(b"0123456789")
+    repo = _partial_repo(complete, tmp_path / "incomplete")
+    assert await repo.locate_partial(_h("peer"), "../../etc/passwd", size=999) is None
+    assert (
+        await repo.locate_partial(_h("peer"), "Share\\wanted.flac", size=10) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_locate_partial_skips_outside_symlink(tmp_path):
+    # A partial outside the incomplete mount, linked in, stays invisible.
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "01 - Track.flac").write_bytes(b"short")
+    (incomplete / "escaped").symlink_to(outside, target_is_directory=True)
+    repo = _partial_repo(complete, incomplete)
+    assert (
+        await repo.locate_partial(_h("peer"), "Share\\01 - Track.flac", size=999)
+        is None
+    )
+
+
+AUTH_MESSAGE_401 = (
+    "Authentication rejected (401) — check the API key and slskd's CIDR allowlist"
+)
+
+
+def _auth_repo(client_health_check, tmp_path) -> SlskdRepository:
+    client = AsyncMock()
+    client.health_check = client_health_check
+    return SlskdRepository(
+        client=client, url="http://slskd.example.com", api_key="k", downloads_mount=tmp_path
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_check_auth_error_uses_fixed_template(tmp_path):
+    from core.exceptions import SlskdAuthError
+
+    repo = _auth_repo(
+        AsyncMock(
+            side_effect=SlskdAuthError(
+                "slskd returned HTTP 401", details="", code=401
+            )
+        ),
+        tmp_path,
+    )
+    status = await repo.health_check()
+    assert status.status == "error"
+    assert status.message == AUTH_MESSAGE_401
+
+
+@pytest.mark.asyncio
+async def test_health_check_cidr_401_renders_like_wrong_key(tmp_path):
+    # Wrong key and key-CIDR deny are both 401 server-side: no per-cause split.
+    from core.exceptions import SlskdAuthError
+
+    wrong = await _auth_repo(
+        AsyncMock(
+            side_effect=SlskdAuthError(
+                "slskd returned HTTP 401", details="", code=401
+            )
+        ),
+        tmp_path,
+    ).health_check()
+    cidr = await _auth_repo(
+        AsyncMock(
+            side_effect=SlskdAuthError(
+                "slskd returned HTTP 401", details="", code=401
+            )
+        ),
+        tmp_path,
+    ).health_check()
+    assert wrong.message == cidr.message == AUTH_MESSAGE_401
+
+
+@pytest.mark.asyncio
+async def test_health_check_auth_403_uses_same_template_shape(tmp_path):
+    from core.exceptions import SlskdAuthError
+
+    repo = _auth_repo(
+        AsyncMock(
+            side_effect=SlskdAuthError(
+                "slskd returned HTTP 403", details="", code=403
+            )
+        ),
+        tmp_path,
+    )
+    status = await repo.health_check()
+    assert status.message == AUTH_MESSAGE_401.replace("(401)", "(403)")
+
+
+@pytest.mark.asyncio
+async def test_health_check_auth_body_snippet_single_line_truncated(tmp_path):
+    from core.exceptions import SlskdAuthError
+
+    repo = _auth_repo(
+        AsyncMock(
+            side_effect=SlskdAuthError(
+                "slskd returned HTTP 401",
+                details="  proxy says\nno   second line  ",
+                code=401,
+            )
+        ),
+        tmp_path,
+    )
+    status = await repo.health_check()
+    assert status.message == f"{AUTH_MESSAGE_401}: proxy says no second line"
+    assert "\n" not in status.message
+    assert "http://slskd.example.com" not in status.message
+
+    long_repo = _auth_repo(
+        AsyncMock(
+            side_effect=SlskdAuthError(
+                "slskd returned HTTP 401", details="x" * 300, code=401
+            )
+        ),
+        tmp_path,
+    )
+    long_status = await long_repo.health_check()
+    assert long_status.message == f"{AUTH_MESSAGE_401}: {'x' * 200}"
+
+
+@pytest.mark.asyncio
+async def test_health_check_401_end_to_end_renders_auth_template():
+    # Full chain: strict mock 401 -> SlskdAuthError -> fixed template, and the
+    # shared live breaker stays CLOSED.
+    from repositories.slskd.slskd_client import (
+        SlskdClient,
+        _slskd_circuit_breaker,
+        _slskd_verify_circuit_breaker,
+    )
+
+    slskd_mock.reset_state()
+    slskd_mock.set_expected_api_key("real-key")
+    _slskd_circuit_breaker.reset()
+    _slskd_verify_circuit_breaker.reset()
+    try:
+        transport = httpx.ASGITransport(app=slskd_mock.app)
+        http = httpx.AsyncClient(transport=transport)
+        repo = SlskdRepository(
+            client=SlskdClient(http, "http://slskd", "wrong-key"),
+            url="http://slskd",
+            api_key="wrong-key",
+            downloads_mount=Path("/dl"),
+        )
+        status = await repo.health_check()
+        assert status.status == "error"
+        assert status.message.startswith(AUTH_MESSAGE_401)
+        assert not _slskd_circuit_breaker.is_open()
+        assert _slskd_circuit_breaker.failure_count == 0
+        await http.aclose()
+    finally:
+        slskd_mock.reset_state()
+        _slskd_circuit_breaker.reset()
+        _slskd_verify_circuit_breaker.reset()

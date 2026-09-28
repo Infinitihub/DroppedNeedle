@@ -22,6 +22,7 @@ from core.dependencies import (
     get_user_connections_store,
     get_user_listening_prefs_store,
 )
+from core.exceptions import RateLimitedError
 from infrastructure.crypto import init_crypto
 from infrastructure.persistence.user_connections_store import UserConnectionsStore
 from infrastructure.persistence.user_listening_prefs_store import UserListeningPrefsStore
@@ -165,6 +166,7 @@ def test_connect_listenbrainz(ctx):
     assert resp.json()["username"] == "alice_lb"
     listing = ctx.client.get("/me/connections").json()["connections"]
     assert [c["service"] for c in listing] == ["listenbrainz"]
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_awaited_once_with()
 
 
 def test_connect_listenbrainz_empty_username_400(ctx):
@@ -181,6 +183,35 @@ def test_connect_listenbrainz_invalid_token_400(ctx):
         "/me/connections/listenbrainz", json={"user_token": "bad", "username": "x"}
     )
     assert resp.status_code == 400
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
+
+
+def test_connect_listenbrainz_rate_limited_429_does_not_persist(ctx):
+    provider_message = "provider body sentinel"
+    credential = "listenbrainz credential sentinel"
+    ctx.settings_service.verify_listenbrainz.side_effect = RateLimitedError(
+        provider_message,
+        details={"credential": credential},
+        retry_after_seconds=17,
+    )
+    ctx.conn_store.upsert = AsyncMock()
+
+    response = ctx.client.put(
+        "/me/connections/listenbrainz",
+        json={"user_token": credential, "username": "alice_lb"},
+    )
+
+    assert response.status_code == 429
+    error = response.json()["error"]
+    assert error["code"] == "RATE_LIMITED"
+    assert (
+        error["message"]
+        == "ListenBrainz is temporarily rate-limiting this server. Try again shortly."
+    )
+    assert provider_message not in response.text
+    assert credential not in response.text
+    ctx.conn_store.upsert.assert_not_awaited()
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
 
 
 def test_scrobble_preferences_default(ctx):
@@ -245,6 +276,7 @@ def test_disconnect(ctx):
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert ctx.client.get("/me/connections").json()["connections"] == []
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
 
 
 def test_disconnect_unknown_service_404(ctx):
@@ -455,3 +487,37 @@ def test_disconnect_supports_media_server_services(ctx):
     assert resp.status_code == 200
     assert resp.json() == {"service": "navidrome", "deleted": True}
     assert asyncio.run(ctx.conn_store.get("user-a", "navidrome")) is None
+
+
+def test_connect_listenbrainz_persistence_failure_does_not_run_hook(ctx):
+    ctx.conn_store.upsert = AsyncMock(side_effect=RuntimeError("persist failed"))
+
+    resp = ctx.client.put(
+        "/me/connections/listenbrainz",
+        json={"user_token": "lb-tok", "username": "alice_lb"},
+    )
+
+    assert resp.status_code == 500
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()
+
+
+def test_disconnect_listenbrainz_runs_hook_after_deletion(ctx):
+    asyncio.run(
+        ctx.conn_store.upsert(
+            "user-a", "listenbrainz", {"user_token": "lb-tok", "username": "alice_lb"}
+        )
+    )
+
+    resp = ctx.client.delete("/me/connections/listenbrainz")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"service": "listenbrainz", "deleted": True}
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_awaited_once_with()
+
+
+def test_disconnect_absent_listenbrainz_does_not_run_hook(ctx):
+    resp = ctx.client.delete("/me/connections/listenbrainz")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"service": "listenbrainz", "deleted": False}
+    ctx.settings_service.on_listenbrainz_connection_changed.assert_not_awaited()

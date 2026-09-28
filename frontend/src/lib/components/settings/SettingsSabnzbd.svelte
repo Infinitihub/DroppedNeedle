@@ -3,16 +3,19 @@
 
 	import {
 		getSabnzbdConfigQuery,
+		getSabnzbdStatusQuery,
 		saveSabnzbdConfig,
 		testSabnzbd
 	} from '$lib/queries/downloads/DownloadClientsQueries.svelte';
 	import { getIndexersQuery } from '$lib/queries/downloads/IndexerQueries.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import type { SabnzbdConnectionSettings, SabnzbdTestResult } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	import DownloadClientCard from './DownloadClientCard.svelte';
 
 	const configQuery = getSabnzbdConfigQuery();
+	const statusQuery = getSabnzbdStatusQuery();
 	const indexersQuery = getIndexersQuery();
 	const save = saveSabnzbdConfig();
 	const test = testSabnzbd();
@@ -45,15 +48,27 @@
 		}
 	});
 
-	const connected = $derived(testResult?.valid === true);
+	const connected = $derived(
+		testResult ? testResult.valid === true : statusQuery.data?.valid === true
+	);
 	const statusText = $derived(
-		connected
-			? `Connected${testResult?.version ? ` · v${testResult.version}` : ''}`
-			: enabled
-				? url
-					? 'Run Test to check the connection'
-					: 'Not configured'
-				: 'Disabled'
+		testResult
+			? testResult.valid === true
+				? `Connected${testResult.version ? ` · v${testResult.version}` : ''}`
+				: enabled
+					? url
+						? 'Run Test to check the connection'
+						: 'Not configured'
+					: 'Disabled'
+			: statusQuery.data?.valid === true
+				? `Connected${statusQuery.data.version ? ` · v${statusQuery.data.version}` : ''}`
+				: statusQuery.data
+					? statusQuery.data.message
+					: enabled
+						? url
+							? 'Run Test to check the connection'
+							: 'Not configured'
+						: 'Disabled'
 	);
 
 	function current(): SabnzbdConnectionSettings {
@@ -130,7 +145,7 @@
 						<span class="font-semibold">No indexers configured.</span> SABnzbd downloads the NZBs your
 						indexers find - with none set up, Usenet search returns nothing and this client stays idle.
 					</p>
-					<a class="link link-warning font-medium" href="/settings?tab=indexers">
+					<a class="link link-warning font-medium" href={withBasePath('/settings?tab=indexers')}>
 						Add an indexer →
 					</a>
 				</div>
@@ -237,6 +252,9 @@
 					bind:value={downloadsMount}
 					placeholder="/sabnzbd-downloads"
 				/>
+				{#if testResult?.mount_message}
+					<p class="text-xs leading-relaxed text-warning">{testResult.mount_message}</p>
+				{/if}
 			</div>
 		</section>
 

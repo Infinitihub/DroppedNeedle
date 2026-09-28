@@ -25,12 +25,18 @@ Design (validated against real Newznab/Soulseek result sets):
   be settled by the indexer-match base score + the import tag-match (Q4 obfuscation tolerance).
 - Version descriptors (deluxe/remaster/edition...) are stripped from BOTH sides, so a
   deluxe/remastered edition of the requested album still matches.
+- Canonical punctuation is normalized on BOTH sides before splitting (GH #259 / #307):
+  apostrophes inside words are deleted (``man's`` -> ``mans``, matching the scene-named
+  ``Mans_Best_Friend``), and the abutting paren-obfuscation shape unfolds
+  (``O(verly)`` -> ``overly``). Standalone paren groups (``(2014)``, ``(Deluxe
+  Version)``, ``(feat. X)``) still split into separate tokens.
 - Roman series numerals (II..) are ordinary alpha words, so they discriminate naturally.
   Digit volumes ("Vol. 2" vs "Vol. 3") are NOT distinguished: a bare digit can't be told
   from a year / bit-depth / catalog number, and ``volNN+NN`` par2 names would false-reject -
   the same scene-filename-collision caution that keeps ``part N`` out of the markers.
 """
 
+from pathlib import Path
 import re
 import unicodedata
 
@@ -40,7 +46,22 @@ from unidecode import unidecode
 # A leading Usenet part counter: ``[002/113] "`` (and the opening quote of the real name).
 _PART_COUNTER_RE = re.compile(r'^\s*\[\d+\s*/\s*\d+\]\s*"?')
 # Title separators -> spaces, so ``led_zeppelin``, ``In.Through``, ``(2014)`` all tokenise.
+# Word-INTERNAL apostrophes/quotes are deleted before this split (see ``_APOS_RE``):
+# scene names drop them entirely (``Mans_Best_Friend``) while MusicBrainz titles carry
+# them (``Man's Best Friend``), so splitting on them made the two sides tokenise
+# asymmetrically (GH #259). A quote with a space on one side still splits here - it
+# frames the title, it isn't part of a word.
 _SEP_RE = re.compile(r"[_.\-/()\[\]{}+,'\"]")
+# The GH #307 paren-obfuscation shape: a paren group DIRECTLY abutting a preceding word
+# char with a single word run inside (``O(verly)``, ``D(edicated)``) is the next chunk of
+# that word, not a standalone group - unfold it (``O(verly)`` -> ``overly``). Standalone
+# groups (``(2014)``, ``(Deluxe Version)``, ``(feat. X)``) keep their split behaviour.
+_PAREN_UNFOLD_RE = re.compile(r"(\w)\((\w+)\)")
+# Word-internal apostrophes/quotes: ``man's`` -> ``mans``, ``can't`` -> ``cant``,
+# ``Man"s`` -> ``mans``. fold() unidecodes typographic ``’`` (and its cousins) to ``'``
+# first, so one ASCII class covers both spellings; a quote with a space on one side
+# (framing the title) is not word-internal and is left for the separator split.
+_APOS_RE = re.compile(r'(?<=\w)["\'](?=\w)')
 # A trailing/inline featuring credit: ``(feat. X)`` / ``ft. X`` / ``featuring X`` - not part of
 # album identity, and a long credit tail drags the fuzzy ratio + can read as a foreign word.
 _FEAT_RE = re.compile(r"\s[(\[]?\b(feat|ft|featuring)\b\.?.*$", re.IGNORECASE)
@@ -61,6 +82,41 @@ def fold(text: str) -> str:
 
 def strip_featuring(text: str) -> str:
     return _FEAT_RE.sub("", text or "").strip()
+
+
+# A leading bracketed tag: ``[Explicit] Song`` / ``(Bonus) Song`` - a content or
+# source marker AcoustID/file tags prepend, not part of the recording identity.
+# Only LEADING groups fold: a trailing ``(Kygo Remix)`` denotes a different
+# recording and must keep mismatching.
+_LEADING_BRACKET_RE = re.compile(r"^\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*")
+
+
+def normalize_recording_title(value: str | None) -> str:
+    """Fold two spellings of the SAME recording to one string for mismatch checks.
+
+    Pure function shared by the fingerprint title veto and the tag-conflict paths:
+    case/accent folds (``KASHMIR`` == ``Kashmir``), punctuation folds (``Don't Stop!``
+    == ``dont stop``), censored masks (``F**k`` == ``Fuck`` at the fuzzy gate - the
+    ``*`` carries no identity), leading bracketed markers (``[Explicit] Song`` ==
+    ``Song``), and trailing featuring credits (``Song (feat. X)`` == ``Song``).
+    Trailing edition markers (``(Kygo Remix)``) are preserved - they name a
+    different recording.
+    """
+    if not value:
+        return ""
+    text = fold(value)
+    while True:
+        stripped = _LEADING_BRACKET_RE.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    text = strip_featuring(text)
+    text = _APOS_RE.sub("", text)
+    text = text.replace("*", "")
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = text.replace("_", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
 
 # Tokens that begin the format/source/quality run: the album name ends before the first of
 # these. Codecs, media, and online sources - none of which are album-name words. Bit-depth /
@@ -85,7 +141,33 @@ _EDITION = frozenset({
     "limited", "collectors", "collector", "bonus", "reissue", "repack", "proper", "mono",
     "stereo", "original", "digipak", "version", "explicit", "clean", "extended", "standard",
     "promo", "disc",
+    # F-EDITION-03 signed additions: valid reissue/edition descriptors that
+    # must not read as foreign album words.
+    "immersion", "experience", "box", "boxset", "super", "oknotok", "mfsl",
+    "half", "speed", "master", "audiophile",
 })
+
+
+def _fold_box_set(tokens: list[str]) -> list[str]:
+    """Fold an adjacent ``box`` + ``set`` pair into the canonical ``boxset``
+    descriptor so dotted/hyphenated/underscored spellings behave identically
+    (F-EDITION-03). A bare ``set`` stays an album word."""
+    folded: list[str] = []
+    index = 0
+    while index < len(tokens):
+        if (
+            tokens[index] == "box"
+            and index + 1 < len(tokens)
+            and tokens[index + 1] == "set"
+        ):
+            folded.append("boxset")
+            index += 2
+        else:
+            folded.append(tokens[index])
+            index += 1
+    return folded
+
+
 # Sidecar / packaging extensions a per-file result or folder listing drags in.
 _SIDECAR = frozenset({
     "log", "cue", "nfo", "sfv", "m3u", "m3u8", "jpg", "jpeg", "png", "txt", "pdf", "par",
@@ -98,7 +180,14 @@ _STOP = frozenset({
 
 
 def _tokens(text: str) -> list[str]:
+    # GH #259 / #307: canonical MB punctuation vs scene names. One normalization pass,
+    # applied symmetrically to both sides before splitting: unfold the abutting paren
+    # shape (``O(verly)`` -> ``overly``), then delete apostrophes/quotes inside words
+    # instead of splitting on them (``man's`` -> ``mans``, matching the scene-named
+    # ``Mans_Best_Friend``; ``can't`` -> ``cant``).
     cleaned = strip_featuring(fold(_PART_COUNTER_RE.sub("", text or "")))
+    cleaned = _PAREN_UNFOLD_RE.sub(r"\1\2", cleaned)
+    cleaned = _APOS_RE.sub("", cleaned)
     return [t for t in _SEP_RE.sub(" ", cleaned).split() if t]
 
 
@@ -202,13 +291,32 @@ def artist_evidence(artist_name: str, candidate_path: str) -> bool:
 
     Stopwords are dropped from the artist's words so "The Who" needs "who", not the
     ubiquitous "the" (fallback to all words when the name is entirely stopwords)."""
-    words = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2 and t not in _STOP}
+    # GH-284: digit-bearing names (deadmau5, u2) keep their alphanumeric tokens -
+    # ``isalpha()`` alone dropped them, so no candidate could ever earn evidence.
+    # Pure-numeric names (311) are excluded here: a bare number must match an
+    # exact path SEGMENT (artist directory), not any word in the path.
+    name_tokens = _tokens(artist_name)
+    words = {
+        t
+        for t in name_tokens
+        if len(t) >= 2
+        and (t.isalpha() or (any(c.isdigit() for c in t) and any(c.isalpha() for c in t)))
+        and t not in _STOP
+    }
     if not words:
-        words = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
+        words = {t for t in name_tokens if t.isalpha() and len(t) >= 2}
+    pure_numeric = {t for t in name_tokens if t.isdigit() and len(t) >= 2}
     # Soulseek remote paths are backslash-delimited; ``_SEP_RE`` (calibrated for release
     # TITLES) doesn't split on backslash, so normalise to '/' before tokenising or every
     # directory level glues to its neighbour and the artist token is never seen.
-    return _artist_present(_tokens(candidate_path.replace("\\", "/")), words)
+    normalized = candidate_path.replace("\\", "/")
+    if _artist_present(_tokens(normalized), words):
+        return True
+    if pure_numeric:
+        segments = {part.casefold() for part in normalized.split("/") if part}
+        stems = {Path(part).stem.casefold() for part in segments if "." in part}
+        return bool(pure_numeric & (segments | stems))
+    return False
 
 
 def names_different_album(album_title: str, artist_name: str, candidate_title: str) -> bool:
@@ -220,10 +328,13 @@ def names_different_album(album_title: str, artist_name: str, candidate_title: s
     and only when the artist is recognisably present (a fully obfuscated title is left to the
     indexer-match base score + import tag-match). Version descriptors are stripped from both
     sides so a deluxe/remaster of the requested album matches."""
+    # F-EDITION-03: fold the ``box`` + ``set`` compound to the canonical
+    # ``boxset`` descriptor on both sides so dotted/hyphenated/underscored
+    # spellings compare identically. A bare ``set`` stays an album word.
     artist = {t for t in _tokens(artist_name) if t.isalpha() and len(t) >= 2}
-    candidate = _tokens(candidate_title)
+    candidate = _fold_box_set(_tokens(candidate_title))
     if not _artist_present(candidate, artist):
         return False
-    wanted = _content_words(_tokens(album_title), artist)
+    wanted = _content_words(_fold_box_set(_tokens(album_title)), artist)
     got = _content_words(_album_region(candidate), artist)
     return bool(got - wanted)

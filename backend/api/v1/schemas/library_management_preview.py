@@ -66,6 +66,13 @@ class LibraryManagementPreviewCreatedResponse(AppStruct):
     existing: bool = False
 
 
+class LibraryManagementPreviewReissueResponse(AppStruct):
+    job_id: str
+    preview_token: str
+    created_at: float
+    expires_at: float
+
+
 class LibraryManagementTagEditFieldRequest(AppStruct):
     field_name: str
     value: LibraryManagementTagEditValue = None
@@ -189,6 +196,7 @@ class LibraryManagementPreviewSummaryResponse(AppStruct):
     reasons: dict[str, int] = msgspec.field(default_factory=dict)
     roots: dict[str, int] = msgspec.field(default_factory=dict)
     formats: dict[str, int] = msgspec.field(default_factory=dict)
+    deferred_sources: dict[str, int] = msgspec.field(default_factory=dict)
     metadata_snapshot_ids: list[str] = msgspec.field(default_factory=list)
 
 
@@ -233,6 +241,8 @@ class LibraryManagementPreviewDetailResponse(AppStruct):
     expired: bool = False
     stale: bool = False
     stale_reasons: list[str] = msgspec.field(default_factory=list)
+    stale_input_count: int = 0
+    stale_sample_relative_paths: list[str] = msgspec.field(default_factory=list)
     ready_for_confirmation: bool = False
     operation_row_revision: int = 1
     operation_event_revision: int = 0
@@ -305,11 +315,19 @@ class LibraryManagementOperationHistoryItemResponse(AppStruct):
     target_root_id: str | None = None
     activation_preview: bool = False
     selection: dict = msgspec.field(default_factory=dict)
+    eligible_count: int = 0
+    warning_count: int = 0
+    blocked_count: int = 0
+    expires_at: float | None = None
 
 
 class LibraryManagementOperationHistoryResponse(AppStruct):
     items: list[LibraryManagementOperationHistoryItemResponse]
     next_cursor: str | None = None
+
+
+class LibraryManagementNeedsAttentionBundle(AppStruct):
+    bundle_id: str
 
 
 class LibraryManagementRecoveryDiagnosticsResponse(AppStruct):
@@ -319,6 +337,16 @@ class LibraryManagementRecoveryDiagnosticsResponse(AppStruct):
     cleanup_pending_count: int
     oldest_updated_at: float | None = None
     state_counts: dict[str, int] = msgspec.field(default_factory=dict)
+    needs_attention_bundles: list[LibraryManagementNeedsAttentionBundle] = (
+        msgspec.field(default_factory=list)
+    )
+
+
+class LibraryManagementImportBundleResolveResponse(AppStruct):
+    bundle_id: str
+    state: str
+    verified_files: int
+    total_files: int
 
 
 class LibraryManagementProfileCreateRequest(AppStruct):

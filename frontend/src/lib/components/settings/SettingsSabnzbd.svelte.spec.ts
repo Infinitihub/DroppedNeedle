@@ -26,6 +26,10 @@ vi.mock('$lib/queries/downloads/DownloadClientsQueries.svelte', () => ({
 		isLoading: false,
 		isError: false
 	}),
+	getSabnzbdStatusQuery: () => ({
+		data: { valid: true, version: '5.0.4', message: 'SABnzbd 5.0.4' },
+		isLoading: false
+	}),
 	saveSabnzbdConfig: () => ({ mutateAsync: saveMutate, isPending: false }),
 	testSabnzbd: () => ({ mutateAsync: testMutate, isPending: false })
 }));
@@ -41,20 +45,20 @@ import SettingsSabnzbd from './SettingsSabnzbd.svelte';
 
 describe('SettingsSabnzbd.svelte', () => {
 	it('shows the SABnzbd card header with an enable toggle (collapsed by default)', async () => {
-		render(SettingsSabnzbd);
+		await render(SettingsSabnzbd);
 		await expect.element(page.getByText('SABnzbd')).toBeInTheDocument();
 		await expect.element(page.getByLabelText('Enable SABnzbd download client')).toBeInTheDocument();
 	});
 
 	it('reveals URL + full-key inputs when expanded', async () => {
-		render(SettingsSabnzbd);
+		await render(SettingsSabnzbd);
 		await page.getByRole('button', { name: 'Expand' }).click();
 		await expect.element(page.getByPlaceholder('http://sabnzbd:8080')).toBeInTheDocument();
 		await expect.element(page.getByPlaceholder('SABnzbd full API key')).toBeInTheDocument();
 	});
 
 	it('runs Test and shows the connected version', async () => {
-		render(SettingsSabnzbd);
+		await render(SettingsSabnzbd);
 		await page.getByRole('button', { name: 'Expand' }).click();
 		await page.getByRole('button', { name: 'Test connection' }).click();
 		expect(testMutate).toHaveBeenCalledWith(
@@ -65,12 +69,19 @@ describe('SettingsSabnzbd.svelte', () => {
 	});
 
 	it('persists immediately when toggled and warns when no indexer is set up', async () => {
-		render(SettingsSabnzbd);
+		await render(SettingsSabnzbd);
 		await page.getByRole('button', { name: 'Expand' }).click();
 		// Flipping the header switch saves on the spot - no need to hit "Save settings".
 		await page.getByLabelText('Enable SABnzbd download client').click();
 		expect(saveMutate).toHaveBeenCalledWith(expect.objectContaining({ enabled: true }));
 		// With no indexers, an enabled SABnzbd is inert - the card must say so.
 		await expect.element(page.getByText('No indexers configured.')).toBeInTheDocument();
+	});
+
+	it('shows live Connected status from the status query without running Test', async () => {
+		testMutate.mockClear();
+		await render(SettingsSabnzbd);
+		await expect.element(page.getByText(/Connected/).first()).toBeInTheDocument();
+		expect(testMutate).not.toHaveBeenCalled();
 	});
 });

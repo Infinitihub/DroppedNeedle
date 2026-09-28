@@ -1,4 +1,37 @@
-"""Paginated review projections and revision-safe administrator actions."""
+"""Paginated review projections and revision-safe administrator actions.
+
+Review taxonomy (N-02; draft from LibraryFindings-All 06-risks, copied here
+as the code-adjacent home). Each row is type -> owner / writer / reader /
+auto-drain rule. These types share the word "review" but are independent
+queues with independent owners; do not merge them:
+
+- drop ``ItemStatus`` -> drop-import / ``drop_import_service`` /
+  ``DropImportJobList`` / 90d terminal delete (F-02).
+- quality ``disposition`` -> acquisition policy / ``acquisition/quality.py`` /
+  search/download cards / none (advisory verdict).
+- ``AWAITING_REVIEW`` -> acquisition status / SSE publisher (transient) /
+  downloads SSE UI / none (transient).
+- ident ``ReviewDecision`` -> library work / ``finish_identification_job`` /
+  review browser/detail / none (explicit action; retry requeues).
+- API ``ReviewState`` -> review contract / ``LibraryReviewService`` (this
+  module) / review UI / none (``edition_to_confirm`` terminal).
+- ``MigrationReview`` -> legacy migration / bounded migrator / pending
+  service / re-attempt (event-driven, 3 triggers).
+- ``ContributionState`` -> contribution / verification worker / contribution
+  review UI / worker advance; 90d terminal delete.
+- ``IdentificationOutcome`` -> identify pipeline / engine/service / review
+  evidence / none (maps to review states).
+- ``HeldImport`` -> held-import / orchestrator / held cards / none (explicit
+  reverify/import/discard).
+- quarantine -> download store / orchestrator / quarantine UI / reconsidered
+  on retry; admin delete.
+
+Depth-field concept map for this module's list contract: ``counts_by_state``
+is a GLOBAL GROUP BY with no WHERE (all-time totals, kept for back-compat);
+``counts_by_state_filtered`` / ``counts_by_reason_filtered`` carry the SAME
+scoping inputs as the page itself, so per-state depths (in particular the
+Done state) must render from the ``*_filtered`` fields.
+"""
 
 from __future__ import annotations
 
@@ -41,10 +74,36 @@ PREVIEW_TTL_SECONDS = 15 * 60
 AUTOMATIC_SAFE_EVIDENCE_REASONS = frozenset(
     {"SUPPORTED", "ACCEPTED", "SUPPORTED_EMBEDDED_IDS"}
 )
-REVIEW_STATES = frozenset({"needs_review", "keep_tagged", "excluded", "resolved"})
+REVIEW_STATES = frozenset(
+    {"needs_review", "keep_tagged", "excluded", "resolved", "edition_to_confirm"}
+)
+TIER_STATE = "edition_to_confirm"
+TIER_REASON = "EDITION_UNCERTAIN"
+
+
+def _is_tier_row(row: dict[str, Any]) -> bool:
+    """Tolerant tier detection: state OR reason OR persisted flag."""
+    return (
+        bool(row.get("edition_uncertain"))
+        or str(row.get("state") or "") == TIER_STATE
+        or str(row.get("reason_code") or "") == TIER_REASON
+    )
+
+
+def _tier_edition_keys(row: dict[str, Any]) -> list[str]:
+    """Ranked `rg:release` edition keys for tier rows, else empty."""
+    raw = row.get("ranked_edition_keys_json")
+    if raw is None:
+        return []
+    try:
+        decoded = msgspec.json.decode(str(raw).encode(), type=list[str])
+    except (msgspec.DecodeError, UnicodeEncodeError):
+        return []
+    return [str(key) for key in decoded]
+
+
 REVIEW_POLICIES = frozenset({"automatic", "local_metadata", "excluded"})
 ACTIVE_JOB_STATES = frozenset({"queued", "running", "paused"})
-
 logger = logging.getLogger(__name__)
 
 
@@ -181,6 +240,7 @@ class LibraryReviewService:
         metadata_incomplete: bool | None = None,
         candidate_available: bool | None = None,
         job_state: str | None = None,
+        exclude_active_jobs: bool = False,
         sort: str = "newest",
         created_from: float | None = None,
         created_to: float | None = None,
@@ -238,6 +298,7 @@ class LibraryReviewService:
             metadata_incomplete=metadata_incomplete,
             candidate_available=candidate_available,
             job_state=job_state,
+            exclude_active_jobs=exclude_active_jobs,
             created_from=created_from,
             created_to=created_to,
             updated_from=updated_from,
@@ -257,9 +318,17 @@ class LibraryReviewService:
             counts_by_state={
                 str(key): int(value) for key, value in result["counts_by_state"].items()
             },
+            counts_by_state_filtered={
+                str(key): int(value)
+                for key, value in result["counts_by_state_filtered"].items()
+            },
             counts_by_reason={
                 str(key): int(value)
                 for key, value in result["counts_by_reason"].items()
+            },
+            counts_by_reason_filtered={
+                str(key): int(value)
+                for key, value in result.get("counts_by_reason_filtered", {}).items()
             },
             catalog_revision=await self._store.get_catalog_revision(),
         )
@@ -479,7 +548,14 @@ class LibraryReviewService:
             now=time.time() if now is None else now,
         )
         review = result["review"]
-        if review["local_album_id"] is not None:
+        # Confirming a tier-row edition is catalog-only: the lane promises
+        # files never change there, so (unlike a needs_review accept) it
+        # never schedules management. The sealed exact stays eligible for
+        # later explicit management runs.
+        if (
+            review["local_album_id"] is not None
+            and result.get("prior_state") != TIER_STATE
+        ):
             await self._schedule_scan_management(str(review["local_album_id"]))
         return ReviewActionResponse(
             review_id=review_id,
@@ -631,6 +707,8 @@ class LibraryReviewService:
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
             row_revision=int(row["row_revision"]),
+            edition_uncertain=_is_tier_row(row),
+            ranked_edition_keys=_tier_edition_keys(row),
         )
 
     @staticmethod

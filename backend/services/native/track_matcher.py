@@ -3,7 +3,7 @@
 Single-track scoring with no group/coherence phase: scores each candidate file
 against the target track and wraps the best as a one-file ``ScoredCandidate`` so
 the orchestrator's track branch and the Review tab consume it identically to an
-album candidate. Reuses the album scorer's ``_file_confidence`` and the shared
+album candidate. Reuses the shared scoring core's ``file_confidence`` and the shared
 quarantine + quality-tier filters (codec/tier gate + absolute highest-tier
 preference). ``tier='auto'`` additionally requires the requested artist to be
 named somewhere in the candidate's remote path (``title_match.artist_evidence``,
@@ -13,17 +13,22 @@ of the folder scorer (2026-07-05 wrong-single incident).
 """
 
 from infrastructure.persistence.download_store import DownloadStore
+from models.acquisition_quality import (
+    AcquisitionQualitySnapshot,
+    CodecFamily,
+    EvidenceCertainty,
+)
 from models.download import ScoredCandidate, TargetTrack
 from models.download_identity import soulseek_identity
 from repositories.protocols.download_client import DownloadSearchResult
-from services.native.album_preflight_scorer import _file_confidence
+from services.native.acquisition.scoring_core import file_confidence
+from services.native.album_preflight_scorer import _file_evidence
 from services.native.title_match import artist_evidence
+from services.native.acquisition import quality as acq_quality
 from services.native.quality_tiers import (
-    DEFAULT_QUALITY_MAX,
-    DEFAULT_QUALITY_MIN,
+    in_range,
     file_tier,
     folder_hires_key,
-    in_range,
     is_audio,
     is_flac_or_mp3,
     tier_rank,
@@ -31,30 +36,25 @@ from services.native.quality_tiers import (
 
 
 class TrackMatcher:
-    def __init__(
-        self,
-        download_store: DownloadStore,
-        *,
-        quality_min: str = DEFAULT_QUALITY_MIN,
-        quality_max: str = DEFAULT_QUALITY_MAX,
-        flac_mp3_only: bool = True,
-    ):
+    """Quality flows exclusively through the per-call ``AcquisitionQualitySnapshot``
+    (spec Snapshot rule); non-quality spec gates ride ``spec_extras``."""
+
+    def __init__(self, download_store: DownloadStore):
         self._store = download_store
-        self._quality_min = quality_min
-        self._quality_max = quality_max
-        self._flac_mp3_only = flac_mp3_only
 
     async def match(
         self,
         target: TargetTrack,
         results: list[DownloadSearchResult],
         *,
+        snapshot: AcquisitionQualitySnapshot,
         auto_accept_threshold: float = 0.70,
         manual_threshold: float = 0.50,
     ) -> ScoredCandidate | None:
         ranked = await self.rank(
             target,
             results,
+            snapshot=snapshot,
             auto_accept_threshold=auto_accept_threshold,
             manual_threshold=manual_threshold,
         )
@@ -65,6 +65,7 @@ class TrackMatcher:
         target: TargetTrack,
         results: list[DownloadSearchResult],
         *,
+        snapshot: AcquisitionQualitySnapshot,
         auto_accept_threshold: float = 0.70,
         manual_threshold: float = 0.50,
         limit: int = 20,
@@ -82,15 +83,28 @@ class TrackMatcher:
             if ("soulseek", soulseek_identity(r.username, r.filename))
             not in quarantined
         ]
-        # drop the art/cue/log sidecars a folder search returns alongside the tracks
+        # Drop art/cue/log sidecars a folder search returns alongside tracks.
         filtered = [r for r in filtered if is_audio(r)]
-        if self._flac_mp3_only:
+        if snapshot.flac_mp3_only:
             filtered = [r for r in filtered if is_flac_or_mp3(r)]
-        filtered = [
-            r
-            for r in filtered
-            if in_range(file_tier(r), self._quality_min, self._quality_max)
-        ]
+        # Recipe entries replace the contiguous v1 tier range. Keep soft
+        # policy misses visible for an explicit manual pick, but remove hard
+        # importability/cap violations before ranking.
+        if acq_quality.is_recipe_snapshot(snapshot):
+            recipe_filtered = []
+            for result in filtered:
+                decision = acq_quality.evaluate(snapshot, _file_evidence(result))
+                if not acq_quality.is_hard_quality_rejection(decision):
+                    recipe_filtered.append(result)
+            filtered = recipe_filtered
+        else:
+            order = snapshot.quality_preference_order
+
+            def _inside_range(candidate_result) -> bool:
+                projection = file_tier(candidate_result)
+                return in_range(projection, order[-1], order[0])
+
+            filtered = [r for r in filtered if _inside_range(r)]
         if held_tier is not None:
             filtered = [
                 r for r in filtered if tier_rank(file_tier(r)) > tier_rank(held_tier)
@@ -98,17 +112,17 @@ class TrackMatcher:
         if not filtered:
             return []
 
-        scored: list[
-            tuple[tuple[int | float, ...], float, str, DownloadSearchResult]
-        ] = []
+        scored = []
         for file in filtered:
-            # strict_title: a track title is directly comparable to a filename, so the
-            # containment metric applies (unlike the album path's title-vs-album noise).
-            score = _file_confidence(
+            # strict_title: a track title is directly comparable to a filename,
+            # so the containment metric applies.
+            score = file_confidence(
                 target.track_title,
                 target.artist_name,
                 target.duration_seconds,
-                file,
+                file.filename,
+                file.parent_directory,
+                file.duration,
                 strict_title=True,
             )
             if score >= auto_accept_threshold and artist_evidence(
@@ -119,26 +133,66 @@ class TrackMatcher:
                 acceptance = "manual"
             else:
                 acceptance = "rejected"
-            bit_depth, sample_rate = folder_hires_key([file])
-            queue_known = file.queue_length is not None
-            rank_key = (
-                {"rejected": 0, "manual": 1, "auto": 2}[acceptance],
-                tier_rank(file_tier(file)),
-                bit_depth,
-                sample_rate,
-                int(file.has_free_slot),
-                int(queue_known),
-                -(file.queue_length if file.queue_length is not None else 2**31 - 1),
-                file.upload_speed,
-                -file.size,
-                score,
+            quality_decision = (
+                acq_quality.evaluate(snapshot, _file_evidence(file))
+                if acq_quality.is_recipe_snapshot(snapshot)
+                else None
             )
-            scored.append((rank_key, score, acceptance, file))
+            if (
+                quality_decision is not None
+                and not quality_decision.eligible
+                and acceptance == "auto"
+            ):
+                acceptance = "manual"
+            if quality_decision is not None:
+                step = (
+                    quality_decision.preference_step
+                    if quality_decision.preference_step is not None
+                    else len(snapshot.quality_recipe) + 1
+                )
+                refinement = acq_quality.recipe_refinement_key(
+                    snapshot, quality_decision.evidence
+                )
+                rank_key = (
+                    {"rejected": 0, "manual": 1, "auto": 2}[acceptance],
+                    -step,
+                    *(-value for value in refinement),
+                    int(file.has_free_slot),
+                    int(file.queue_length is not None),
+                    -(
+                        file.queue_length
+                        if file.queue_length is not None
+                        else 2**31 - 1
+                    ),
+                    file.upload_speed,
+                    -file.size,
+                    score,
+                )
+            else:
+                bit_depth, sample_rate = folder_hires_key([file])
+                queue_known = file.queue_length is not None
+                rank_key = (
+                    {"rejected": 0, "manual": 1, "auto": 2}[acceptance],
+                    tier_rank(file_tier(file)),
+                    bit_depth,
+                    sample_rate,
+                    int(file.has_free_slot),
+                    int(queue_known),
+                    -(
+                        file.queue_length
+                        if file.queue_length is not None
+                        else 2**31 - 1
+                    ),
+                    file.upload_speed,
+                    -file.size,
+                    score,
+                )
+            scored.append((rank_key, score, acceptance, file, quality_decision))
         scored.sort(key=lambda item: item[0], reverse=True)
 
         candidates: list[ScoredCandidate] = []
         seen_peers: set[str] = set()
-        for _rank, score, acceptance, file in scored:
+        for _rank, score, acceptance, file, quality_decision in scored:
             if file.username in seen_peers:
                 continue  # one candidate per peer - failover skips same-peer anyway
             seen_peers.add(file.username)
@@ -156,6 +210,12 @@ class TrackMatcher:
                     file_confidence=score,
                     final_score=score,
                     tier=acceptance,
+                    quality_evidence=(
+                        quality_decision.evidence
+                        if quality_decision is not None
+                        else None
+                    ),
+                    quality_decision=quality_decision,
                 )
             )
             if len(candidates) >= limit:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
 import time
 import uuid
 import logging
@@ -9,9 +11,11 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from core.exceptions import StaleRevisionError, ValidationError
+from infrastructure.observability.library_metrics import LibraryMetrics
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.library_work import (
     ScanControlResult,
+    ScanFailureRecord,
     ScanRequest,
     ScanRequestResult,
     ScanRun,
@@ -30,7 +34,13 @@ PolicyResolverGetter = Callable[[], LibraryPolicyResolver]
 IndexedAlbumCallback = Callable[[str], Awaitable[object]]
 INDEXED_ALBUM_CALLBACK_BATCH_SIZE = 16
 INDEXED_ALBUM_CALLBACK_RETRY_MAX_SECONDS = 300.0
+# R-02: the settle spin below is DB-round-trip-bound, not CPU-bound, but it
+# must still stay bounded - cap stale retries, then take the stop-signal path.
+SETTLE_STALE_MAX_RETRIES = 10
+SETTLE_STALE_RETRY_BASE_SECONDS = 0.05
 logger = logging.getLogger(__name__)
+
+_scan_metrics = LibraryMetrics.for_library_workload()
 
 
 class LibraryScanCoordinator:
@@ -108,6 +118,22 @@ class LibraryScanCoordinator:
             scope.policy_revision != request.policy_revision for scope in request.scopes
         ):
             raise StaleRevisionError("The selected library policy has changed.")
+        if request.kind != "policy_reconcile":
+            # GH-296: a request may not queue scopes for unconfigured roots;
+            # such a queued run could never succeed and poisoned every later
+            # claim. Frozen policy-apply scopes are exempt: a removed root's
+            # frozen scope is the sanctioned F-TARGETCATALOG-02 Apply carrier
+            # and converges through scanner skip-and-report instead.
+            configured_roots = {
+                root.id for root in self._resolver_getter().settings.library_roots
+            }
+            unknown_roots = sorted(
+                {scope.root_id for scope in request.scopes} - configured_roots
+            )
+            if unknown_roots:
+                raise ValidationError(
+                    "One or more selected library scopes no longer exist."
+                )
         result = await self._store.request_scan_run(
             request, run_id=str(uuid.uuid4()), requested_at=self._clock()
         )
@@ -155,6 +181,14 @@ class LibraryScanCoordinator:
             next_cursor = f"{last.terminal_at}:{last.id}"
         return items, next_cursor
 
+    async def scan_run_failures(
+        self, run_id: str, *, limit: int = 50, cursor_rowid: int | None = None
+    ) -> tuple[list[ScanFailureRecord], int | None]:
+        await self._store.get_scan_run(run_id)
+        return await self._store.list_scan_run_failures(
+            run_id, limit=limit, cursor_rowid=cursor_rowid
+        )
+
     async def control(
         self, run_id: str, control: str, expected_revision: int
     ) -> ScanControlResult:
@@ -185,18 +219,37 @@ class LibraryScanCoordinator:
 
     async def recover(self) -> list[ScanRun]:
         if not self._resolver_getter().settings.enabled:
-            return []
+            return await self.recover_stopping()
         runs = await self._store.recover_scan_runs(now=self._clock())
         self._pending_control_run_ids.clear()
         for run in runs:
             self._log_progress(run, "recovery", force=True)
         return runs
 
+    async def recover_stopping(self) -> list[ScanRun]:
+        runs = await self._store.recover_stopping_scan_runs(now=self._clock())
+        for run in runs:
+            self._pending_control_run_ids.discard(run.id)
+            if self._events is not None:
+                await self._events.publish(run, event="scan.transition")
+            await self._store.flush_scan_invalidation(terminal=True)
+            self._log_progress(run, "recovery", force=True)
+            if self._filesystem is not None:
+                self._filesystem.forget_scan(run.id)
+        return runs
+
     async def _settle_pending_control(self, run_id: str) -> ScanRun:
+        stale_retries = 0
         while True:
             run, _, _ = await self._store.get_scan_run(run_id)
             if run.state not in {"pausing", "stopping"}:
                 self._pending_control_run_ids.discard(run.id)
+                # Every terminal state must release its process-local revision entries,
+                # including scanner-created failed (F-INDEXREC-02). Use public forget_scan
+                # and keep paused/pausing resumable.
+                if run.state in {"completed", "cancelled", "superseded_policy_changed", "failed"}:
+                    if self._filesystem is not None:
+                        self._filesystem.forget_scan(run.id)
                 return run
             new_state = "paused" if run.state == "pausing" else "cancelled"
             try:
@@ -208,6 +261,25 @@ class LibraryScanCoordinator:
                     now=self._clock(),
                 )
             except StaleRevisionError:
+                # R-02: a racing writer keeps moving the revision under us.
+                # Sleep with jitter and retry bounded times, then take the
+                # stop-signal path: return the still-unsettled run WITHOUT
+                # discarding the pending-control entry, so checkpoint keeps
+                # returning False and the supervisor retries later. Never
+                # raise: checkpoint consumers only understand True/False.
+                stale_retries += 1
+                if stale_retries >= SETTLE_STALE_MAX_RETRIES:
+                    _scan_metrics.increment("settle_stale_retries")
+                    logger.warning(
+                        "Scan settle spin exhausted %d stale retries for run %s; "
+                        "leaving it unsettled for the supervisor to retry",
+                        stale_retries,
+                        run_id,
+                    )
+                    return run
+                await asyncio.sleep(
+                    SETTLE_STALE_RETRY_BASE_SECONDS * random.uniform(0.5, 1.5)
+                )
                 continue
             if self._events is not None:
                 await self._events.publish(settled, event="scan.transition")
@@ -231,6 +303,9 @@ class LibraryScanCoordinator:
             return True
         run, _, _ = await self._store.get_scan_run(run_id)
         if current_policy_revision != frozen_policy_revision:
+            if run.state == "stopping" or run.requested_control == "stop":
+                await self._settle_pending_control(run.id)
+                return False
             if run.state == "paused":
                 await self._store.transition_scan_run(
                     run.id,
@@ -282,6 +357,12 @@ class LibraryScanCoordinator:
         try:
             return await self._continue_run(run, root_paths)
         except Exception:  # noqa: BLE001 - a crashed worker must leave a terminal durable run
+            logger.exception(
+                "Scan worker failed for run %s during scan state %s",
+                run.id,
+                run.state,
+                extra={"run_id": run.id, "scan_state": run.state},
+            )
             current, _, _ = await self._store.get_scan_run(run.id)
             if current.state in {"pausing", "stopping"}:
                 return await self._settle_pending_control(current.id)
@@ -443,3 +524,25 @@ class LibraryScanCoordinator:
                 await self._store.complete_scan_management_candidate(
                     run_id, album_id, completed_at=now
                 )
+    def close(self) -> None:
+        close = getattr(self._inventory, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - close must not hang shutdown
+                logger.exception("Failed to close inventory scanner")
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._inventory, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 - close must not hang shutdown
+                logger.exception("Failed to close inventory scanner")
+            return
+        close = getattr(self._inventory, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - close must not hang shutdown
+                logger.exception("Failed to close inventory scanner")

@@ -3,22 +3,19 @@
 Each acquisition source (Soulseek via slskd, Usenet via Newznab+SABnzbd) differs in
 search, identity, enqueue, poll→status, completed-file enumeration and cleanup. Lidarr
 sprinkles ``if protocol == usenet`` across its download flow; we collapse those branches
-behind a ``SourceStrategy`` so the orchestrator never branches on source.
-
-Extracted in behaviour-preserving slices (each verbatim + suite-green):
-- slice 1: ``search_and_score`` (find candidates for this source).
-- slice 2a: ``import_files`` (per-file slskd import vs unpacked-folder Usenet import).
-- slice 2b: ``enqueue`` (build + persist the manifest, hand off to the client).
-Source-enablement stays on the orchestrator (it reads the live enable toggles). Later
-slices fold in identity + blocklist-on-failure and the failover-loop source branches.
+behind a ``SourceStrategy`` so the orchestrator never branches on source. Source
+enablement stays on the orchestrator (it reads the live enable toggles).
 """
 
 import asyncio
+from contextlib import suppress
 import logging
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from core.exceptions import NewznabApiError
+from models.acquisition_quality import AcquisitionQualitySnapshot
 from models.download import ScoredCandidate, TargetAlbum, TargetTrack
 from models.download_identity import soulseek_identity, usenet_identity
 from models.download_manifest import DownloadManifest, ExpectedFile, ExpectedTrack
@@ -27,6 +24,8 @@ from repositories.protocols.download_client import (
     EnqueueRequest,
     TaskHandle,
 )
+from services.album_utils import audio_tracks
+from services.native.acquisition import scoring_core
 from services.native.acquisition.errors import OrchestrationError
 from services.native.file_processor import (
     DOWNLOADS_MOUNT_UNAVAILABLE,
@@ -37,9 +36,11 @@ from services.native.file_processor import (
 
 logger = logging.getLogger(__name__)
 
-# Re-poll budget for an unpacked Usenet job folder, tolerating a separate-NFS-client
-# directory-attribute cache lag (a shared client sees the move instantly).
-_USENET_SETTLE_SECONDS = 20.0
+# Re-poll budget for an unpacked Usenet job folder that EXISTS but is empty,
+# tolerating slow mount-visibility lag (NFS/SMB attribute-cache delays can
+# exceed the old 20s window). A missing folder never settles - it short-
+# circuits to the remap-fault path in import_files.
+_USENET_SETTLE_SECONDS = 60.0
 
 # A SABnzbd failure mentioning one of these is a password-protected NZB - a non-retryable
 # skip (blocklisted regardless of age, since propagation can't fix encryption).
@@ -104,6 +105,9 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
             info = await album_service.get_album_tracks_info(task.release_group_mbid)
     except Exception as error:  # noqa: BLE001 - no exact proof means no enqueue
         raise OrchestrationError("could not verify the exact album edition") from error
+    # Audio media only: DVD-video positions are not downloadable audio, and the
+    # manifest must measure the same target set as request time and coverage.
+    tracks = audio_tracks(list(info.tracks))
     expected = [
         ExpectedTrack(
             track_number=track.position,
@@ -113,7 +117,7 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
             title=track.title,
             release_track_mbid=track.release_track_id,
         )
-        for track in info.tracks
+        for track in tracks
     ]
     if (
         not expected
@@ -141,6 +145,73 @@ async def _expected_tracks_for_task(  # noqa: ANN001, ANN201
                 "could not pin the exact album edition to this download"
             ) from error
     return selected_release, expected
+
+
+def _file_serves_expected(value, tracks) -> bool:  # noqa: ANN001
+    """Whether one search-result file plausibly serves any of ``tracks`` - the
+    per-file failover filter (#292). Search-side evidence only (filename stem +
+    advertised duration), judged by the SAME thresholds the post-download matcher
+    applies (coverage's ``row_covers_track`` rules): containment-strong title,
+    duration within max(15s, 10%). Evidence is tri-state per track: a disagreeing
+    title only excludes when duration cannot rescue it (peer paths like ``02.flac``
+    carry no title signal), a hard duration miss always excludes, and a track with
+    no usable signal cannot be discriminated - its files pass rather than strand
+    the position on every candidate. Thin wrapper over the shared
+    ``scoring_core`` pair rule so the failover filter and grab-time overlap can
+    never drift apart."""
+    stem = scoring_core.filename_stem(value.filename)
+    return any(
+        scoring_core.pair_serves_track(
+            stem, value.duration, track.title, track.duration_seconds
+        )
+        for track in tracks
+    )
+
+
+def pre_publication_quality_check(
+    task,
+    candidate,
+    files,
+    tagger,
+):  # noqa: ANN001
+    """UNCONDITIONAL local verification before publication (Acquisition plan):
+    probe the downloaded bytes through the codec-aware tagger and re-run the
+    task's STORED snapshot evaluation on measured facts. Returns a mismatch
+    dict, or None when the quality is acceptable / cannot be judged (no stored
+    snapshot, no tagger wired - tests - or unreadable files)."""
+    if tagger is None or not files:
+        return None
+    raw = getattr(task, "quality_snapshot_json", None)
+    if raw is None:
+        return None
+
+    from services.native.acquisition import quality as acq_quality
+
+    try:
+        snapshot = acq_quality.decode_snapshot(raw)
+    except acq_quality.SnapshotValidationError:
+        return {
+            "reason": "post_download_quality_mismatch",
+            "detail": "Stored quality policy snapshot is invalid.",
+        }
+
+    from services.native.acquisition.local_probe import (
+        expected_vs_actual_copy,
+        probe_files_sync,
+        quality_mismatch,
+    )
+
+    try:
+        probed = probe_files_sync(files, tagger)
+    except Exception:  # noqa: BLE001 - an unreadable byte never blocks publication
+        return None
+    decision = getattr(candidate, "quality_decision", None)
+    if quality_mismatch(snapshot, decision, probed):
+        return {
+            "reason": "post_download_quality_mismatch",
+            "detail": expected_vs_actual_copy(decision, probed),
+        }
+    return None
 
 
 @runtime_checkable
@@ -190,8 +261,10 @@ class SourceStrategy(Protocol):
         timeout: float,
         auto: float,
         manual: float,  # noqa: ANN001
+        snapshot: AcquisitionQualitySnapshot,
     ) -> list[ScoredCandidate]:
-        """Search this source for ``task`` and return its scored candidates (best first)."""
+        """Search this source for ``task`` and return its scored candidates
+        ranked under the task's immutable quality snapshot (best first)."""
         ...
 
     async def enqueue(
@@ -201,10 +274,14 @@ class SourceStrategy(Protocol):
         *,
         strict_track_duration: bool,
         hold_on_wrong_track: bool = False,  # noqa: ANN001
+        remaining_positions: "frozenset[tuple[int, int]] | None" = None,
     ) -> None:
         """Build + persist the crash-recovery manifest, then hand the pick to the client.
         ``hold_on_wrong_track`` (the last-resort track re-pull, D9): a canonical-duration
-        failure at import then holds the file for review instead of failing it."""
+        failure at import then holds the file for review instead of failing it.
+        ``remaining_positions`` (per-file failover, #292): when given, ask ONLY for the
+        still-missing (disc, track) positions instead of the whole album; Usenet ignores
+        it (an NZB is the smallest addressable unit)."""
         ...
 
     async def import_files(
@@ -241,6 +318,8 @@ class SoulseekStrategy:
         naming_template,
         library=None,
         album_service=None,
+        policy_extras=None,  # Callable[[], SpecPolicy | None]: live NON-quality gates
+        probe_tagger=None,  # AudioTagger for the pre-publication quality probe
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -254,6 +333,8 @@ class SoulseekStrategy:
         # Resolves the held tier an origin='upgrade' run must beat (upgrade-floor, D12).
         self._library = library
         self._album_service = album_service
+        self._policy_extras = policy_extras
+        self._probe_tagger = probe_tagger
 
     @property
     def client(self):  # noqa: ANN201
@@ -261,6 +342,9 @@ class SoulseekStrategy:
 
     def candidate_identity(self, candidate) -> str:  # noqa: ANN001
         return candidate.username
+
+    def _extras(self):
+        return self._policy_extras() if self._policy_extras is not None else None
 
     def local_fault_message(self, attempt_mount: bool) -> str:  # noqa: ARG002
         # slskd's only local fault is an unreachable downloads mount (attempt_mount is True here).
@@ -273,8 +357,9 @@ class SoulseekStrategy:
         # there's no release-level blocklist to apply at failover time.
         return
 
-    async def search_and_score(self, task, *, timeout, auto, manual):  # noqa: ANN001, ANN201
+    async def search_and_score(self, task, *, timeout, auto, manual, snapshot):  # noqa: ANN001, ANN201
         held_tier = await _upgrade_held_tier(self._library, task)
+        extras = self._extras()
         if task.download_type == "track":
             target = TargetTrack(
                 artist_name=task.artist_name,
@@ -293,6 +378,7 @@ class SoulseekStrategy:
             return await self._track_matcher.rank(
                 target,
                 results,
+                snapshot=snapshot,
                 auto_accept_threshold=auto,
                 manual_threshold=manual,
                 held_tier=held_tier,
@@ -324,6 +410,7 @@ class SoulseekStrategy:
             return await self._track_matcher.rank(
                 target,
                 results,
+                snapshot=snapshot,
                 auto_accept_threshold=auto,
                 manual_threshold=manual,
                 held_tier=held_tier,
@@ -343,16 +430,41 @@ class SoulseekStrategy:
             timeout=timeout,
         )
         results = [r.soulseek for r in indexer_results if r.soulseek is not None]
+        # Grab-time overlap input: the same pinned-edition tracklist the import
+        # will verify against, resolved WITHOUT pinning side-effects
+        # (task_store=None - pinning stays at enqueue). Advisory only: any
+        # resolution failure falls back to today's tracklist-blind rank.
+        expected_tracks: list = []
+        if self._album_service is not None and task.release_group_mbid:
+            try:
+                _, expected_tracks = await _expected_tracks_for_task(
+                    task, self._album_service, None
+                )
+            except OrchestrationError as exc:
+                logger.info(
+                    "download.overlap_unresolved",
+                    extra={"task_id": task.id, "reason": str(exc)},
+                )
         return await self._scorer.rank(
             target,
             results,
+            snapshot=snapshot,
+            spec_extras=extras,
             auto_accept_threshold=auto,
             manual_threshold=manual,
             held_tier=held_tier,
+            expected_tracks=expected_tracks,
+            release_group_mbid=task.release_group_mbid,
         )
 
     async def enqueue(
-        self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False
+        self,
+        task,
+        candidate,
+        *,
+        strict_track_duration,
+        hold_on_wrong_track=False,
+        remaining_positions=None,
     ):  # noqa: ANN001, ANN201
         # For a per-track download - or a 1-track album (a single, whose identity was
         # threaded at request time) - verify the imported file against the CANONICAL
@@ -374,13 +486,35 @@ class SoulseekStrategy:
         ):
             raise OrchestrationError("could not resolve the exact album tracklist")
 
+        # Per-file failover (#292): when the orchestrator says only some (disc, track)
+        # positions are still missing, ask this peer for JUST those - expected_tracks
+        # shrinks to them, and only files that plausibly serve one get enqueued. slskd
+        # keeps partial bytes per file, so re-requesting a missing track RESUMES its
+        # earlier errored attempt instead of starting over.
+        serving = candidate.files
+        if remaining_positions is not None:
+            expected_tracks = [
+                value
+                for value in expected_tracks
+                if (value.disc_number or 1, value.track_number) in remaining_positions
+            ]
+            if not expected_tracks:
+                raise OrchestrationError("nothing left to acquire from this source")
+            serving = [
+                value
+                for value in candidate.files
+                if _file_serves_expected(value, expected_tracks)
+            ]
+            if not serving:
+                raise OrchestrationError("candidate has no files serving the remaining tracks")
+
         files = [
             DownloadFileRef(
                 username=candidate.username, filename=f.filename, size=f.size
             )
-            for f in candidate.files
+            for f in serving
         ]
-        total_size = sum(f.size for f in candidate.files)
+        total_size = sum(f.size for f in serving)
         await self._store.update_status(
             task.id,
             "downloading",
@@ -397,7 +531,7 @@ class SoulseekStrategy:
         initial_handle = TaskHandle(
             source="soulseek",
             username=candidate.username,
-            filenames=[f.filename for f in candidate.files],
+            filenames=[f.filename for f in serving],
         )
         attempt = await self._store.create_download_attempt(
             task_id=task.id,
@@ -428,7 +562,7 @@ class SoulseekStrategy:
                     if use_canonical
                     else f.duration,
                 )
-                for f in candidate.files
+                for f in serving
             ],
             # Complete selected-edition map. Transfer filenames remain the correlation
             # keys; import maps each audio file to one exact release position and then
@@ -476,17 +610,53 @@ class SoulseekStrategy:
             "download.processing",
             extra={"task_id": task.id, "files_total": len(manifest.target_files)},
         )
+        # UNCONDITIONAL local quality probe before publication handoff.
+        if self._probe_tagger is not None:
+            local_paths: list = []
+            for target_file in manifest.target_files:
+                with suppress(Exception):
+                    resolved = await self._client.get_file_path(
+                        getattr(manifest, "handle", None), target_file.filename
+                    )
+                    if resolved is not None:
+                        local_paths.append(resolved)
+            candidate = await self._current_candidate(task)
+            mismatch = pre_publication_quality_check(
+                task, candidate, local_paths, self._probe_tagger
+            )
+            if mismatch is not None:
+                logger.info(
+                    "download.quality_mismatch",
+                    extra={
+                        "task_id": task.id,
+                        **{k: v for k, v in mismatch.items() if k != "probed"},
+                    },
+                )
+                failed = [
+                    FileFailure(filename=f.filename, reason=mismatch["reason"])
+                    for f in manifest.target_files
+                ]
+                return ProcessResult(succeeded=[], failed=failed), len(failed)
+
         result = await self._file_processor.process_downloaded(
             manifest, only_filenames=only_filenames
         )
         for failure in result.failed:
-            if failure.reason in QUARANTINE_REASONS:
+            # ``tag_mismatch`` is intentionally kept on the returned ProcessResult so
+            # callers can report the truthful content-verification outcome. The
+            # quarantine table's existing CHECK vocabulary predates this reason, so
+            # persist it as the equivalent ``verify_failed`` source exclusion without
+            # changing the failure surfaced to the orchestrator or held-import UI.
+            quarantine_reason = (
+                "verify_failed" if failure.reason == "tag_mismatch" else failure.reason
+            )
+            if quarantine_reason in QUARANTINE_REASONS:
                 await self._store.record_quarantine(
                     source="soulseek",
                     identity=soulseek_identity(
                         task.source_username or "", failure.filename
                     ),
-                    reason=failure.reason,
+                    reason=quarantine_reason,
                     release_group_mbid=task.release_group_mbid,
                 )
                 logger.info(
@@ -502,6 +672,18 @@ class SoulseekStrategy:
                 task.id, str(Path(result.succeeded[0]).parent)
             )
         return result, len(result.succeeded) + len(result.failed)
+
+    async def _current_candidate(self, task):  # noqa: ANN001
+        """The selected candidate blob for this task (None when unlinked)."""
+        try:
+            if task.search_job_id is None or task.candidate_index is None:
+                return None
+            candidates = await self._store.get_search_job_candidates(task.search_job_id)
+            if 0 <= task.candidate_index < len(candidates):
+                return candidates[task.candidate_index]
+        except Exception:  # noqa: BLE001 - probe path must fail open
+            return None
+        return None
 
 
 class UsenetStrategy:
@@ -532,6 +714,8 @@ class UsenetStrategy:
         post_processing,
         min_release_age_seconds,
         library=None,
+        policy_extras=None,
+        probe_tagger=None,
     ):
         self._indexer = indexer
         self._scorer = scorer
@@ -549,6 +733,8 @@ class UsenetStrategy:
         self._priority = priority
         self._post_processing = post_processing
         self._min_release_age = min_release_age_seconds
+        self._policy_extras = policy_extras
+        self._probe_tagger = probe_tagger
 
     @property
     def client(self):  # noqa: ANN201
@@ -615,6 +801,17 @@ class UsenetStrategy:
         # CHECK-constrained in the DB AND shown in the Quarantine panel, so it must stay in the
         # allowed vocabulary - "verify_failed" is the existing term for "downloaded but didn't
         # match", reusing the soulseek import-verify reasons.
+        if completed and not enumerated_any and await self._completed_folder_missing(task):
+            # A Completed job whose folder is missing on the mount is a
+            # storage-remap fault (Windows backslashes, category-subfolder
+            # mounts), not a dead release: never blocklist it. The workspace is
+            # preserved by the import path, so a later reimport can still
+            # recover the files (#245).
+            logger.info(
+                "download.usenet_remap_skip",
+                extra={"task_id": task.id},
+            )
+            return
         stored_reason = "verify_failed" if confirms_underdelivery else "download_failed"
         await self._store.record_quarantine(
             source="usenet",
@@ -632,10 +829,36 @@ class UsenetStrategy:
             },
         )
 
-    async def search_and_score(self, task, *, timeout, auto, manual):  # noqa: ANN001, ANN201
+    async def _blocklist_content_rejected_release(self, task, release) -> None:  # noqa: ANN001
+        """Quarantine a release whose NZB fetch returned an indexer error/limit page.
+
+        A non-NZB body is deterministic (propagation can't fix an indexer error
+        page), so no age leniency applies - unlike ``maybe_blocklist_on_failure``.
+        Same title+size identity and ``download_failed`` reason vocabulary so a
+        follow-up search/score run skips this release.
+        """
+        identity = usenet_identity(release.title, release.size_bytes)
+        await self._store.record_quarantine(
+            source="usenet",
+            identity=identity,
+            reason="download_failed",
+            release_group_mbid=task.release_group_mbid,
+        )
+        logger.info(
+            "download.quarantined",
+            extra={
+                "task_id": task.id,
+                "source": "usenet",
+                "reason": "nzb_content_rejected",
+                "identity": identity,
+            },
+        )
+
+    async def search_and_score(self, task, *, timeout, auto, manual, snapshot):  # noqa: ANN001, ANN201
         # A track upgrade still fetches the album NZB (D4), but its floor is the
         # RECORDING's held tier - _upgrade_held_tier scopes by download_type.
         held_tier = await _upgrade_held_tier(self._library, task)
+        extras = self._policy_extras() if self._policy_extras else None
         target = TargetAlbum(
             artist_name=task.artist_name,
             album_title=task.album_title,
@@ -654,6 +877,8 @@ class UsenetStrategy:
         return await self._scorer.rank(
             target,
             releases,
+            snapshot=snapshot,
+            spec_extras=extras,
             auto_accept_threshold=auto,
             manual_threshold=manual,
             track_count=task.track_count,
@@ -661,13 +886,23 @@ class UsenetStrategy:
         )
 
     async def enqueue(
-        self, task, candidate, *, strict_track_duration, hold_on_wrong_track=False
+        self,
+        task,
+        candidate,
+        *,
+        strict_track_duration,
+        hold_on_wrong_track=False,
+        remaining_positions=None,
     ):  # noqa: ANN001, ANN201, ARG002
         # Hand the chosen album NZB to SABnzbd. The manifest carries the expected MB
         # tracklist (not pre-known filenames) - the folder import matches the unpacked files
         # to it (D18). For a per-track grab (D4) the tracklist is the single track.
         # hold_on_wrong_track is a slskd re-pull concern; the folder import has its own
         # per-track matcher, so it is accepted for protocol conformance and unused.
+        # remaining_positions is likewise accepted-and-ignored (#292): an NZB is the
+        # smallest addressable Usenet unit, so failover stays whole-album here; the
+        # release-level blocklist above already stops re-grabbing an under-delivering
+        # release.
         release = candidate.usenet_release
         if release is None:
             raise OrchestrationError("usenet candidate has no release")
@@ -680,7 +915,7 @@ class UsenetStrategy:
             task, self._album_service, self._store
         )
         if not expected_tracks:
-            raise OrchestrationError("could not resolve the album tracklist")
+            raise OrchestrationError(f"could not resolve the album tracklist for {task.release_group_mbid}")
         # Unique per failover candidate: failover reuses the same task object (only
         # candidate_index advances), so a constant name collides with the prior attempt's
         # not-yet-deleted SABnzbd job and SAB appends .1/.2, orphaning unpacked folders on the
@@ -733,6 +968,18 @@ class UsenetStrategy:
                     post_processing=self._post_processing,
                 )
             )
+        except NewznabApiError as exc:
+            if getattr(exc, "content_rejection", False):
+                # Deterministic indexer content rejection (an HTML error/limit page
+                # instead of an NZB): blocklist this release by title+size so a
+                # re-search skips it, then fail over surfacing the safe message.
+                # ``exc.message`` (not ``str(exc)``) - ``str`` appends ``details``,
+                # which carries the indexer body snippet that must never reach the
+                # user-facing task error.
+                await self._blocklist_content_rejected_release(task, release)
+                raise OrchestrationError(exc.message) from exc
+            logger.exception("Usenet enqueue failed for task %s", task.id)
+            raise OrchestrationError("enqueue failed") from exc
         except Exception as exc:  # noqa: BLE001 - any client error -> task failed
             logger.exception("Usenet enqueue failed for task %s", task.id)
             raise OrchestrationError("enqueue failed") from exc
@@ -764,9 +1011,20 @@ class UsenetStrategy:
         # by identity in the failover loop (it can be a zero-file Failed that never reaches here).
         files = await self._client.list_completed_files(manifest.handle)
         if not files and completed:
-            # A good release's files are present at Completed; re-poll briefly only to cover a
-            # separate-NFS-client visibility lag before concluding empty. A failed job is
-            # terminal (waiting won't add files), so don't settle.
+            # An empty first enumeration is either mount-visibility lag or a
+            # storage-remap fault. A missing folder short-circuits to the
+            # remap-fault path (no settle can fix a path that resolves
+            # nowhere); an existing-but-empty folder settles first (#245).
+            if await self._completed_folder_missing_handle(manifest.handle):
+                logger.warning(
+                    "download.usenet_folder_missing",
+                    extra={"task_id": task.id},
+                )
+                return ProcessResult(
+                    succeeded=[],
+                    failed=[],
+                    workspace_disposition="preserve",
+                ), 0
             files = await self._settle_files(manifest.handle)
         enumerated = len(files)
         logger.info(
@@ -788,26 +1046,116 @@ class UsenetStrategy:
                         FileFailure(filename="", reason=DOWNLOADS_MOUNT_UNAVAILABLE)
                     ],
                 ), enumerated
+        # UNCONDITIONAL local quality probe before publication handoff.
+        if self._probe_tagger is not None:
+            candidate = None
+            try:
+                if task.search_job_id is not None and task.candidate_index is not None:
+                    candidates = await self._store.get_search_job_candidates(
+                        task.search_job_id
+                    )
+                    if 0 <= task.candidate_index < len(candidates):
+                        candidate = candidates[task.candidate_index]
+            except Exception:  # noqa: BLE001 - probe fails open
+                candidate = None
+            mismatch = pre_publication_quality_check(
+                task, candidate, list(files), self._probe_tagger
+            )
+            if mismatch is not None:
+                logger.info(
+                    "download.quality_mismatch",
+                    extra={
+                        "task_id": task.id,
+                        "detail": mismatch.get("detail", "")[:200],
+                    },
+                )
+                return (
+                    ProcessResult(
+                        succeeded=[],
+                        failed=[
+                            FileFailure(
+                                filename=str(f),
+                                reason=mismatch["reason"],
+                            )
+                            for f in files
+                        ],
+                    ),
+                    enumerated,
+                )
+
         result = await self._file_processor.process_downloaded_folder(manifest, files)
         if result.succeeded:
             await self._store.set_final_path(
                 task.id, str(Path(result.succeeded[0]).parent)
             )
+        if not files and completed:
+            # Ambiguous empty after settle on a reachable mount (remap fault or
+            # slow visibility): never discard the user's completed folder -
+            # preserve it so a later reimport can still find the files. The 6h
+            # orphan reconcile is the terminal state for genuinely dead folders
+            # (#245). (The mount-unreachable path returned above.)
+            result = ProcessResult(
+                succeeded=list(result.succeeded),
+                failed=list(result.failed),
+                publisher_bundle_ids=list(result.publisher_bundle_ids),
+                workspace_disposition="preserve",
+            )
         return result, enumerated
 
+    async def _completed_folder_missing(self, task) -> bool:  # noqa: ANN001
+        """Whether the Completed job's folder is missing on the mount (or its
+        storage unresolvable) - the remap-fault signal (#245)."""
+        try:
+            attempt = await self._store.get_download_attempt_for_candidate(
+                task.id, "usenet", task.candidate_index
+            )
+        except Exception:  # noqa: BLE001 - journal trouble reads as missing (safe path)
+            return True
+        handle = attempt.handle if attempt is not None else None
+        return await self._completed_folder_missing_handle(handle)
+
+    async def _completed_folder_missing_handle(self, handle) -> bool:  # noqa: ANN001
+        """Handle-level half of :meth:`_completed_folder_missing`, shared with the
+        import path (which already holds the manifest handle).
+
+        Resolved through the exact-path evidence: when the exact path is
+        unresolvable but the hardened remap could still apply, this reads
+        missing and the caller takes the safe path (preserve, no blocklist) -
+        the fail-safe direction. An inspect failure also reads missing.
+        """
+        if handle is None or not (handle.job_name or handle.nzo_id):
+            return True
+        try:
+            material = await self._client.inspect_materialization(handle)
+        except Exception:  # noqa: BLE001 - diagnostic failure reads as missing
+            return True
+        workspace = material.workspace_path or ""
+        if not workspace:
+            return True
+        try:
+            return not await asyncio.to_thread(Path(workspace).is_dir)
+        except OSError:
+            return True
+
     async def _settle_files(self, handle):  # noqa: ANN001, ANN201
-        """Re-poll the completed job's folder for audio, tolerating the window where a
-        separate NFS client's directory-attribute cache delays visibility. Returns as soon
-        as any file appears, else [] after polling for up to ``_USENET_SETTLE_SECONDS``."""
+        """Re-poll the completed job's existing-but-empty folder for audio,
+        tolerating slow mount-visibility lag. Returns once the enumerated set is
+        stable across two polls (a partially-materialised folder must not import
+        short), else whatever the last poll saw after polling for up to
+        ``_USENET_SETTLE_SECONDS``."""
         interval = self._import_settle
-        tries = max(1, int(_USENET_SETTLE_SECONDS / interval)) if interval > 0 else 5
+        tries = max(2, int(_USENET_SETTLE_SECONDS / interval)) if interval > 0 else 5
+        previous: list[str] = []
+        files: list[Path] = []
         for _ in range(tries):
             if interval > 0:
                 await asyncio.sleep(interval)
             files = await self._client.list_completed_files(handle)
-            if files:
+            current = sorted(str(p) for p in files)
+            if current and current == previous:
                 return files
-        return []
+            previous = current
+        return files
 
 
 def _basename(filename: str) -> str:

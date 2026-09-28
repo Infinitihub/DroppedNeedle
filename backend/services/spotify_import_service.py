@@ -5,11 +5,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
+from rapidfuzz.fuzz import token_set_ratio
+
+from infrastructure.cache.cache_keys import mb_isrc_key
+from infrastructure.cache.memory_cache import CacheInterface
+from infrastructure.degradation import try_get_degradation_context
+from infrastructure.http.client import get_spotify_cover_http_client
+from infrastructure.integration_result import IntegrationResult
 from infrastructure.queue.priority_queue import RequestPriority
-from repositories.musicbrainz_album import _pick_best_release_group
-from repositories.musicbrainz_base import mb_api_get
+from infrastructure.validators import is_valid_isrc, validate_spotify_cover_url
+from repositories.musicbrainz_album import (
+    _artist_name_matches,
+    _artist_preference_active,
+    _pick_best_release_group,
+)
+from repositories.musicbrainz_base import (
+    capture_mb_source_context,
+    clear_mb_response_context,
+    extract_artist_name,
+    get_mb_response_context,
+    is_mb_source_current,
+    mb_api_get,
+    mb_cache_get_if_current,
+    mb_cache_set_if_current,
+    mb_deduplicator,
+)
+from services.native.musicbrainz_matcher import MusicBrainzMatcher
 from repositories.async_playlist_repository import AsyncPlaylistRepository
 
 if TYPE_CHECKING:
@@ -51,6 +77,148 @@ def _best_image_url(images: list[dict], min_size: int = 250) -> str | None:
             return img.get("url")
     return sorted_imgs[-1].get("url")
 
+def _playlist_track_count(playlist: dict) -> int:
+    """Track count from a GET /me/playlists playlist item.
+
+    Spotify simplified-playlist shape (served early Sept 2026, DroppedNeedle
+    v2.9.0, issue #353 over 221 playlists): the count lives under ``items``
+    as a dict ``{"href": ..., "total": N}`` with ``tracks`` null/absent. The
+    older shape used ``tracks: {"total": N}``. ``items`` is also the
+    pagination key elsewhere and may arrive as a list, which carries no
+    total, so only dict shapes are read and anything else yields 0.
+    """
+    for key in ("items", "tracks"):
+        val = playlist.get(key)
+        if isinstance(val, dict):
+            total = val.get("total")
+            if isinstance(total, int):
+                return total
+    return 0
+
+
+_SOURCE = "spotify"
+
+# Network read bound for one playlist cover. Deliberately looser than the
+# 2 MB storage cap PlaylistService enforces: this only stops us reading an
+# unbounded response off the wire; storage validation stays authoritative.
+MAX_COVER_FETCH_BYTES = 5 * 1024 * 1024
+
+CoverFetcher = Callable[[str], Awaitable[tuple[bytes, str] | None]]
+
+
+def _record_degradation(msg: str) -> None:
+    ctx = try_get_degradation_context()
+    if ctx is not None:
+        ctx.record(IntegrationResult.error(source=_SOURCE, msg=msg))
+
+
+async def fetch_spotify_playlist_cover(
+    url: str, http_client: httpx.AsyncClient
+) -> tuple[bytes, str] | None:
+    """Fetch and validate a Spotify CDN playlist image.
+
+    Single attempt, no redirects (a scdn.co URL must answer directly), HTTPS
+    host allowlist, ``image/*`` content type, and a bounded streamed read that
+    aborts past :data:`MAX_COVER_FETCH_BYTES` without buffering the excess.
+    Returns ``(image_bytes, content_type)``, or ``None`` when the response is
+    unusable. Network errors propagate; the caller degrades.
+    """
+    if not validate_spotify_cover_url(url):
+        return None
+    async with http_client.stream("GET", url, follow_redirects=False) as response:
+        if response.is_redirect or response.status_code != 200:
+            return None
+        content_type = (
+            response.headers.get("content-type", "").split(";")[0].strip().lower()
+        )
+        if not content_type.startswith("image/"):
+            return None
+        declared = response.headers.get("content-length")
+        if (
+            declared
+            and declared.lstrip().isdigit()
+            and int(declared) > MAX_COVER_FETCH_BYTES
+        ):
+            return None
+        buffer = bytearray()
+        async for chunk in response.aiter_bytes():
+            buffer.extend(chunk)
+            if len(buffer) > MAX_COVER_FETCH_BYTES:
+                return None
+    return bytes(buffer), content_type
+
+
+def cover_fetcher_for(http_client: httpx.AsyncClient) -> CoverFetcher:
+    """Bind the bounded cover fetch to a client - the factory-built named
+    client in production, a MockTransport-served client in tests."""
+
+    async def _fetch(url: str) -> tuple[bytes, str] | None:
+        return await fetch_spotify_playlist_cover(url, http_client)
+
+    return _fetch
+
+
+def _prefer_artist_matching_recordings(
+    recordings: list[dict], artist: str
+) -> list[dict]:
+    """Stable artist-first ordering for the ISRC per-recording loop (#385).
+
+    Recordings whose in-hand artist credit fuzzy-matches the expected artist
+    resolve first, so a Various Artists compilation recording sharing the ISRC
+    no longer wins by MusicBrainz response order. Blank/Various Artists
+    requests keep wire order.
+    """
+    if not _artist_preference_active(artist):
+        return recordings
+    return sorted(
+        recordings,
+        key=lambda rec: not _artist_name_matches(
+            artist, extract_artist_name(rec)
+        ),
+    )
+
+
+def _import_artist_floor_ok(target_artist: str, candidate_artist: str | None) -> bool:
+    """Artist-floor gate mirroring MusicBrainzMatcher._artist_floor_ok.
+
+    Local (rather than a Matcher instance) because the import service owns no
+    matcher; the floor constant and normalization are the matcher's own.
+    """
+    if not candidate_artist:
+        return True
+    result_artist = MusicBrainzMatcher._normalize(candidate_artist)
+    if not result_artist:
+        return True
+    return (
+        token_set_ratio(MusicBrainzMatcher._normalize(target_artist), result_artist)
+        / 100.0
+        >= MusicBrainzMatcher.ARTIST_MATCH_FLOOR
+    )
+
+
+def _select_import_search_result(
+    results: list[Any], artist: str, album_name: str
+) -> Any:
+    """Title-search fallback pick (#385): most title-similar result among
+    artist-floor passers instead of blind results[0]; falls back to results[0]
+    when the artist is blank/Various Artists or nothing passes.
+    """
+    if not _artist_preference_active(artist):
+        return results[0]
+    passing = [
+        result
+        for result in results
+        if _import_artist_floor_ok(artist, getattr(result, "artist", None))
+    ]
+    if not passing:
+        return results[0]
+    return max(
+        passing,
+        key=lambda result: MusicBrainzMatcher.title_similarity(
+            album_name, getattr(result, "title", "") or ""
+        ),
+    )
+
 
 class SpotifyImportService:
     def __init__(
@@ -59,9 +227,12 @@ class SpotifyImportService:
         playlist_repo: PlaylistRepository | None,
         mb_repo: MusicBrainzRepository,
         playlist_service: PlaylistService,
+        cache: CacheInterface,
         async_playlist_repo: Any | None = None,
+        cover_fetcher: CoverFetcher | None = None,
     ) -> None:
         self._client_factory = client_factory
+        self._cache = cache
         if async_playlist_repo is None and playlist_repo is None:
             raise ValueError("A playlist repository is required.")
         self._async_repo = (
@@ -71,6 +242,7 @@ class SpotifyImportService:
         )
         self._mb_repo = mb_repo
         self._playlist_service = playlist_service
+        self._cover_fetcher: CoverFetcher | None = cover_fetcher
 
     async def _get_client(self, user_id: str):
         client = await self._client_factory.resolve_spotify(user_id)
@@ -108,7 +280,7 @@ class SpotifyImportService:
                     "id": pid,
                     "name": p.get("name") or "",
                     "description": p.get("description") or "",
-                    "track_count": (p.get("tracks") or {}).get("total", 0),
+                    "track_count": _playlist_track_count(p),
                     "cover_url": cover_url,
                     "owner": owner.get("display_name") or "",
                     "imported_playlist_id": imported_mapping.get(pid),
@@ -174,9 +346,65 @@ class SpotifyImportService:
             )
 
         await self._async_repo.add_tracks(playlist_id, track_dicts)
+        await self._persist_playlist_cover(
+            user_id, spotify_playlist_id, playlist_id, _pl_info
+        )
         logger.info(
             f"Imported Spotify playlist {spotify_playlist_id} - internal {playlist_id} ({len(track_dicts)} tracks)"
         )
+
+    def _cover_fetch(self) -> CoverFetcher:
+        """Lazily bind the default named factory client on first use, so pure
+        unit tests that never touch covers don't build an HTTP client."""
+        if self._cover_fetcher is None:
+            self._cover_fetcher = cover_fetcher_for(get_spotify_cover_http_client())
+        return self._cover_fetcher
+
+    async def _persist_playlist_cover(
+        self,
+        user_id: str,
+        spotify_playlist_id: str,
+        playlist_id: str,
+        pl_info: dict,
+    ) -> None:
+        """Optional enrichment: store the picked provider image as the local
+        playlist cover. Any failure degrades (recorded into the request-scoped
+        DegradationContext when one is active) and leaves the import untouched -
+        artwork must never fail a playlist import; no cover is normal."""
+        cover_url = _best_image_url(pl_info.get("images") or [])
+        if not cover_url:
+            return
+        try:
+            fetched = await self._cover_fetch()(cover_url)
+            if fetched is None:
+                msg = (
+                    f"Spotify playlist cover rejected for {spotify_playlist_id} "
+                    f"({cover_url})"
+                )
+                _record_degradation(msg)
+                logger.warning(
+                    "spotify.playlist_cover action=rejected spotify_playlist=%s",
+                    spotify_playlist_id,
+                )
+                return
+            data, content_type = fetched
+            stored = await self._playlist_service.set_imported_cover(
+                playlist_id, user_id, data, content_type
+            )
+            logger.info(
+                "spotify.playlist_cover action=%s playlist=%s",
+                "stored" if stored else "kept_existing",
+                playlist_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional artwork never fails the import
+            _record_degradation(
+                f"Spotify playlist cover fetch failed for {spotify_playlist_id}: {exc}"
+            )
+            logger.warning(
+                "spotify.playlist_cover action=failed spotify_playlist=%s error=%s",
+                spotify_playlist_id,
+                exc,
+            )
 
     async def _resolve_album_mbids(
         self, raw_tracks: list[dict]
@@ -209,28 +437,120 @@ class SpotifyImportService:
     async def _resolve_mbid(
         self, isrc: str | None, artist: str, album_name: str
     ) -> str | None:
-        if isrc:
-            try:
-                data = await mb_api_get(
-                    f"/isrc/{isrc}",
-                    priority=RequestPriority.BACKGROUND_SYNC,
+        clear_mb_response_context()
+        operation_context = capture_mb_source_context()
+        # Gate before the durable read: a malformed ISRC is caller-data shape,
+        # not a provider failure, so it skips to the title-search fallback
+        # like a missing ISRC (no degradation recorded). MusicBrainz wants
+        # uppercase; Spotify may hand us lowercase.
+        normalized_isrc = (isrc or "").strip().upper()
+        isrc_usable = is_valid_isrc(normalized_isrc)
+        cache_key = mb_isrc_key(normalized_isrc) if isrc_usable else ""
+        cache_token = self._cache.capture_clear_token()
+        if isrc_usable and (
+            await mb_cache_get_if_current(self._cache, cache_key, operation_context)
+            == []
+        ):
+            # [] means a recent 404/empty wire response proved this ISRC
+            # absent: skip the durable read and the wire, straight to fallback.
+            isrc_usable = False
+        if isrc_usable:
+            canonical_store = getattr(self._mb_repo, "mb_canonical_store", None)
+            if canonical_store is not None:
+                try:
+                    existing = await canonical_store.get_recordings_by_isrc(
+                        normalized_isrc,
+                        source_context=operation_context,
+                    )
+                    if not is_mb_source_current(operation_context):
+                        existing = []
+                except Exception:  # noqa: BLE001 - durable miss falls through to wire
+                    existing = []
+                if not isinstance(existing, (list, tuple, set)):
+                    existing = []
+
+                # Only inspect the repository memory tier before paying for /isrc.
+                # A durable ISRC row is an index, not permission to issue another
+                # recording wire for every candidate.
+                cache_lookup = getattr(
+                    self._mb_repo, "get_cached_recording_to_release_group", None
                 )
+                if callable(cache_lookup):
+                    for rec_id in sorted(
+                        {str(value).casefold() for value in existing if value}
+                    ):
+                        try:
+                            mbid = await cache_lookup(rec_id)
+                        except Exception:  # noqa: BLE001 - try the next known row
+                            continue
+                        if mbid:
+                            return mbid
+
+            operation_context = capture_mb_source_context()
+            try:
+                dedupe_key = f"{cache_key}:g{operation_context.generation}"
+                data = await mb_deduplicator.dedupe(
+                    dedupe_key,
+                    lambda: mb_api_get(
+                        f"/isrc/{normalized_isrc}",
+                        priority=RequestPriority.BACKGROUND_SYNC,
+                        source_context=operation_context,
+                    ),
+                )
+                response_context = get_mb_response_context() or operation_context
+                if response_context != operation_context or not is_mb_source_current(
+                    operation_context
+                ):
+                    raise RuntimeError("MusicBrainz source changed during ISRC lookup")
                 recordings: list[dict] = data.get("recordings") or []
                 if isinstance(recordings, dict):
                     recordings = [recordings]
-                for rec in recordings:
+                if not recordings:
+                    # 404/empty: proven absence gets a 600 s memory-only negative
+                    # entry so repeat imports skip the wire; never banked durably.
+                    await mb_cache_set_if_current(
+                        self._cache,
+                        cache_key,
+                        [],
+                        ttl_seconds=600,
+                        context=response_context,
+                        cache_token=cache_token,
+                    )
+                # ST2 P1: bank ISRC -> recording ids durably (write-through)
+                # only for the source generation that answered.
+                if canonical_store is not None and operation_context is not None:
+                    try:
+                        await canonical_store.save_isrc_recordings(
+                            [
+                                (normalized_isrc, rec["id"])
+                                for rec in recordings
+                                if rec.get("id")
+                            ],
+                            source_context=operation_context,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass  # write-through must never break the import
+                for rec in _prefer_artist_matching_recordings(recordings, artist):
+                    if not is_mb_source_current(operation_context):
+                        raise RuntimeError(
+                            "MusicBrainz source changed during recording resolution"
+                        )
                     rec_id = rec.get("id")
                     if not rec_id:
                         continue
                     mbid = await self._mb_repo.resolve_recording_to_release_group(
-                        rec_id
+                        rec_id, expected_artist=artist
                     )
                     if mbid:
                         return mbid
+                if not is_mb_source_current(operation_context):
+                    raise RuntimeError(
+                        "MusicBrainz source changed during ISRC release selection"
+                    )
                 all_releases: list[dict] = []
                 for rec in recordings:
                     all_releases.extend(rec.get("releases") or [])
-                best = _pick_best_release_group(all_releases)
+                best = _pick_best_release_group(all_releases, expected_artist=artist)
                 if best:
                     return best[0]
             except Exception:  # noqa: BLE001
@@ -243,9 +563,12 @@ class SpotifyImportService:
                     album_name,
                     limit=3,
                     include_all_types=False,
+                    priority=RequestPriority.BACKGROUND_SYNC,
                 )
                 if results:
-                    return results[0].musicbrainz_id
+                    return _select_import_search_result(
+                        results, artist, album_name
+                    ).musicbrainz_id
             except Exception:  # noqa: BLE001
                 pass
 

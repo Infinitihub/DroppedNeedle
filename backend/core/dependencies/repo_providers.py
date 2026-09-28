@@ -9,6 +9,7 @@ import httpx
 from core.config import get_settings
 from infrastructure.http.client import (
     HttpClientFactory,
+    get_brainzmash_http_client,
     get_coverart_http_client,
     get_http_client,
     get_listenbrainz_http_client,
@@ -19,6 +20,7 @@ from .cache_providers import (
     get_cache,
     get_disk_cache,
     get_library_db,
+    get_mb_canonical_store,
     get_mbid_store,
     get_native_library_store,
     get_preferences_service,
@@ -40,20 +42,44 @@ def _get_configured_http_client() -> httpx.AsyncClient:
 
 @singleton
 def get_library_repository() -> "LibraryRepositoryProtocol":
-    # answers the wide legacy surface for services not yet migrated to the native engine
-    from services.native.library_manager import LibraryManager
+    from services.native.target_library_repository import TargetLibraryRepository
 
-    return LibraryManager(get_library_db())
+    from .cache_providers import get_native_library_store
+
+    return TargetLibraryRepository(
+        get_native_library_store(), get_request_history_store()
+    )
 
 
 @singleton
 def get_musicbrainz_repository() -> "MusicBrainzRepository":
     from repositories.musicbrainz_repository import MusicBrainzRepository
+    from repositories.musicbrainz_base import (
+        set_mb_canonical_store,
+        set_mb_response_store,
+    )
+    from .cache_providers import get_mb_response_store
+
+    set_mb_response_store(get_mb_response_store())
+    set_mb_canonical_store(get_mb_canonical_store())
 
     cache = get_cache()
     preferences_service = get_preferences_service()
     http_client = _get_configured_http_client()
-    return MusicBrainzRepository(http_client, cache, preferences_service)
+    brainzmash_client = get_brainzmash_http_client(
+        get_settings(),
+        timeout=float(preferences_service.get_advanced_settings().http_timeout),
+        connect_timeout=float(
+            preferences_service.get_advanced_settings().http_connect_timeout
+        ),
+    )
+    return MusicBrainzRepository(
+        http_client,
+        cache,
+        preferences_service,
+        mb_canonical_store=get_mb_canonical_store(),
+        brainzmash_http_client=brainzmash_client,
+    )
 
 
 @singleton
@@ -247,6 +273,7 @@ def get_youtube_repo() -> "YouTubeRepository":
         http_client=http_client,
         api_key=api_key,
         daily_quota_limit=yt_settings.daily_quota_limit,
+        settings_getter=preferences_service.get_youtube_connection,
     )
 
 
@@ -534,9 +561,9 @@ def _build_coverart_repository(
         * 1024,
         cover_non_monitored_ttl_seconds=advanced.cache_ttl_recently_viewed_bytes,
         library_db=library_db,
-        local_cover_priority=lambda: get_preferences_service()
-        .get_advanced_settings()
-        .prefer_local_cover_art,
+        local_cover_priority=lambda: (
+            get_preferences_service().get_advanced_settings().prefer_local_cover_art
+        ),
         native_library_store=native_library_store,
     )
 
@@ -637,7 +664,8 @@ def get_slskd_repository() -> "SlskdRepository":
     from repositories.slskd.slskd_repository import SlskdRepository
 
     settings = get_settings()
-    dc = get_preferences_service().get_download_client_settings_raw()
+    prefs = get_preferences_service()
+    dc = prefs.get_download_client_settings_raw()
     return SlskdRepository(
         client=get_slskd_client(),
         url=dc.url,
@@ -647,6 +675,7 @@ def get_slskd_repository() -> "SlskdRepository":
         ),
         concurrent_searches=settings.download_client_concurrent_searches,
         concurrent_enqueues=settings.download_client_concurrent_enqueues,
+        incomplete_mount=prefs.get_slskd_incomplete_mount(),
     )
 
 
@@ -685,8 +714,9 @@ def get_newznab_indexer() -> "NewznabIndexer":
         )
         for s in raw
     ]
-    # Keep the search cache TTL BELOW the auto-retry interval (02-… §Rate-limiting) so a
-    # delayed re-search actually re-hits the indexer instead of serving a stale result -
+    # Keep the search cache TTL BELOW the auto-retry interval
+    # (02-newznab-indexer-reference.md §Rate-limiting) so a delayed re-search
+    # actually re-hits the indexer instead of serving a stale result -
     # honoured even when the admin sets a sub-5-minute retry interval.
     retry_interval_s = (
         prefs.get_download_policy().auto_retry_base_interval_minutes * 60.0
@@ -706,12 +736,60 @@ def build_newznab_client(url: str, api_key: str) -> "NewznabClient":
     return NewznabClient(http, url, api_key, indexer_name=url)
 
 
+# Audio categories sent on Prowlarr searches (the single connection carries no
+# per-row categories). Mirrors the NewznabIndexerSettings default
+# ([3000, 3010, 3040]); category acceptance verified live on Prowlarr 2.3.5.5327.
+_PROWLARR_DEFAULT_CATEGORIES = [3000, 3010, 3040]
+
+
+@singleton
+def get_prowlarr_indexer() -> "ProwlarrIndexer":
+    """The Prowlarr search member: one ``IndexerProtocol`` over the single
+    configured Prowlarr connection. Unconfigured (no client) until the admin
+    saves a connection; pooled only when the ``usenet_search_backend`` selector
+    picks ``"prowlarr"`` (see ``_build_usenet_indexer``)."""
+    from repositories.prowlarr.prowlarr_client import ProwlarrClient
+    from repositories.prowlarr.prowlarr_indexer import ProwlarrIndexer
+
+    prefs = get_preferences_service()
+    raw = prefs.get_prowlarr_connection_raw()
+    if not (raw.enabled and raw.url and raw.api_key):
+        return ProwlarrIndexer(None, enabled=False)
+    http = HttpClientFactory.get_client(
+        name="prowlarr", timeout=30.0, connect_timeout=5.0
+    )
+    client = ProwlarrClient(http, raw.url, raw.api_key)
+    # Same TTL discipline as Newznab (below the auto-retry interval) so a
+    # delayed re-search re-hits instead of serving a stale result.
+    retry_interval_s = (
+        prefs.get_download_policy().auto_retry_base_interval_minutes * 60.0
+    )
+    search_cache_ttl = max(30.0, min(300.0, retry_interval_s * 0.5))
+    return ProwlarrIndexer(
+        client,
+        categories=list(_PROWLARR_DEFAULT_CATEGORIES),
+        search_cache_ttl=search_cache_ttl,
+    )
+
+
+def build_prowlarr_client(url: str, api_key: str) -> "ProwlarrClient":
+    """Transient (not cached) client from caller-supplied credentials, for the
+    Prowlarr Test-connection route - validates what the admin typed before saving."""
+    from repositories.prowlarr.prowlarr_client import ProwlarrClient
+
+    http = HttpClientFactory.get_client(
+        name="prowlarr-verify", timeout=30.0, connect_timeout=5.0
+    )
+    return ProwlarrClient(http, url, api_key, indexer_name=url)
+
 def build_slskd_repository(url: str, api_key: str) -> "SlskdRepository":
     """Transient (not cached) repo from caller-supplied credentials.
 
     Test-connection validates what the admin typed before saving, so it needs a
     one-off repo from the submitted url/key, not the stored config. Distinct httpx
-    client name so it never shares the live config.
+    client name so it never shares the live config. The incomplete fallback stays
+    off here (incomplete_mount=None): test-connection checks reachability, never
+    file locations.
     """
     from pathlib import Path
 
@@ -723,7 +801,7 @@ def build_slskd_repository(url: str, api_key: str) -> "SlskdRepository":
         name="slskd-verify", timeout=30.0, connect_timeout=5.0
     )
     return SlskdRepository(
-        client=SlskdClient(http, url, api_key),
+        client=SlskdClient(http, url, api_key, use_verify_breaker=True),
         url=url,
         api_key=api_key,
         downloads_mount=Path(settings.slskd_downloads_path),
@@ -769,7 +847,9 @@ def get_sabnzbd_download_client() -> "SabnzbdDownloadClient":
     )
 
 
-def build_sabnzbd_download_client(url: str, api_key: str) -> "SabnzbdDownloadClient":
+def build_sabnzbd_download_client(
+    url: str, api_key: str, downloads_mount: str = "/tmp"
+) -> "SabnzbdDownloadClient":
     """Transient client from caller-supplied credentials, for the Test-connection route."""
     from pathlib import Path
 
@@ -780,7 +860,7 @@ def build_sabnzbd_download_client(url: str, api_key: str) -> "SabnzbdDownloadCli
         name="sabnzbd-verify", timeout=60.0, connect_timeout=5.0
     )
     return SabnzbdDownloadClient(
-        SabnzbdClient(http, url, api_key), url, api_key, Path("/tmp")
+        SabnzbdClient(http, url, api_key), url, api_key, Path(downloads_mount)
     )
 
 

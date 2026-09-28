@@ -1,5 +1,7 @@
 """Request/response DTOs for the download-client + search + quarantine routes (Phase 6)."""
 
+from typing import Literal
+
 import msgspec
 
 from infrastructure.msgspec_fastapi import AppStruct
@@ -31,15 +33,42 @@ class IndexerSavedResponse(AppStruct):
     id: str
 
 
+class UsenetSearchBackend(AppStruct):
+    """The active Usenet search backend (either/or): ``"indexers"`` for the native
+    Newznab priority list, ``"prowlarr"`` for the single Prowlarr connection.
+    Required ``Literal``: unknown values and empty bodies 422 at decode (never a
+    silent reset to ``"indexers"``)."""
+
+    backend: Literal["indexers", "prowlarr"]
+
+
+class ProwlarrTestResponse(AppStruct):
+    """Result of testing the submitted Prowlarr connection (lidarr-import shape:
+    body-carried valid/version/message, never a leaked 5xx). ``version`` and
+    ``indexer_count`` are degraded-optional until the A0 probe confirms
+    ``system/status`` - the test route must not hard-fail when it 404s."""
+
+    valid: bool
+    version: str | None = None
+    message: str = ""
+    indexer_count: int | None = None
+
+
 class SabnzbdTestResponse(AppStruct):
     """Result of testing SABnzbd: version + the category list (for the picker) + the
-    SABnzbd-side completed dir (the mount hint)."""
+    SABnzbd-side completed dir (the mount hint) + the mount diagnosis (how many
+    sampled SABnzbd downloads resolve under the submitted mount, with an
+    actionable message when they don't)."""
 
     valid: bool
     version: str | None = None
     message: str = ""
     categories: list[str] = msgspec.field(default_factory=list)
     complete_dir: str | None = None
+    mount_has_files: bool | None = None
+    resolvable_downloads: int | None = None
+    sampled_downloads: int | None = None
+    mount_message: str | None = None
 
 
 class IndexerReorderRequest(AppStruct):
@@ -62,6 +91,9 @@ class DownloadClientStatusResponse(AppStruct):
     # slskd's own configured downloads dir (its in-container path), shown as a hint so the
     # user can match it to DroppedNeedle's mount. None when slskd didn't report it.
     slskd_downloads_dir: str | None = None
+    # The actual lookup dir: the mount plus the UI subfolder. The UI shows it so a
+    # wrong subfolder reads as a wrong path instead of a mystery empty folder.
+    effective_downloads_path: str | None = None
 
 
 class SearchAlbumRequest(AppStruct):
@@ -77,6 +109,13 @@ class SearchAlbumResponse(AppStruct):
     job_id: str | None = None
 
 
+class QualityRejectionSummary(AppStruct):
+    outside_policy: int = 0
+    unknown_rejected: int = 0
+    not_importable: int = 0
+    needs_review: int = 0
+
+
 class SearchJobResponse(AppStruct):
     job_id: str
     status: str
@@ -84,6 +123,10 @@ class SearchJobResponse(AppStruct):
     album_title: str
     candidate_count: int
     top_score: float | None = None
+    quality_snapshot_summary: str | None = None
+    quality_rejections: QualityRejectionSummary = msgspec.field(
+        default_factory=QualityRejectionSummary
+    )
     candidates: list[ScoredCandidate] = msgspec.field(default_factory=list)
 
 
@@ -167,7 +210,16 @@ class DownloadTaskResponse(AppStruct):
     retry_ladder_minutes: list[int] = []
     acquisition_cleanup_state: str = "not_tracked"
     quality_format: str | None = None
+    quality_bitrate: int | None = None
     quality_bit_depth: int | None = None
+    # Acquisition-quality projection (Acquisition plan): the snapshot contract,
+    # stable step, evidence labels and manual-override marker for queue/review UI.
+    quality_snapshot_summary: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_preference_step: int | None = None
+    quality_certainty: str | None = None
+    quality_provenance: str | None = None
+    manual_quality_override: bool = False
     quality_sample_rate: int | None = None
     advertised_queue_depth: int | None = None
     queue_position_start: int | None = None
@@ -178,6 +230,48 @@ class DownloadTaskResponse(AppStruct):
     attempt_total: int = 0
     has_next_source: bool = False
     held_for_review: bool = False
+    # Wrong-product verdict (Slice 2): when the import proved the grabbed
+    # folder is a different product. The detail names the grabbed folder.
+    wrong_product_verdict_at: float | None = None
+    wrong_product_detail: str | None = None
+
+
+class PolicySummaryResponse(AppStruct):
+    """Safe, signed-in-user projection of the acquisition policy (spec):
+    quality summary sentence + source-mode label only - no admin internals."""
+
+    summary: str
+    source_mode: str
+    legacy_rollback_compatible: bool
+    quality_recipe_status: Literal["v1", "v2", "non_convertible", "invalid"] = "v1"
+    quality_recipe_error: str | None = None
+
+
+class PolicyImpactResponse(AppStruct):
+    """Admin preview of an UNSAVED policy against persisted state (spec).
+    ``legacy_representable`` reports whether a down-level image would preserve
+    acquisition behaviour."""
+
+    manual_search_jobs: int = 0
+    queued_without_attempts: int = 0
+    awaiting_review: int = 0
+    remote_queued_zero_byte: int = 0
+    transferring_immutable: int = 0
+    held_reviews: int = 0
+    legacy_representable: bool = True
+
+
+class RestartWithPolicyRequest(AppStruct):
+    """Guard against acting on a stale view: the caller echoes the stored
+    hash it saw; a mismatch aborts the atomic restart."""
+
+    expected_snapshot_hash: str | None = None
+
+
+class RestartWithPolicyResponse(AppStruct):
+    accepted: bool
+    snapshot_summary: str | None = None
+    message: str | None = None
 
 
 class HeldImportResponse(AppStruct):
@@ -210,6 +304,7 @@ class HeldImportResponse(AppStruct):
     evidence_score: float | None = None
     management_retry_count: int = 0
     management_next_retry_at: float | None = None
+    expected_duration_seconds: float | None = None
 
 
 class HeldListResponse(AppStruct):
@@ -224,6 +319,42 @@ class HeldActionResponse(AppStruct):
 class HeldManagementActionResponse(AppStruct):
     status: str
     files: int
+
+
+class HeldVerdictActionResponse(AppStruct):
+    status: str
+    files: int
+
+
+class HeldReverifyResponse(AppStruct):
+    """Result of re-running the fingerprint identity check on one held file: a
+    confident result that no longer disagrees imports through the same
+    settle/reconcile path as "import anyway", anything else stays held."""
+
+    status: Literal["imported", "still_held"]
+    final_path: str | None = None
+
+
+class HeldBulkReverifyRequest(AppStruct):
+    """Re-check held tracks in bulk. ``held_ids`` scopes the run (in request
+    order); omitted means every held track the caller may see, newest first.
+    Either way at most 25 ids run per request."""
+
+    held_ids: list[int] | None = None
+
+
+class HeldBulkReverifyItem(AppStruct):
+    """Per-id bulk outcome: "imported" | "still_held" | "skipped" | "error"."""
+
+    held_id: int
+    status: Literal["imported", "still_held", "skipped", "error"]
+    final_path: str | None = None
+    release_group_mbid: str | None = None
+    message: str | None = None
+
+
+class HeldBulkReverifyResponse(AppStruct):
+    results: list[HeldBulkReverifyItem]
 
 
 class DownloadListResponse(AppStruct):
@@ -320,7 +451,7 @@ class TrackRequestBody(AppStruct):
 
 
 class TrackRequestResponse(AppStruct):
-    status: str  # "queued" | "already_in_library"
+    status: str  # "awaiting_approval" | "queued" | "already_in_library"
     task_id: str | None = None
 
 

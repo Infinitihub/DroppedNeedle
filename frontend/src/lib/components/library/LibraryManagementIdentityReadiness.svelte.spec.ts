@@ -6,6 +6,7 @@ const h = vi.hoisted(() => ({
 	create: vi.fn(),
 	apply: vi.fn(),
 	discard: vi.fn(),
+	undo: vi.fn(),
 	preparations: {
 		data: { pages: [{ items: [] as Array<Record<string, unknown>> }] },
 		isLoading: false,
@@ -63,7 +64,8 @@ const h = vi.hoisted(() => ({
 	}
 }));
 
-vi.mock('$lib/stores/authStore.svelte', () => ({
+vi.mock('$lib/stores/authStore.svelte', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/stores/authStore.svelte')>()),
 	authStore: { isAdmin: true, user: { id: 'admin-1' } }
 }));
 vi.mock('$lib/queries/library/LibraryIdentityPreparationQueries.svelte', () => ({
@@ -74,7 +76,8 @@ vi.mock('$lib/queries/library/LibraryIdentityPreparationQueries.svelte', () => (
 vi.mock('$lib/queries/library/LibraryIdentityPreparationMutations.svelte', () => ({
 	createLibraryIdentityPreparation: () => ({ mutateAsync: h.create, isPending: false }),
 	applyLibraryIdentityPreparation: () => ({ mutateAsync: h.apply, isPending: false }),
-	discardLibraryIdentityPreparation: () => ({ mutateAsync: h.discard, isPending: false })
+	discardLibraryIdentityPreparation: () => ({ mutateAsync: h.discard, isPending: false }),
+	undoLibraryAutomaticEdition: () => ({ mutateAsync: h.undo, isPending: false })
 }));
 vi.mock('$lib/queries/library/LibraryOperationMutations.svelte', () => ({
 	controlLibraryOperation: () => ({ mutateAsync: vi.fn(), isPending: false })
@@ -144,6 +147,7 @@ beforeEach(() => {
 	h.create.mockResolvedValue({});
 	h.apply.mockResolvedValue({});
 	h.discard.mockResolvedValue({});
+	h.undo.mockResolvedValue({});
 	h.preparations = {
 		data: { pages: [{ items: [] }] },
 		isLoading: false,
@@ -178,7 +182,7 @@ beforeEach(() => {
 
 describe('LibraryManagementIdentityReadiness', () => {
 	it('explains the exact-edition prerequisite before starting a read-only check', async () => {
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await expect.element(page.getByText('Need exact track maps')).toBeVisible();
 		await expect.element(page.getByText('Need an exact edition', { exact: true })).toBeVisible();
@@ -198,7 +202,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await expect.element(page.getByText('Juturna')).toBeVisible();
 		await expect.element(page.getByText('Circa Survive')).toBeVisible();
@@ -231,7 +235,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await page.getByRole('button', { name: 'Dismiss report' }).click();
 		await expect.element(page.getByRole('heading', { name: 'Dismiss this report?' })).toHaveFocus();
@@ -253,7 +257,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 			isError: false
 		};
 		h.findings.data.pages[0].items[0].reason_code = 'RELEASE_TYPE_REQUIRES_CONFIRMATION';
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 		await page.getByRole('button', { name: /Needs review/ }).click();
 		await expect.element(page.getByRole('button', { name: 'Re-identify' })).toBeVisible();
 		await expect
@@ -271,7 +275,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 		};
 		h.findings.data.pages[0].refresh_required = true;
 		h.findings.data.pages[0].items[0].reason_code = 'UNSAFE_RELEASE_TYPE';
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await expect
 			.element(page.getByText('These checks used older rules. Run a fresh identity check.'))
@@ -314,7 +318,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 				status: 'Official'
 			}
 		};
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await page.getByRole('button', { name: /Choose edition/ }).click();
 		await expect.element(page.getByText(/Suggested: Juturna \(Deluxe\)/)).toBeVisible();
@@ -337,7 +341,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 			exact_release_suggested: 2,
 			needs_review: 1
 		};
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await page.getByRole('button', { name: 'Accept editions (2)...' }).click();
 		await expect
@@ -362,7 +366,7 @@ describe('LibraryManagementIdentityReadiness', () => {
 			exact_release_suggested: 2,
 			needs_review: 1
 		};
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await page.getByRole('button', { name: 'Accept editions (2)...' }).click();
 		await page.getByRole('button', { name: 'Accept identities' }).click();
@@ -379,11 +383,99 @@ describe('LibraryManagementIdentityReadiness', () => {
 			isLoading: false,
 			isError: false
 		};
-		render(LibraryManagementIdentityReadiness, { roots });
+		await render(LibraryManagementIdentityReadiness, { roots });
 
 		await expect.element(page.getByRole('button', { name: 'Accept mappings...' })).toBeVisible();
 		await expect
 			.element(page.getByRole('button', { name: /Accept editions/ }))
 			.not.toBeInTheDocument();
+	});
+
+	it('renders auto-accepted albums distinctly from suggested-pending', async () => {
+		h.preparations = {
+			data: { pages: [{ items: [readyReport()] }] },
+			isLoading: false,
+			isError: false
+		};
+		h.findings.data.pages[0].current_counts_by_finding = {
+			mapping_ready: 0,
+			ready: 0,
+			exact_release_required: 0,
+			exact_release_auto_accepted: 2,
+			needs_review: 0
+		};
+		h.findings.data.pages[0].items[0] = {
+			id: 'finding-auto',
+			local_album_id: 'album-auto',
+			album_title: 'Juturna',
+			album_artist_name: 'Circa Survive',
+			album_year: 2005,
+			cover_available: false,
+			evidence_id: 'evidence-auto',
+			review_id: null,
+			finding_code: 'exact_release_auto_accepted',
+			reason_code: 'EXACT_EDITION_AUTO_ACCEPTED',
+			confidence: 'complete',
+			apply_eligible: false,
+			state: 'applied',
+			apply_result: 'EDITION_AUTO_ACCEPTED',
+			suggested_edition: null,
+			automatic_undo: null,
+			updated_at: 10,
+			row_revision: 3
+		};
+		await render(LibraryManagementIdentityReadiness, { roots });
+
+		const tab = page.getByRole('button', { name: /Auto-accepted/ });
+		await expect.element(tab).toHaveTextContent('2');
+		await page.getByRole('button', { name: /Auto-accepted/ }).click();
+		await expect.element(page.getByText('Edition accepted automatically')).toBeVisible();
+		await expect.element(page.getByText('Auto-accepted', { exact: true })).toBeVisible();
+		await expect.element(page.getByRole('button', { name: 'Undo' })).not.toBeInTheDocument();
+	});
+
+	it('shows the undo action on an auto-accepted finding and fires it once', async () => {
+		h.preparations = {
+			data: { pages: [{ items: [readyReport()] }] },
+			isLoading: false,
+			isError: false
+		};
+		h.findings.data.pages[0].items[0] = {
+			id: 'finding-auto',
+			local_album_id: 'album-auto',
+			album_title: 'Juturna',
+			album_artist_name: 'Circa Survive',
+			album_year: 2005,
+			cover_available: false,
+			evidence_id: 'evidence-auto',
+			review_id: null,
+			finding_code: 'exact_release_auto_accepted',
+			reason_code: 'EXACT_EDITION_AUTO_ACCEPTED',
+			confidence: 'complete',
+			apply_eligible: false,
+			state: 'applied',
+			apply_result: 'EDITION_AUTO_ACCEPTED',
+			suggested_edition: null,
+			automatic_undo: {
+				expected_album_revision: 4,
+				expected_identity_revision: 2
+			},
+			updated_at: 10,
+			row_revision: 3
+		};
+		await render(LibraryManagementIdentityReadiness, { roots });
+		await page.getByRole('button', { name: /Auto-accepted/ }).click();
+
+		await expect.element(page.getByText('Edition accepted automatically')).toBeVisible();
+		const undo = page.getByRole('button', { name: 'Undo' });
+		await expect.element(undo).toBeVisible();
+		await undo.click();
+
+		expect(h.undo).toHaveBeenCalledTimes(1);
+		expect(h.undo).toHaveBeenCalledWith({
+			albumId: 'album-auto',
+			expectedAlbumRevision: 4,
+			expectedIdentityRevision: 2
+		});
 	});
 });

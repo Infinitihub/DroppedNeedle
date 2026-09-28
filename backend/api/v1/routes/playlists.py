@@ -565,7 +565,6 @@ async def request_missing_tracks(
         ):
             skipped += 1
             continue
-
         if release_group_mbid not in album_tracklists:
             try:
                 album_tracklists[release_group_mbid] = await album_service.get_album_tracks_info(

@@ -10,6 +10,7 @@
 		getLibraryManagementOperationsQuery,
 		getLibraryManagementSettingsQuery
 	} from '$lib/queries/library-management/LibraryManagementQueries.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { isRecord, titleManagementValue } from './LibraryManagementDisplay';
 
 	let origin = $state('');
@@ -57,8 +58,8 @@
 
 	function operationHref(jobId: string, value: string, terminalCode: string | null): string {
 		return value === 'ready' || terminalCode === 'PREVIEW_DISCARDED'
-			? `/library/management/previews/${encodeURIComponent(jobId)}`
-			: `/library/management/operations/${encodeURIComponent(jobId)}`;
+			? withBasePath(`/library/management/previews/${encodeURIComponent(jobId)}`)
+			: withBasePath(`/library/management/operations/${encodeURIComponent(jobId)}`);
 	}
 
 	function rootLabel(value: string | null): string {
@@ -196,12 +197,12 @@
 		</section>
 
 		{#if historyQuery.isLoading || settingsQuery.isLoading || policyQuery.isLoading}
-			<div class="space-y-2">
+			<div class="space-y-2" role="status" aria-label="Loading organization history">
 				<div class="skeleton h-24 rounded-xl"></div>
 				<div class="skeleton h-24 rounded-xl"></div>
 			</div>
 		{:else if historyQuery.isError || settingsQuery.isError || policyQuery.isError}
-			<div class="alert alert-error">Could not load organization history.</div>
+			<div class="alert alert-error" role="alert">Could not load organization history.</div>
 		{:else if historyItems.length === 0}
 			<div class="rounded-2xl border border-dashed border-base-content/15 p-10 text-center">
 				<FolderCog class="mx-auto h-7 w-7 text-base-content/35" />
@@ -234,7 +235,10 @@
 											: item.operation.state === 'ready'
 												? 'badge-warning'
 												: 'badge-outline'}">{titleManagementValue(item.operation.state)}</span
-								></span
+								>{#if item.operation.state === 'ready' && item.expires_at}
+									<span class="badge badge-outline badge-sm"
+										>Expires {formatDate(item.expires_at)}</span
+									>{/if}</span
 							><small
 								>{titleManagementValue(item.origin)} · {scopeLabel(
 									isRecord(item.selection) ? item.selection : {},
@@ -247,9 +251,25 @@
 									>{latestTimestampLabel(item.operation.state)}
 									{formatDate(item.operation.updated_at)}</span
 								></small
-							><small
-								>{item.operation.succeeded_count} succeeded · {item.operation.failed_count} failed · {item
-									.operation.skipped_count} skipped</small
+							><span class="mt-1 flex flex-wrap gap-1"
+								>{#if item.operation.state === 'ready'}
+									{#if (item.eligible_count ?? 0) > 0}<span class="badge badge-success badge-sm"
+											>{item.eligible_count} eligible</span
+										>{/if}{#if (item.warning_count ?? 0) > 0}<span
+											class="badge badge-warning badge-sm">{item.warning_count} warning</span
+										>{/if}{#if (item.blocked_count ?? 0) > 0}<span
+											class="badge badge-error badge-sm">{item.blocked_count} blocked</span
+										>{/if}
+								{:else}
+									{#if item.operation.succeeded_count}<span class="badge badge-success badge-sm"
+											>{item.operation.succeeded_count} succeeded</span
+										>{/if}{#if item.operation.failed_count}<span class="badge badge-error badge-sm"
+											>{item.operation.failed_count} failed</span
+										>{/if}{#if item.operation.skipped_count}<span
+											class="badge badge-warning badge-sm"
+											>{item.operation.skipped_count} skipped</span
+										>{/if}
+								{/if}</span
 							></span
 						><ArrowRight class="h-4 w-4" /></a
 					>

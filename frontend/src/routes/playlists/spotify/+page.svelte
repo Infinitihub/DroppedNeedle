@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { Loader2, Music2, ArrowLeft, RefreshCw, CheckCircle2, Download, Upload } from 'lucide-svelte';
+	import { LoaderCircle, Music2, ArrowLeft, RefreshCw, CircleCheckBig, Download, Upload } from 'lucide-svelte';
 	import SpotifyIcon from '$lib/components/SpotifyIcon.svelte';
 	import { importExportifyPlaylist } from '$lib/api/playlists';
 	import { toastStore } from '$lib/stores/toast';
@@ -10,6 +10,8 @@
 		createImportSpotifyLinkMutation
 	} from '$lib/queries/spotify/SpotifyQueries.svelte';
 	import type { SpotifyPlaylistItem } from '$lib/types';
+	import { withBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 
 	const playlistsQuery = getSpotifyPlaylistsQuery();
 	const importMutation = createImportSpotifyPlaylistMutation();
@@ -63,7 +65,7 @@
 				message: `"${playlist.name}" is importing in the background`,
 				type: 'success'
 			});
-			await goto(`/playlists/${result.playlist_id}`);
+			await goto(withBasePath(`/playlists/${result.playlist_id}`));
 		} catch {
 			toastStore.show({ message: `Failed to import "${playlist.name}"`, type: 'error' });
 		} finally {
@@ -127,12 +129,12 @@
 			type="url"
 		/>
 		<button class="btn btn-primary gap-1.5" type="submit" disabled={!playlistUrl.trim() || importingLink}>
-			{#if importingLink}<Loader2 class="h-4 w-4 animate-spin" />{:else}<Download class="h-4 w-4" />{/if}
+			{#if importingLink}<LoaderCircle class="h-4 w-4 animate-spin" />{:else}<Download class="h-4 w-4" />{/if}
 			Import link
 		</button>
 	</form>
 	<div class="flex items-center gap-3">
-		<a href="/playlists" class="btn btn-ghost btn-sm btn-circle">
+		<a href={withBasePath('/playlists')} class="btn btn-ghost btn-sm btn-circle">
 			<ArrowLeft class="h-4 w-4" />
 		</a>
 		<h1 class="flex min-w-0 flex-1 items-center gap-2 text-2xl font-bold sm:text-3xl">
@@ -155,7 +157,7 @@
 			disabled={importingExportify}
 			title="Import an Exportify CSV"
 		>
-			{#if importingExportify}<Loader2 class="h-3.5 w-3.5 animate-spin" />{:else}<Upload class="h-3.5 w-3.5" />{/if}
+			{#if importingExportify}<LoaderCircle class="h-3.5 w-3.5 animate-spin" />{:else}<Upload class="h-3.5 w-3.5" />{/if}
 			<span class="hidden sm:inline">Exportify CSV</span>
 		</button>
 		{#if unimportedCount > 0 && !importingAll}
@@ -169,7 +171,7 @@
 			</button>
 		{:else if importingAll}
 			<div class="flex shrink-0 items-center gap-2 text-sm text-base-content/60">
-				<Loader2 class="h-4 w-4 animate-spin" />
+				<LoaderCircle class="h-4 w-4 animate-spin" />
 				{importAllProgress.done}/{importAllProgress.total}
 			</div>
 		{/if}
@@ -191,7 +193,7 @@
 			</span>
 			<div class="flex gap-2">
 				{#if err instanceof Error && err.message.includes('400')}
-					<a href="/profile" class="btn btn-sm btn-ghost">Go to Profile</a>
+					<a href={withBasePath('/profile')} class="btn btn-sm btn-ghost">Go to Profile</a>
 				{:else}
 					<button class="btn btn-sm btn-ghost" onclick={() => void playlistsQuery.refetch()}>
 						Retry
@@ -213,7 +215,7 @@
 					<div class="relative aspect-square overflow-hidden rounded-2xl bg-base-300/60">
 						{#if playlist.cover_url}
 							<img
-								src={playlist.cover_url}
+								src={getApiUrl(playlist.cover_url)}
 								alt={playlist.name}
 								class="h-full w-full object-cover transition-transform duration-200 group-hover:scale-[1.03]"
 							/>
@@ -228,7 +230,7 @@
 								class="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60 opacity-0 transition-opacity group-hover:opacity-100"
 							>
 								<a
-									href="/playlists/{playlist.imported_playlist_id}"
+									href={withBasePath(`/playlists/${playlist.imported_playlist_id}`)}
 									class="btn btn-sm btn-ghost rounded-full text-white"
 								>
 									View Playlist
@@ -239,7 +241,7 @@
 									disabled={!!importing}
 								>
 									{#if isImporting}
-										<Loader2 class="h-3 w-3 animate-spin" />
+										<LoaderCircle class="h-3 w-3 animate-spin" />
 									{:else}
 										<RefreshCw class="h-3 w-3" />
 									{/if}
@@ -253,7 +255,7 @@
 								disabled={!!importing}
 							>
 								{#if isImporting}
-									<Loader2 class="h-8 w-8 animate-spin text-white" />
+									<LoaderCircle class="h-8 w-8 animate-spin text-white" />
 								{:else}
 									<div class="flex flex-col items-center gap-1 rounded-xl px-3 py-2 text-white">
 										<SpotifyIcon class="h-6 w-6 text-green-400" />
@@ -267,7 +269,7 @@
 							<div
 								class="absolute right-2 top-2 rounded-full bg-green-600 p-0.5 shadow group-hover:opacity-0 transition-opacity"
 							>
-								<CheckCircle2 class="h-4 w-4 text-white" />
+								<CircleCheckBig class="h-4 w-4 text-white" />
 							</div>
 						{/if}
 					</div>

@@ -1727,3 +1727,71 @@ def test_importer_provider_is_singleton_and_only_builds_in_isolated_composition(
     assert first._resolver is resolver
     assert first._cover_reader is cover_reader
     service_providers.get_legacy_catalog_importer.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_apply_fails_closed_when_reference_cannot_materialize(
+    tmp_path: Path,
+) -> None:
+    """GH-367/F6: the cutover caller converts store skips to ValidationError."""
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    store, importer = _importer(database, root)
+    plan, _report = await importer.prepare("cutover-poison", now=100)
+
+    original_matches = store._migration_reference_matches
+    poisoned = {"done": False}
+
+    def poisoned_matches(connection: sqlite3.Connection, provenance) -> bool:
+        if provenance.source_kind == "favorite" and not poisoned["done"]:
+            poisoned["done"] = True
+            return False
+        return original_matches(connection, provenance)
+
+    store._migration_reference_matches = poisoned_matches  # type: ignore[method-assign]
+    with pytest.raises(ValidationError, match="unmaterialized"):
+        await importer.apply(
+            "cutover-poison",
+            expected_source_revision=plan.source_revision,
+            now=101,
+        )
+    assert poisoned["done"] is True
+    with sqlite3.connect(database) as connection:
+        state = connection.execute(
+            "SELECT state FROM library_migration_runs WHERE id = ?",
+            ("cutover-poison",),
+        ).fetchone()[0]
+    assert state != "completed"
+
+
+@pytest.mark.asyncio
+async def test_coherent_copy_carries_file_tag_release_type(tmp_path: Path) -> None:
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    file_id = "99999999-9999-4999-8999-999999999997"
+    _insert_identityless_library_file(
+        database,
+        root,
+        file_id,
+        release_group_mbid="legacy-release-group",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE library_files ADD COLUMN release_type TEXT")
+        connection.execute(
+            "UPDATE library_files SET release_type = 'EP' WHERE id = ?", (file_id,)
+        )
+    store, importer = _importer(database, root)
+
+    plan, report = await importer.prepare("release-type-carry", now=100)
+
+    assert report.state == "ready"
+    bundle = next(
+        item
+        for item in plan.bundles
+        if any(track.id == file_id for track in item.membership.tracks)
+    )
+    assert bundle.membership.tracks[0].release_type == "EP"

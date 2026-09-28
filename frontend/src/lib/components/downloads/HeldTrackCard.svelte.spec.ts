@@ -7,8 +7,10 @@ import type { HeldImport } from '$lib/types';
 const h = vi.hoisted(() => ({
 	importMut: vi.fn(),
 	discardMut: vi.fn(),
+	reverifyMut: vi.fn(),
 	importError: null as { message: string } | null,
-	discardError: null as { message: string } | null
+	discardError: null as { message: string } | null,
+	reverifyError: null as { message: string } | null
 }));
 
 vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
@@ -25,14 +27,21 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 		get error() {
 			return h.discardError;
 		}
+	}),
+	reverifyHeldTrack: () => ({
+		mutate: h.reverifyMut,
+		isPending: false,
+		get error() {
+			return h.reverifyError;
+		}
 	})
 }));
 
 import HeldTrackCard from './HeldTrackCard.svelte';
 
 type RenderOpts = Parameters<typeof render<typeof HeldTrackCard>>[1];
-function renderCard(item: HeldImport) {
-	return render(HeldTrackCard, { props: { held: item } } as unknown as RenderOpts);
+async function renderCard(item: HeldImport) {
+	return await render(HeldTrackCard, { props: { held: item } } as unknown as RenderOpts);
 }
 
 function held(overrides: Partial<HeldImport> = {}): HeldImport {
@@ -51,6 +60,7 @@ function held(overrides: Partial<HeldImport> = {}): HeldImport {
 		original_filename: '103.flac',
 		file_format: 'flac',
 		duration_seconds: 388,
+		expected_duration_seconds: 390,
 		reason: 'fingerprint_mismatch',
 		reason_detail: null,
 		source: 'usenet',
@@ -69,12 +79,14 @@ describe('HeldTrackCard', () => {
 	beforeEach(() => {
 		h.importMut.mockReset();
 		h.discardMut.mockReset();
+		h.reverifyMut.mockReset();
 		h.importError = null;
 		h.discardError = null;
+		h.reverifyError = null;
 	});
 
 	it('shows the track, the couldn’t-verify state, and the AcoustID evidence', async () => {
-		renderCard(held());
+		await renderCard(held());
 		await expect.element(page.getByText(/You Shook Me/)).toBeVisible();
 		await expect.element(page.getByText(/Couldn't verify/i)).toBeVisible();
 		await expect.element(page.getByText(/Nobody's Fault but Mine/)).toBeVisible();
@@ -82,7 +94,7 @@ describe('HeldTrackCard', () => {
 	});
 
 	it('imports the held track on "Import anyway"', async () => {
-		renderCard(held());
+		await renderCard(held());
 		await page.getByRole('button', { name: /Import anyway/ }).click();
 		expect(h.importMut).toHaveBeenCalledWith(
 			{ id: 7, release_group_mbid: 'rg-1' },
@@ -95,7 +107,7 @@ describe('HeldTrackCard', () => {
 		h.importError = {
 			message: 'No library root is configured - restore one in Settings → Library, then try again.'
 		};
-		renderCard(held());
+		await renderCard(held());
 
 		const alert = page.getByRole('alert');
 		await expect.element(alert).toHaveTextContent(/No library root is configured/);
@@ -109,7 +121,7 @@ describe('HeldTrackCard', () => {
 	});
 
 	it('discards the held track on "Discard"', async () => {
-		renderCard(held());
+		await renderCard(held());
 		await page.getByRole('button', { name: /Discard/ }).click();
 		expect(h.discardMut).toHaveBeenCalledWith(
 			{ id: 7, release_group_mbid: 'rg-1' },
@@ -119,7 +131,7 @@ describe('HeldTrackCard', () => {
 	});
 
 	it('offers an audio preview: play control, scrubber, and the duration', async () => {
-		renderCard(held());
+		await renderCard(held());
 		await expect.element(page.getByRole('button', { name: /Play a preview/ })).toBeVisible();
 		await expect.element(page.getByRole('slider', { name: /Scrub preview/ })).toBeVisible();
 		await expect.element(page.getByText('0:00 / 6:28')).toBeVisible(); // 388s duration
@@ -129,7 +141,7 @@ describe('HeldTrackCard', () => {
 	// (the AcoustID wording above stays reserved for fingerprint_mismatch)
 
 	it('describes tag_mismatch evidence as the file’s own tags, not AcoustID', async () => {
-		renderCard(
+		await renderCard(
 			held({
 				reason: 'tag_mismatch',
 				evidence_title: 'Arrival in Ashford',
@@ -143,7 +155,7 @@ describe('HeldTrackCard', () => {
 	});
 
 	it('describes wrong_track evidence as a length mismatch, closest match kept', async () => {
-		renderCard(
+		await renderCard(
 			held({
 				reason: 'wrong_track',
 				evidence_title: 'the arrival',
@@ -153,5 +165,49 @@ describe('HeldTrackCard', () => {
 		);
 		await expect.element(page.getByText(/wrong length/i)).toBeVisible();
 		await expect.element(page.getByText(/closest copy/i)).toBeVisible();
+	});
+
+	it('describes target_occupied as a path collision, never AcoustID', async () => {
+		await renderCard(
+			held({
+				reason: 'target_occupied',
+				reason_detail: '/music/Led Zeppelin/03 You Shook Me.flac',
+				evidence_title: null,
+				evidence_artist: null,
+				evidence_score: null
+			})
+		);
+		await expect.element(page.getByText(/destination is taken/i)).toBeVisible();
+		await expect.element(page.getByText(/file in the way/i)).toBeVisible();
+		await expect.element(page.getByText(/03 You Shook Me\.flac/)).toBeVisible();
+		await expect.element(page.getByText(/couldn't confirm/i)).not.toBeInTheDocument();
+		await expect.element(page.getByText(/AcoustID/)).not.toBeInTheDocument();
+	});
+
+	it('shows the file length against the expected length', async () => {
+		await renderCard(held());
+		await expect.element(page.getByText(/File length 6:28/)).toBeVisible();
+		await expect.element(page.getByText(/expected 6:30/)).toBeVisible();
+	});
+
+	it('hides the length comparison when the expected length is unknown', async () => {
+		await renderCard(held({ expected_duration_seconds: null }));
+		await expect.element(page.getByText(/File length/)).not.toBeInTheDocument();
+	});
+
+	it('hides the length comparison when the file duration is unknown', async () => {
+		await renderCard(held({ duration_seconds: null, expected_duration_seconds: 390 }));
+		await expect.element(page.getByText(/File length/)).not.toBeInTheDocument();
+	});
+
+	it('re-checks the held track on "Re-check"', async () => {
+		await renderCard(held());
+		await page.getByRole('button', { name: 'Re-check' }).click();
+		expect(h.reverifyMut).toHaveBeenCalledWith(
+			{ id: 7, release_group_mbid: 'rg-1' },
+			expect.objectContaining({ onSuccess: expect.any(Function) })
+		);
+		expect(h.importMut).not.toHaveBeenCalled();
+		expect(h.discardMut).not.toHaveBeenCalled();
 	});
 });

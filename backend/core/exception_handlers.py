@@ -1,4 +1,5 @@
 import logging
+import math
 from fastapi import Request, HTTPException, status
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -7,6 +8,7 @@ from starlette.responses import Response
 from core.exceptions import (
     ResourceNotFoundError,
     ExternalServiceError,
+    RateLimitedError,
     SourceResolutionError,
     ValidationError,
     ConfigurationError,
@@ -15,6 +17,7 @@ from core.exceptions import (
     ConflictError,
     RevisionOverflowError,
     StaleRevisionError,
+    AutomaticManagementHoldError,
 )
 from infrastructure.msgspec_fastapi import MsgSpecJSONResponse
 from infrastructure.resilience.retry import CircuitOpenError
@@ -23,6 +26,7 @@ from models.error import (
     VALIDATION_ERROR,
     NOT_FOUND,
     EXTERNAL_SERVICE_UNAVAILABLE,
+    RATE_LIMITED,
     CONFIGURATION_ERROR,
     SOURCE_RESOLUTION_ERROR,
     INTERNAL_ERROR,
@@ -31,6 +35,7 @@ from models.error import (
     CONFLICT,
     REVISION_OVERFLOW,
     STALE_REVISION,
+    AUTOMATIC_MANAGEMENT_HOLD,
     STATUS_TO_CODE,
 )
 
@@ -56,6 +61,52 @@ async def external_service_error_handler(
         status.HTTP_503_SERVICE_UNAVAILABLE,
         EXTERNAL_SERVICE_UNAVAILABLE,
         "External service unavailable",
+    )
+
+
+_RETRY_AFTER_MAX_SECONDS = 3600
+
+
+def _safe_retry_after_seconds(value: object) -> int | None:
+    """Clamp an upstream Retry-After hint to a finite, non-negative int.
+
+    Producers pass upstream headers through bare float(), so inf/nan/garbage
+    survive; the 429 handler must never raise on the hint and turn a 429
+    into a 500. Returns None when the hint is unusable (omit the header).
+    """
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return max(0, min(int(seconds), _RETRY_AFTER_MAX_SECONDS))
+
+
+# Frontend 429 audit (BrainzMashEfficiency 05-6): ProviderAlbumPage.svelte:39 and
+# ProviderArtistPage.svelte:157 already treat 429 like 503; no other flow branches
+# on 503/429 and nothing references RATE_LIMITED/EXTERNAL_SERVICE_UNAVAILABLE/Retry-After.
+async def rate_limited_error_handler(
+    request: Request, exc: RateLimitedError
+) -> MsgSpecJSONResponse:
+    logger.warning(
+        "Rate limited: %s - %s %s", exc, request.method, request.url.path
+    )
+    headers = None
+    if exc.retry_after_seconds is not None:
+        retry_after = _safe_retry_after_seconds(exc.retry_after_seconds)
+        if retry_after is not None:
+            headers = {"Retry-After": str(retry_after)}
+    return MsgSpecJSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "error": {
+                "code": RATE_LIMITED,
+                "message": "Too many requests",
+                "details": None,
+            }
+        },
+        headers=headers,
     )
 
 
@@ -116,6 +167,23 @@ async def conflict_error_handler(
         status.HTTP_409_CONFLICT,
         getattr(exc, "error_code", CONFLICT),
         str(exc),
+    )
+
+
+async def automatic_management_hold_handler(
+    request: Request, exc: AutomaticManagementHoldError
+) -> MsgSpecJSONResponse:
+    logger.warning(
+        "Automatic management hold (%s) - %s %s",
+        exc.reason_code,
+        request.method,
+        request.url.path,
+    )
+    return error_response(
+        status.HTTP_409_CONFLICT,
+        AUTOMATIC_MANAGEMENT_HOLD,
+        "Import blocked by a Library Management safety check.",
+        details={"reason_code": exc.reason_code},
     )
 
 

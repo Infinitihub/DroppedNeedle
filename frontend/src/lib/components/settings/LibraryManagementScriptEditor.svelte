@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowDown, ArrowUp, Copy, FileCode2, Plus } from 'lucide-svelte';
+	import { ArrowDown, ArrowUp, Copy, FileCode, Plus } from 'lucide-svelte';
 
 	import type { ManagementScriptSettings } from '$lib/queries/library-management/types';
 	import { createUuid } from '$lib/utils/uuid';
@@ -123,7 +123,7 @@
 		<div class="management-script-workbench">
 			<div class="flex flex-wrap items-center justify-between gap-2">
 				<div class="flex items-center gap-2">
-					<FileCode2 class="h-4 w-4 text-library-manage" />
+					<FileCode class="h-4 w-4 text-library-manage" />
 					<span class="text-xs text-base-content/55">
 						{kind === 'naming' ? 'Changes paths, never tags.' : 'Changes metadata, never paths.'}
 					</span>
@@ -190,8 +190,13 @@
 				<summary class="cursor-pointer font-semibold">Language reference</summary>
 				{#if kind === 'naming'}
 					<p class="mt-2">
-						Common values: title, album, album_disambiguation, artist, albumartist, year, disc,
-						track, medium_format, medium_number, genre, ext, codec.
+						Common values: title, album, album_disambiguation, artist, albumartist, initial, year,
+						disc, track, medium_format, medium_number, genre, ext, codec.
+					</p>
+					<p class="mt-1">
+						{'{initial}'} uses the effective album artist, ignores leading Unicode whitespace and a case-insensitive
+						"The" plus following Unicode whitespace, then returns one uppercase letter; empty or nonletter
+						leads return "#".
 					</p>
 					<p class="mt-1">
 						Functions: default, conditional, concat, is_empty, pad, replace, lower, upper, title,

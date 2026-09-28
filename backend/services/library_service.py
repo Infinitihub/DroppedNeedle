@@ -351,7 +351,8 @@ class LibraryService:
             raise ExternalServiceError(f"Failed to fetch recently added: {e}")
 
     async def sync_library(
-        self, is_manual: bool = False, force_full: bool = False
+        self, is_manual: bool = False, force_full: bool = False,
+        *, initiating_user_id: str | None = None,
     ) -> SyncLibraryResponse:
         if not self._library_repo.is_configured():
             raise ExternalServiceError(
@@ -465,7 +466,8 @@ class LibraryService:
 
                 task = asyncio.create_task(
                     self._precache_service.precache_library_resources(
-                        artists, albums, resume=resume
+                        artists, albums, resume=resume,
+                        initiating_user_id=initiating_user_id if is_manual else None,
                     )
                 )
 
@@ -576,20 +578,23 @@ class LibraryService:
         return artist_mbid, artist_name
 
     def _recycle_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
-        """Move files to the recycle bin (falls back to hard delete when no bin
-        can be resolved - e.g. no library path configured)."""
+        """Move files to the recycle bin; fails closed (every path reported as
+        failed, nothing touched) when no bin can be resolved - e.g. no library
+        path configured. Permanent deletion stays an explicit ``delete_files``
+        action, never a fallback of a recycle request."""
         from services.native.recycle_bin import recycle, resolve_bin_path
 
-        policy = self._preferences.get_download_policy()
-        lib = self._preferences.get_typed_library_settings()
+        policy = self._preferences_service.get_download_policy()
+        lib = self._preferences_service.get_typed_library_settings()
         bin_path = resolve_bin_path(
             policy.recycle_bin_path, [root.path for root in lib.library_roots]
         )
         if bin_path is None:
             logger.warning(
-                "No recycle bin available; hard-deleting %d files", len(paths)
+                "recycle_bin_unresolved: no recycle bin available; not touching %d files",
+                len(paths),
             )
-            return self._unlink_paths(paths)
+            return [], list(paths)
         moved: list[str] = []
         failed: list[str] = []
         parents: set[str] = set()

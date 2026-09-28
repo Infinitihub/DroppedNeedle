@@ -3,6 +3,11 @@ from pathlib import Path
 import pytest
 
 from infrastructure.persistence.maintenance_manifest import capture_source_identity
+from models.identification import ExistingAlbumMembership, GroupingTrack
+from services.native.local_album_grouper import (
+    LocalAlbumGrouper,
+    assign_album_continuity,
+)
 from tests.benchmarks.feedback_fixes_benchmark import (
     EVIDENCE_CANDIDATES_PER_SUBJECT,
     EVIDENCE_SUBJECTS,
@@ -85,12 +90,59 @@ async def test_box_set_network_unavailable_and_control_benchmarks() -> None:
     assert controls["passed"] is True
 
 
+def _forbid_dense_matrix(cost: list[list[int]]) -> list[int]:
+    raise AssertionError("over-cap component must not build a dense matrix")
+
+
 def test_flat_grouping_benchmark_uses_sparse_continuity() -> None:
     report = benchmark_flat_grouping(1_000)
 
     assert report["group_count"] == 1_000
     assert report["quadratic_matrix_cells"] == 0
     assert report["passed"] is True
+
+
+def test_merged_group_continuity_component_stays_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-14 (Phase 1 step 1.7): one M-02-merged group over many old albums
+    stays sparse.
+
+    600 same-fold tracks with alternating album artists merge to a single
+    group; the resulting 600-edge star component exceeds the cap, so
+    continuity must use sparse single assignment (the dense matrix builder
+    is rigged to raise) and still retain the earliest old album."""
+    monkeypatch.setattr(
+        "services.native.local_album_grouper._hungarian_min", _forbid_dense_matrix
+    )
+    count = 600
+    proposed = LocalAlbumGrouper().group(
+        [
+            GroupingTrack(
+                local_track_id=f"m-{index}",
+                root_id="benchmark-root",
+                relative_path=f"merged/{index:04}.flac",
+                title=f"Track {index}",
+                artist_name="Artist" if index % 2 == 0 else "Other",
+                album_title="Album",
+                album_artist_name="Artist" if index % 2 == 0 else "Other",
+                track_number=index + 1,
+            )
+            for index in range(count)
+        ]
+    )
+    assert len(proposed) == 1
+    existing = [
+        ExistingAlbumMembership(
+            local_album_id=f"old-{index}",
+            track_ids=[f"m-{index}"],
+            created_at=float(index),
+        )
+        for index in range(count)
+    ]
+    [continued] = assign_album_continuity(existing, proposed)
+    assert continued.retained_album_id == "old-0"
+    assert continued.continuity_reason_code == "CONTINUITY_TIE_BROKEN"
 
 
 @pytest.mark.asyncio
@@ -203,11 +255,15 @@ async def test_complete_manifest_migration_startup_and_rollback_rehearsal(
     assert target_smoke["cached_native_artwork_status"] == 200
     assert target_smoke["restored_artwork_bytes_match"] is True
     assert report["full_rollback"]["smoke"]["native_playback_prefix_ok"] is True
-    assert len(report["process_transcript"]) == 8
+    # F-NL-03: only the target_main admission process runs now (was 8 entries
+    # when legacy main:app source/rollback legs still launched processes).
+    assert len(report["process_transcript"]) == 2
     stopped = [
         event for event in report["process_transcript"] if event["event"] == "stopped"
     ]
-    assert len(stopped) == 4
+    # F-NL-03: only the target_main admission process stops now; the three
+    # legacy main:app scratch legs were converted to durable-state checks.
+    assert len(stopped) == 1
     assert all(event["process_exited"] for event in stopped)
     assert all(event["database_writer_lock_available"] for event in stopped)
     assert report["no_runtime_selector"] is True

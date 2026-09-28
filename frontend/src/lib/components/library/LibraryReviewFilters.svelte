@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Filter, Search, X } from 'lucide-svelte';
+	import { Funnel, Search, X } from 'lucide-svelte';
 	import type { LibraryReviewFilters as Filters } from '$lib/queries/library/LibraryReviewQueries.svelte';
 	import type { LibraryPolicyTreeNode } from '$lib/queries/library/LibraryOperationsTypes';
 
@@ -24,6 +24,10 @@
 	});
 
 	function update(key: keyof Filters, value: string): void {
+		onchange({ ...filters, cursor: undefined, [key]: value || undefined });
+	}
+
+	function updateFlag(key: 'candidateAvailable' | 'hideMatching', value: boolean): void {
 		onchange({ ...filters, cursor: undefined, [key]: value || undefined });
 	}
 
@@ -66,7 +70,7 @@
 			<button class="btn btn-primary btn-sm join-item" type="submit">Search</button>
 		</form>
 		<button class="btn btn-outline btn-sm md:hidden" onclick={openMobileFilters}
-			><Filter class="h-4 w-4" /> Filters</button
+			><Funnel class="h-4 w-4" /> Filters</button
 		>
 	</div>
 	<div class="hidden grid-cols-2 gap-2 md:grid lg:grid-cols-5">
@@ -85,7 +89,8 @@
 			aria-label="Review state"
 			onchange={(event) => update('state', event.currentTarget.value)}
 			><option value="">All states</option><option value="needs_review">Needs review</option><option
-				value="keep_tagged">Keep as tagged</option
+				value="edition_to_confirm">Edition to confirm</option
+			><option value="keep_tagged">Keep as tagged</option
 			><option value="excluded">Excluded</option></select
 		>
 		<select
@@ -96,7 +101,8 @@
 			><option value="">All reasons</option><option value="NO_CANDIDATE">No external result</option
 			><option value="AMBIGUOUS">Several equally likely releases</option><option
 				value="CONTRADICTORY">Conflicting track evidence</option
-			><option value="MAX_DEFERRALS_EXCEEDED">Retry limit reached</option><option
+			><option value="EDITION_UNCERTAIN">Edition to confirm</option><option
+				value="MAX_DEFERRALS_EXCEEDED">Retry limit reached</option><option
 				value="SUBJECT_NOT_AVAILABLE">Album no longer available</option
 			></select
 		>
@@ -119,7 +125,27 @@
 			><option value="newest">Recently updated</option><option value="oldest">Oldest first</option
 			><option value="album">Album title</option><option value="artist">Album artist</option><option
 				value="root">Library root</option
+			><option value="track_count">Most tracks first</option><option value="reason"
+				>Group by reason</option
 			></select
+		>
+	</div>
+	<div class="hidden flex-wrap gap-4 md:flex" aria-label="Review list toggles">
+		<label class="flex cursor-pointer items-center gap-2 text-sm"
+			><input
+				type="checkbox"
+				class="checkbox checkbox-sm"
+				checked={filters.candidateAvailable === true}
+				onchange={(event) => updateFlag('candidateAvailable', event.currentTarget.checked)}
+			/> Only with candidates</label
+		>
+		<label class="flex cursor-pointer items-center gap-2 text-sm"
+			><input
+				type="checkbox"
+				class="checkbox checkbox-sm"
+				checked={filters.hideMatching === true}
+				onchange={(event) => updateFlag('hideMatching', event.currentTarget.checked)}
+			/> Hide still-matching</label
 		>
 	</div>
 	{#if chips.length}
@@ -155,24 +181,26 @@
 					class="select select-bordered"
 					value={filters.state ?? ''}
 					onchange={(event) => update('state', event.currentTarget.value)}
-					><option value="">All states</option><option value="needs_review">Needs review</option
-					><option value="keep_tagged">Keep as tagged</option><option value="excluded"
-						>Excluded</option
-					></select
-				></label
+				><option value="">All states</option><option value="needs_review">Needs review</option><option
+					value="edition_to_confirm">Edition to confirm</option
+				><option value="keep_tagged">Keep as tagged</option><option value="excluded"
+					>Excluded</option
+				></select
+			></label
 			><label class="form-control"
 				><span class="label-text">Reason</span><select
 					class="select select-bordered"
 					value={filters.reasonCode ?? ''}
 					onchange={(event) => update('reasonCode', event.currentTarget.value)}
-					><option value="">All reasons</option><option value="NO_CANDIDATE"
-						>No external result</option
-					><option value="AMBIGUOUS">Several equally likely releases</option><option
-						value="CONTRADICTORY">Conflicting track evidence</option
-					><option value="MAX_DEFERRALS_EXCEEDED">Retry limit reached</option><option
-						value="SUBJECT_NOT_AVAILABLE">Album no longer available</option
-					></select
-				></label
+				><option value="">All reasons</option><option value="NO_CANDIDATE"
+					>No external result</option
+				><option value="AMBIGUOUS">Several equally likely releases</option><option
+					value="CONTRADICTORY">Conflicting track evidence</option
+				><option value="EDITION_UNCERTAIN">Edition to confirm</option><option
+					value="MAX_DEFERRALS_EXCEEDED">Retry limit reached</option><option
+					value="SUBJECT_NOT_AVAILABLE">Album no longer available</option
+			></select
+			></label
 			><label class="form-control"
 				><span class="label-text">Library root</span><select
 					class="select select-bordered"
@@ -193,7 +221,7 @@
 						>Excluded</option
 					></select
 				></label
-			><label class="form-control"
+		><label class="form-control"
 				><span class="label-text">Sort</span><select
 					class="select select-bordered"
 					value={filters.sort ?? 'newest'}
@@ -201,8 +229,26 @@
 					><option value="newest">Recently updated</option><option value="oldest"
 						>Oldest first</option
 					><option value="album">Album title</option><option value="artist">Album artist</option
-					><option value="root">Library root</option></select
+					><option value="root">Library root</option><option value="track_count"
+						>Most tracks first</option
+					><option value="reason">Group by reason</option></select
 				></label
+			>
+			<label class="flex cursor-pointer items-center gap-2 text-sm"
+				><input
+					type="checkbox"
+					class="checkbox"
+					checked={filters.candidateAvailable === true}
+					onchange={(event) => updateFlag('candidateAvailable', event.currentTarget.checked)}
+				/> Only with candidates</label
+			>
+			<label class="flex cursor-pointer items-center gap-2 text-sm"
+				><input
+					type="checkbox"
+					class="checkbox"
+					checked={filters.hideMatching === true}
+					onchange={(event) => updateFlag('hideMatching', event.currentTarget.checked)}
+				/> Hide still-matching</label
 			>
 		</div>
 		<div class="modal-action">

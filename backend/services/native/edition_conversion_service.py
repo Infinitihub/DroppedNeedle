@@ -10,7 +10,7 @@ from pathlib import Path
 import secrets
 import shutil
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 import unicodedata
 import uuid
 
@@ -51,6 +51,7 @@ from models.library_management import (
 from models.library_work import OperationJob
 from api.v1.schemas.library_management import settings_revision
 from services.native.library_management_naming_policy import naming_policy_revision
+from services.native.file_processor import _fingerprint_recording_proof
 from services.native.library_policy_resolver import LibraryPolicyResolver
 from services.native.identification_revisions import (
     album_identity_revision,
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     )
     from services.native.target_import_library_service import TargetImportLibraryService
     from services.preferences_service import PreferencesService
+    from services.plugin_sources import PluginSourceRegistry
     from infrastructure.audio.fingerprinter import AudioFingerprinter
 
 
@@ -105,6 +107,7 @@ class EditionConversionService:
         import_library: "TargetImportLibraryService",
         audio: AudioMetadataEngine | None = None,
         clock: Callable[[], float] = time.time,
+        plugin_sources: "PluginSourceRegistry | None" = None,
     ) -> None:
         self._store = store
         self._albums = album_service
@@ -119,6 +122,19 @@ class EditionConversionService:
         self._audio = audio or AudioMetadataEngine()
         self._import_library = import_library
         self._clock = clock
+        self._plugin_sources = plugin_sources
+
+    def _is_download_source_ready(self) -> bool:
+        if self._preferences.is_download_source_ready():
+            return True
+        return bool(
+            self._plugin_sources is not None and self._plugin_sources.is_any_source_ready()
+        )
+
+    def _is_plugin_source_ready(self) -> bool:
+        return bool(
+            self._plugin_sources is not None and self._plugin_sources.is_any_source_ready()
+        )
 
     async def create_preflight(
         self,
@@ -245,7 +261,7 @@ class EditionConversionService:
             expected_input_revision=input_revision,
             expected_identity_revision=identity_revision,
             preflight_token_hash=hashlib.sha256(token.encode()).hexdigest(),
-            download_source_ready=self._preferences.is_download_source_ready(),
+            download_source_ready=self._is_download_source_ready(),
             required_temporary_bytes=(
                 sum(int(track["file_size_bytes"]) for track in tracks)
                 + kept_size
@@ -286,7 +302,7 @@ class EditionConversionService:
         if not hmac.compare_digest(token_hash, job.preflight_token_hash):
             raise ValidationError("The edition-conversion preflight token is invalid.")
         await self._assert_current(job)
-        if job.acquire_count and not self._preferences.is_download_source_ready():
+        if job.acquire_count and not self._is_download_source_ready():
             raise ValidationError(
                 "Set up a music acquisition source before matching this edition."
             )
@@ -318,15 +334,45 @@ class EditionConversionService:
         if job.final_preview_job_id is None:
             job = await self._ensure_final_preview(job, preview_token=preview_token)
         else:
-            settings = self._preferences.get_library_management_settings_raw()
-            now = self._clock()
-            job = await self._store.rotate_edition_conversion_preview_capability(
-                job.id,
-                expected_row_revision=job.row_revision,
-                preview_token_hash=hashlib.sha256(preview_token.encode()).hexdigest(),
-                preview_expires_at=(now + settings.preview_retention_hours * 60 * 60),
-                now=now,
+            operation = await self._store.get_operation_job(job.final_preview_job_id)
+            snapshot = await self._store.get_library_management_job_snapshot(
+                job.final_preview_job_id
             )
+            if (
+                operation is not None
+                and str(operation["state"]) == "ready"
+                and snapshot is not None
+                and snapshot.phase == "ready"
+            ):
+                settings = self._preferences.get_library_management_settings_raw()
+                now = self._clock()
+                job = await self._store.rotate_edition_conversion_preview_capability(
+                    job.id,
+                    expected_row_revision=job.row_revision,
+                    preview_token_hash=hashlib.sha256(
+                        preview_token.encode()
+                    ).hexdigest(),
+                    preview_expires_at=(
+                        now + settings.preview_retention_hours * 60 * 60
+                    ),
+                    now=now,
+                )
+            else:
+                if operation is None or str(operation["state"]) not in {
+                    "cancelled",
+                    "succeeded",
+                    "failed",
+                    "stopped",
+                }:
+                    raise StaleRevisionError(
+                        "The final conversion preview is no longer ready."
+                    )
+                job = await self._store.detach_dead_edition_conversion_preview(
+                    job.id,
+                    expected_row_revision=job.row_revision,
+                    now=self._clock(),
+                )
+                job = await self._ensure_final_preview(job, preview_token=preview_token)
         return EditionConversionPreviewResponse(
             status=self._response(job), preview_token=preview_token
         )
@@ -338,7 +384,7 @@ class EditionConversionService:
         target_ordinals: list[int],
         expected_row_revision: int,
     ) -> EditionConversionStatusResponse:
-        if not self._preferences.is_download_source_ready():
+        if not self._is_download_source_ready():
             raise ValidationError(
                 "Set up a music acquisition source before retrying these tracks."
             )
@@ -472,7 +518,7 @@ class EditionConversionService:
         uncovered = set(target_by_ordinal) - reusable - set(kept_by_ordinal)
         if (
             uncovered - active_downloads
-            and not self._preferences.is_download_source_ready()
+            and not self._is_download_source_ready()
         ):
             raise ValidationError(
                 "Set up a music acquisition source before continuing this conversion."
@@ -615,11 +661,16 @@ class EditionConversionService:
         self, job: EditionConversionJob, selected: set[int] | None = None
     ) -> None:
         album = await self._albums.get_album_info(job.target_release_group_mbid)
-        source_kind = (
-            "download"
-            if self._preferences.is_builtin_download_ready()
-            else "free_music"
-        )
+        # Plugin acquisitions resolve through the download service (the
+        # orchestrator fans out to plugin clients), so they share the
+        # "download" bookkeeping kind - the CHECK only allows
+        # download/free_music. The elif keeps plugin-only installs off Free Music.
+        if self._preferences.is_builtin_download_ready():
+            source_kind = "download"
+        elif self._is_plugin_source_ready():
+            source_kind = "download"
+        else:
+            source_kind = "free_music"
         for target in job.targets:
             if target.state != "pending" or (
                 selected is not None and target.ordinal not in selected
@@ -805,10 +856,8 @@ class EditionConversionService:
                 )
                 fingerprint = await self._fingerprinter.fingerprint(held)
                 if (
-                    fingerprint.status != "pass"
-                    or not fingerprint.recording_id
-                    or fingerprint.recording_id.casefold()
-                    != target.recording_mbid.casefold()
+                    _fingerprint_recording_proof(fingerprint, target.recording_mbid)
+                    is not True
                 ):
                     raise ValidationError(
                         "A retained track could not be verified as the requested recording."
@@ -1055,6 +1104,18 @@ class EditionConversionService:
             created_at=now,
             updated_at=now,
         )
+        replacement_track_ids = list(
+            dict.fromkeys(
+                request.replacement_local_track_id
+                for request in prepared.files
+                if request.replacement_local_track_id
+            )
+        )
+        live_source_revisions = (
+            await self._store.get_target_tracks_by_ids(replacement_track_ids)
+            if replacement_track_ids
+            else {}
+        )
         plan_items = list(
             await asyncio.gather(
                 *(
@@ -1067,6 +1128,7 @@ class EditionConversionService:
                         policy_revision=policy.policy_revision,
                         profile_revision=pinned.profile.revision,
                         created_at=now,
+                        live_revisions=live_source_revisions,
                     )
                     for request in prepared.files
                 )
@@ -1117,6 +1179,7 @@ class EditionConversionService:
         policy_revision: str,
         profile_revision: str,
         created_at: float,
+        live_revisions: dict[str, dict[str, Any]],
     ) -> LibraryManagementPlanItem:
         desired_json = msgspec.json.encode(request.desired_document).decode()
         source_root_id = request.replacement_root_id or request.destination_root_id
@@ -1159,6 +1222,16 @@ class EditionConversionService:
             for artifact in request.artifacts
         ]
         fingerprint = _sha256_file(Path(request.input_path))
+        # The freshness check compares these fields against the current
+        # local_tracks row, so pin the row values; only an acquired file with no
+        # local row keeps the previous fingerprint for both.
+        live_row = live_revisions.get(request.replacement_local_track_id or "")
+        stat_revision = (
+            fingerprint if live_row is None else str(live_row["stat_revision"])
+        )
+        tag_revision = (
+            fingerprint if live_row is None else str(live_row["tag_revision"] or "")
+        )
         return LibraryManagementPlanItem(
             job_id=preview_job_id,
             ordinal=request.ordinal,
@@ -1170,8 +1243,8 @@ class EditionConversionService:
             expected_profile_revision=profile_revision,
             expected_root_id=source_root_id,
             expected_relative_path=source_relative,
-            expected_stat_revision=fingerprint,
-            expected_tag_revision=fingerprint,
+            expected_stat_revision=stat_revision,
+            expected_tag_revision=tag_revision,
             expected_file_fingerprint=fingerprint,
             source_path_identity=hashlib.sha256(
                 f"{source_root_id}\x00{source_relative}".encode()
@@ -1414,7 +1487,7 @@ class EditionConversionService:
             album_title=job.target_album_title,
             artist_name=job.target_artist_name,
             state=job.state,
-            download_source_ready=self._preferences.is_download_source_ready(),
+            download_source_ready=self._is_download_source_ready(),
             required_temporary_bytes=job.required_temporary_bytes,
             kept_count=job.kept_count,
             acquire_count=job.acquire_count,

@@ -32,20 +32,34 @@ from api.v1.schemas.download import (
     DownloadListResponse,
     DownloadTaskResponse,
     HeldActionResponse,
+    HeldBulkReverifyItem,
+    HeldBulkReverifyRequest,
+    HeldBulkReverifyResponse,
     HeldImportResponse,
     HeldListResponse,
     HeldManagementActionResponse,
+    HeldReverifyResponse,
+    HeldVerdictActionResponse,
     NextSourceRequest,
     NextSourceResponse,
     ReimportDownloadResponse,
     RetryAllResponse,
+    RestartWithPolicyRequest,
+    RestartWithPolicyResponse,
     RetryDownloadResponse,
     StopRetriesResponse,
     UpgradeAlbumRequestBody,
     UpgradeRequestResponse,
     UpgradeTrackRequestBody,
 )
-from core.dependencies import get_download_service, get_sse_publisher
+from core.dependencies import (
+    get_download_orchestrator,
+    get_download_service,
+    get_download_store,
+    get_preferences_service,
+    get_quota_service,
+    get_sse_publisher,
+)
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep, CurrentCuratorDep, CurrentUserDep
 from services.native.download_service import ALREADY_IN_LIBRARY
@@ -106,7 +120,14 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         retry_ladder_minutes=retry_ladder_minutes or [],
         acquisition_cleanup_state=acquisition_cleanup_state,
         quality_format=task.quality_format,
+        quality_bitrate=task.quality_bitrate,
         quality_bit_depth=task.quality_bit_depth,
+        quality_snapshot_summary=task.quality_snapshot_summary,
+        quality_snapshot_hash=task.quality_snapshot_hash,
+        quality_preference_step=task.quality_preference_step,
+        quality_certainty=task.quality_certainty,
+        quality_provenance=task.quality_provenance,
+        manual_quality_override=bool(task.manual_quality_override),
         quality_sample_rate=task.quality_sample_rate,
         advertised_queue_depth=task.advertised_queue_depth,
         queue_position_start=task.queue_position_start,
@@ -117,6 +138,8 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         attempt_total=task.attempt_total,
         has_next_source=task.has_next_source,
         held_for_review=held_for_review,
+        wrong_product_verdict_at=task.wrong_product_verdict_at,
+        wrong_product_detail=task.wrong_product_detail,
     )
 
 
@@ -222,6 +245,80 @@ async def get_download_files(
     )
 
 
+@router.post(
+    "/{task_id}/restart-with-current-policy",
+    response_model=RestartWithPolicyResponse,
+)
+async def restart_with_current_policy(
+    task_id: str,
+    current_user: CurrentUserDep,
+    body: "RestartWithPolicyRequest | None" = None,
+):
+    """Owner-or-admin safe restart under the CURRENT global policy (spec).
+    Zero transferred bytes required; remote-queued tasks are refused with
+    guidance (their dedicated abort path is cancel/re-request). Storage
+    admission re-runs before reset; the whole swap is one atomic transaction
+    that retains the old snapshot on any failure."""
+    from core.dependencies import get_download_orchestrator, get_quota_service
+    from core.exceptions import ConflictError, ResourceNotFoundError, ValidationError
+    from services.native.acquisition.quality import build_snapshot, encode_snapshot
+
+    store = get_download_store()
+    prefs = get_preferences_service()
+    role = getattr(current_user, "role", "user")
+    task = await store.get_task_for_user(task_id, current_user.id, role)
+    if task is None:
+        raise ResourceNotFoundError("Download not found")
+
+    if task.downloaded_bytes > 0:
+        raise ConflictError(
+            "This download already transferred files - restart only works before any bytes move"
+        )
+    if task.remote_queued:
+        raise ConflictError(
+            "This download sits in the source's remote queue - cancel it, then "
+            "request again so the new policy applies"
+        )
+    if task.status not in ("queued", "downloading", "processing"):
+        raise ValidationError(
+            "Only an active search or queued download can be restarted"
+        )
+
+    quota = get_quota_service()
+    await quota.check_storage_admission(task.user_id, task.origin or "user")
+
+    snapshot = build_snapshot(prefs.get_download_policy())
+    expected = getattr(body, "expected_snapshot_hash", None) if body else None
+    ok = await store.apply_quality_policy_restart(
+        task.id,
+        expected_snapshot_hash=expected,
+        new_snapshot_json=encode_snapshot(snapshot),
+        new_snapshot_hash=snapshot.snapshot_hash,
+        new_snapshot_summary=snapshot.summary,
+    )
+    if not ok:
+        raise ConflictError(
+            "The stored policy changed since you opened this view - refresh and retry"
+        )
+    # Stop any still-live poll loop for the previous candidate before
+    # re-dispatching; cancellation is in-memory only (the persisted row was
+    # already reset above), so a registry duplicate can never 500 the swap.
+    orchestrator = get_download_orchestrator()
+    stale_handle = getattr(orchestrator, "_active_tasks", {}).get(task_id)
+    if stale_handle is not None and not stale_handle.done():
+        stale_handle.cancel()
+        try:
+            await stale_handle
+        except BaseException:  # noqa: BLE001 - joined either way
+            pass
+    orchestrator.dispatch(task.id)
+    return RestartWithPolicyResponse(
+        accepted=True,
+        snapshot_summary=snapshot.summary,
+        message="Restarting with the current server quality policy",
+    )
+
+
 @router.post("/{task_id}/cancel", response_model=CancelDownloadResponse)
 async def cancel_download(
     task_id: str, current_user: CurrentUserDep, service=Depends(get_download_service)
@@ -301,6 +398,7 @@ def _held_to_response(held) -> HeldImportResponse:  # noqa: ANN001 - HeldImport
         original_filename=held.original_filename,
         file_format=held.file_format,
         duration_seconds=held.duration_seconds,
+        expected_duration_seconds=held.expected_duration_seconds,
         reason=held.reason,
         reason_detail=held.reason_detail,
         source=held.source,
@@ -433,6 +531,23 @@ async def discard_management_hold(
     return HeldManagementActionResponse(status="discarded", files=count)
 
 
+@router.post(
+    "/held/verdict/{source_task_id}/discard",
+    response_model=HeldVerdictActionResponse,
+)
+async def discard_held_verdict(
+    source_task_id: str,
+    current_user: CurrentUserDep,
+    service=Depends(get_download_service),
+):
+    """Discard every verification-held track for one download (the wrong-product
+    verdict action) and clear the verdict (admin/owner)."""
+    count = await service.discard_held_for_task(
+        source_task_id, current_user.id, current_user.role
+    )
+    return HeldVerdictActionResponse(status="discarded", files=count)
+
+
 @router.post("/held/{held_id}/import", response_model=HeldActionResponse)
 async def import_held(
     held_id: int, current_user: CurrentUserDep, service=Depends(get_download_service)
@@ -449,6 +564,34 @@ async def discard_held(
     """Delete a held track's file and let the album's auto-retry resume."""
     await service.discard_held(held_id, current_user.id, current_user.role)
     return HeldActionResponse(status="discarded")
+
+
+@router.post("/held/reverify", response_model=HeldBulkReverifyResponse)
+async def reverify_held_bulk(
+    current_user: CurrentUserDep,
+    body: HeldBulkReverifyRequest = MsgSpecBody(HeldBulkReverifyRequest),
+    service=Depends(get_download_service),
+):
+    """Re-run the fingerprint identity check over held tracks (admin/owner-scoped,
+    capped): confirmed tracks import through the same path as "import anyway",
+    the rest stay held. One id's failure never stops the sweep."""
+    results = await service.reverify_held_bulk(
+        current_user.id, current_user.role, body.held_ids
+    )
+    return HeldBulkReverifyResponse(
+        results=[HeldBulkReverifyItem(**item) for item in results]
+    )
+
+
+@router.post("/held/{held_id}/reverify", response_model=HeldReverifyResponse)
+async def reverify_held(
+    held_id: int, current_user: CurrentUserDep, service=Depends(get_download_service)
+):
+    """Re-run the fingerprint identity check on one held file (admin/owner)."""
+    status, final_path = await service.reverify_held(
+        held_id, current_user.id, current_user.role
+    )
+    return HeldReverifyResponse(status=status, final_path=final_path)
 
 
 _AUDIO_MEDIA_TYPES = {

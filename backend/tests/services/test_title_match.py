@@ -9,6 +9,7 @@ before reaching the one requested. Cases below are drawn from real Newznab/Souls
 import pytest
 
 from services.native.title_match import (
+    _tokens,
     artist_evidence,
     fold,
     names_different_album,
@@ -141,7 +142,7 @@ def test_numbered_sequel_still_rejected_after_edition_additions():
     assert names_different_album("OK Computer", "Radiohead", "Radiohead Kid A")
 
 
-# --- title_containment_score: names the expected title AND NOTHING ELSE (P2/P3.4) ----
+# title_containment_score: names the expected title AND NOTHING ELSE (P2/P3.4)
 
 
 def test_containment_exact_and_numbered():
@@ -196,7 +197,7 @@ def test_containment_missing_expected_words_lower_coverage():
     assert title_containment_score("Houses of the Holy", "Houses") == pytest.approx(0.5)
 
 
-# --- artist_evidence: the tier='auto' identity gate (D2, 2026-07-05 incident) ---------
+# artist_evidence: the tier='auto' identity gate (D2, 2026-07-05 incident)
 
 
 def test_artist_evidence_incident_wrong_artist_path_is_not_evidence():
@@ -251,3 +252,218 @@ def test_artist_evidence_all_stopword_artist_falls_back_to_full_name():
     # "The The" is entirely stopwords - fall back to the raw words rather than
     # having no evidence path at all.
     assert artist_evidence("The The", "@@x\\The The\\Soul Mining\\01.flac")
+
+
+def test_fedition03_valid_reissue_descriptors_are_not_wrong_album() -> None:
+    """F-EDITION-03: signed descriptor additions (OKNOTOK, MFSL, Immersion,
+    Half Speed Master, Audiophile) are harmless edition words - a self-titled
+    candidate carrying them must NOT read as a different album."""
+    for candidate in (
+        "Led Zeppelin (OKNOTOK)",
+        "Led Zeppelin (MFSL)",
+        "Led Zeppelin - Immersion.Box.Set",
+        "Led Zeppelin Half Speed Master",
+        "Led Zeppelin Audiophile",
+        "Led Zeppelin Super Deluxe Experience",
+    ):
+        assert names_different_album(
+            "Led Zeppelin", "Led Zeppelin", candidate
+        ) is False, candidate
+
+
+def test_fedition03_real_different_albums_still_reject() -> None:
+    for candidate in ("Led Zeppelin - Kid A", "Led Zeppelin - Physical Graffiti"):
+        assert names_different_album(
+            "Led Zeppelin", "Led Zeppelin", candidate
+        ) is True, candidate
+
+
+def test_fedition03_sequel_numbering_still_rejects() -> None:
+    assert names_different_album(
+        "Led Zeppelin", "Led Zeppelin", "Led Zeppelin II"
+    ) is True
+    assert names_different_album(
+        "Led Zeppelin", "Led Zeppelin", "Led Zeppelin III"
+    ) is True
+
+
+def test_boxset_compound_folds_but_bare_set_stays_an_album_word() -> None:
+    # box + set folds to the canonical boxset descriptor on both sides.
+    assert names_different_album(
+        "Led Zeppelin Box Set", "Led Zeppelin", "Led Zeppelin (Box-Set)"
+    ) is False
+    # A bare "set" remains an album word: "Set" alone IS a different album.
+    assert names_different_album(
+        "Led Zeppelin", "Led Zeppelin", "Led Zeppelin - Set"
+    ) is True
+
+
+# GH-284: digit-bearing artist names earn evidence safely
+
+
+@pytest.mark.parametrize(
+    ("artist", "path"),
+    [
+        ("deadmau5", "/music/deadmau5/4x4=12/track-1.mp3"),
+        ("deadmau5", "/music/Deadmau5 - For Lack of a Better Name/track-1.mp3"),
+        ("U2", "/music/u2/the-joshua-tree/track-1.mp3"),
+        ("311", "/music/311/greatest-hits/track-1.flac"),
+        ("Matchbox 20", "/music/matchbox 20/yourself or someone like you/track-1.mp3"),
+    ],
+)
+def test_digit_bearing_artists_match_their_own_paths(artist: str, path: str):
+    assert artist_evidence(artist, path) is True
+
+
+@pytest.mark.parametrize(
+    ("artist", "path"),
+    [
+        # a bare year in the path is not the artist "311"
+        ("311", "/music/various/greatest hits of 1994/311 - song.mp3".replace("311 - ", "")),
+        # track ordinal containing the digits is not artist evidence
+        ("311", "/music/various/album 311 disc/track-7.mp3"),
+        # unrelated numeric directory
+        ("311", "/music/1999/backstreet boys/track-1.mp3"),
+        # wrong artist entirely
+        ("deadmau5", "/music/other artist/album/track-1.mp3"),
+        # obfuscated path without the name
+        ("u2", "/music/a---b/c--d/track-1.mp3"),
+    ],
+)
+def test_numeric_looking_paths_stay_negative(artist: str, path: str):
+    assert artist_evidence(artist, path) is False
+
+
+# GH #259 (scorer leg) + GH #307: canonical MusicBrainz punctuation vs scene-named releases.
+# ``_SEP_RE`` used to split on ' " , ( ) so the canonical title "Man's Best Friend" tokenised
+# to man + s (the 1-char fragment dropped), while the scene-named release drops the
+# apostrophe entirely -> 'mans' read as a foreign word -> WRONG_ALBUM/PERMANENT. Same
+# asymmetric-token mechanism for "O(verly) D(edicated)": o + verly, 'o' dropped, 'verly'
+# foreign. One normalization pass in ``_tokens`` (apostrophe-delete + paren-unfold) closes
+# both - these are the characterization tests that failed before it.
+
+_MBF_ARTIST = "Sabrina Carpenter"
+_MBF = "Man's Best Friend"
+
+
+def test_gh259_scene_named_release_without_apostrophe_passes():
+    # psykix's `dropped_wrong_album=4`: every release the indexer returned was rejected.
+    assert not names_different_album(
+        _MBF, _MBF_ARTIST, "Sabrina_Carpenter-Mans_Best_Friend-CD-FLAC-2025-GROUP"
+    )
+
+
+def test_gh259_human_named_release_without_apostrophe_passes():
+    assert not names_different_album(
+        _MBF, _MBF_ARTIST, "Sabrina Carpenter - Mans Best Friend (2025) [MP3-320]"
+    )
+
+
+def test_gh259_part_counter_prefixed_release_without_apostrophe_passes():
+    assert not names_different_album(
+        _MBF,
+        _MBF_ARTIST,
+        '[002/95] "Sabrina_Carpenter-Mans_Best_Friend-2025.part001.rar"',
+    )
+
+
+def test_gh259_smart_quote_title_matches_apostropheless_release_both_directions():
+    # MusicBrainz titles carry the typographic apostrophe; the scene name drops it.
+    # Either side may be the canonical one - the treatment is symmetric.
+    assert not names_different_album(
+        "Man’s Best Friend", _MBF_ARTIST, "Sabrina_Carpenter-Mans_Best_Friend-CD-FLAC-2025-GROUP"
+    )
+    assert not names_different_album(
+        "Man’s Best Friend", _MBF_ARTIST, "Sabrina Carpenter - Mans Best Friend (2025) [MP3-320]"
+    )
+    # And the release may KEEP the apostrophe (ASCII or typographic) - still the same album.
+    assert not names_different_album(
+        _MBF, _MBF_ARTIST, "Sabrina Carpenter - Man's Best Friend (2025) [MP3-320]"
+    )
+    assert not names_different_album(
+        _MBF, _MBF_ARTIST, "Sabrina Carpenter - Man’s Best Friend (2025) [MP3-320]"
+    )
+
+
+def test_gh259_genuinely_different_album_by_same_artist_still_rejects():
+    # Negative control: relaxation must not open a wrong-album floodgate. "Emails I
+    # Can't Send" carries 'emails' + 'send' - foreign album words regardless of the
+    # apostrophe in "Can't".
+    assert names_different_album(
+        _MBF, _MBF_ARTIST, "Sabrina Carpenter - Emails I Can’t Send"
+    )
+    assert names_different_album(
+        _MBF, _MBF_ARTIST, "Sabrina_Carpenter-Short_n_Sweet-CD-FLAC-2024-GROUP"
+    )
+
+
+def test_gh307_paren_obfuscated_title_unfolds_to_the_canonical_words():
+    # "O(verly) D(edicated)" -> overly + dedicated; the 1-char 'o' and 'd' fragments
+    # the old splitter dropped used to leave 'verly'/'edicated' reading as foreign.
+    assert not names_different_album(
+        "Overly Dedicated", "ScHoolboy Q", "Schoolboy_Q-O(verly)_D(edicated)-2010"
+    )
+    assert not names_different_album(
+        "Overly Dedicated", "ScHoolboy Q", "ScHoolboy Q - O(verly) D(edicated) (2010)"
+    )
+    # The canonical title with real parens elsewhere still matches its own release.
+    assert not names_different_album(
+        "Overly Dedicated", "ScHoolboy Q", "Schoolboy_Q-Overly_Dedicated-CD-FLAC-2010"
+    )
+
+
+def test_gh307_standalone_paren_groups_stay_separate_tokens():
+    # Only the #307 abutting shape (``O(verly)``) unfolds; a paren group with spaces
+    # around/inside it keeps today's split behaviour exactly. ``strip_featuring``
+    # removes a ``(feat. X)`` credit BEFORE tokenising (it is not album identity), so
+    # the standalone-pins below use edition/year shapes for the same boundary.
+    assert _tokens("Album (2014)") == ["album", "2014"]
+    assert _tokens("(2014)") == ["2014"]
+    assert _tokens("Suffocate (feat. Poppy)") == ["suffocate"]
+    assert _tokens("Album (Deluxe Version)") == ["album", "deluxe", "version"]
+    assert _tokens("Album (Disc 2)") == ["album", "disc", "2"]
+    # ...and the abutting shape unfolds into the glued word.
+    assert _tokens("O(verly) D(edicated)") == ["overly", "dedicated"]
+    assert _tokens("Mans_Best_Friend") == ["mans", "best", "friend"]
+    assert _tokens("Can't Stop the Music") == ["cant", "stop", "the", "music"]
+
+
+def test_framing_quotes_still_split_and_word_internal_quotes_fold():
+    # A quote with a space on one side FRAMES the title - it must keep splitting (a
+    # ``'Man's Best Friend'`` candidate would otherwise tokenise to ``'mans`` and
+    # read as a foreign word). A quote between two word chars is part of the word
+    # (``Man"s`` -> ``mans``), same as the apostrophe.
+    assert _tokens("'Man's Best Friend'") == ["mans", "best", "friend"]
+    assert _tokens('"Sabrina Carpenter - Mans Best Friend"') == [
+        "sabrina", "carpenter", "mans", "best", "friend",
+    ]
+    assert _tokens('Man"s Best Friend') == ["mans", "best", "friend"]
+    assert not names_different_album(
+        _MBF, _MBF_ARTIST, '"Sabrina Carpenter - Mans Best Friend"'
+    )
+    assert not names_different_album(
+        'Man"s Best Friend', _MBF_ARTIST, "Sabrina_Carpenter-Mans_Best_Friend-2025"
+    )
+
+
+def test_gh259_gh307_containment_score_does_not_collapse():
+    # The identity metrics run alongside the guard; they must not read the scene-named
+    # release as a different work once the tokens fold. Scored the way the scorers
+    # score candidate TITLES (artist words ignored - ``album_preflight_scorer`` passes
+    # ``ignore=artist_words``); the scene group name is the one tolerated extra word,
+    # matching how a clean scene-named release of ANY album scores today.
+    _artist = frozenset({"sabrina", "carpenter"})
+    assert title_containment_score(
+        _MBF, "Sabrina_Carpenter-Mans_Best_Friend-CD-FLAC-2025-GROUP", ignore=_artist
+    ) >= 0.75
+    assert title_containment_score(
+        _MBF, "Sabrina Carpenter - Mans Best Friend (2025) [MP3-320]", ignore=_artist
+    ) == 1.0
+    assert title_containment_score(
+        "Overly Dedicated", "Schoolboy_Q-O(verly)_D(edicated)-2010",
+        ignore=frozenset({"schoolboy", "q"}),
+    ) == 1.0
+    # ...and a genuinely different album still scores low.
+    assert title_containment_score(
+        _MBF, "Sabrina Carpenter - Emails I Can’t Send", ignore=_artist
+    ) < 0.5

@@ -1,11 +1,14 @@
+import math
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Mapping
 
 import msgspec
 
 from api.v1.schemas.advanced_settings import _validate_range
 from api.v1.schemas.plex import PlexLibrarySectionInfo
+from infrastructure.http.brainzmash_transport import BRAINZMASH_ENDPOINT
 from infrastructure.msgspec_fastapi import AppStruct
+from models.acquisition_quality import QualityRecipeEntry, validate_quality_recipe
 
 LASTFM_SECRET_MASK = "••••••••"
 
@@ -93,6 +96,11 @@ class DownloadClientConnectionSettings(AppStruct):
     # for when the mount points at a parent (e.g. the whole media share). Relative, never
     # escapes the mount (sanitised below + confined again at use).
     downloads_subpath: str = ""
+    # Optional ABSOLUTE container path of slskd's incomplete-downloads dir, for the
+    # partial-bytes fallback (#292). Absolute only: a relative value cannot be resolved
+    # against the complete mount safely, so it is dropped (sanitised below). Empty
+    # disables the fallback entirely (today's behaviour). A plain path, not a secret.
+    slskd_incomplete_mount: str = ""
     preflight_score_auto_accept: float = 0.70
     preflight_score_manual_min: float = 0.50
     # Download resilience (minutes-scale; user-tunable). A transfer actively
@@ -108,6 +116,9 @@ class DownloadClientConnectionSettings(AppStruct):
     auto_retry_base_interval_minutes: int = 15
 
     def __post_init__(self) -> None:
+        # Strip paste whitespace from the key (the "slskd****" mask is
+        # strip-identity, so sentinel comparison is unaffected).
+        self.api_key = self.api_key.strip() if self.api_key else ""
         # normalise a bare host (e.g. "slskd:5030") to a full URL; httpx rejects a
         # schemeless URL
         self.url = self.url.strip()
@@ -161,6 +172,20 @@ class DownloadClientConnectionSettings(AppStruct):
             for p in re.split(r"[\\/]", self.downloads_subpath.strip())
             if p and p not in (".", "..")
         )
+        # same component hygiene for the incomplete mount, but absoluteness is kept:
+        # drop "", ".", ".." so ".." can never escape, then re-anchor at root. A
+        # relative input (or bare "/") has no safe meaning here, so it becomes "".
+        raw_incomplete = self.slskd_incomplete_mount.strip()
+        incomplete_parts = [
+            p
+            for p in re.split(r"[\\/]", raw_incomplete)
+            if p and p not in (".", "..")
+        ]
+        self.slskd_incomplete_mount = (
+            "/" + "/".join(incomplete_parts)
+            if raw_incomplete.startswith("/") and incomplete_parts
+            else ""
+        )
 
 
 class DownloadPolicySettings(AppStruct):
@@ -188,8 +213,8 @@ class DownloadPolicySettings(AppStruct):
     # Don't permanently blocklist a Usenet release younger than this; let it retry once it
     # has propagated across Usenet servers (review M4 / owner Q2).
     usenet_min_release_age_minutes: int = 30
-    # --- Acquisition-pipeline substrate (ArrRebuild). Source-agnostic; consumed by the
-    # decision specs. All default to "off" so behaviour is unchanged until opted in. ---
+    # Acquisition-pipeline substrate (ArrRebuild). Source-agnostic; consumed by the
+    # decision specs. All default to "off" so behaviour is unchanged until opted in.
     # Hard upper bound on a single album's total size (0 = unbounded). Rejects a mislabeled
     # boxset/discography before the bytes are spent.
     max_size_mb: int = 0
@@ -201,7 +226,7 @@ class DownloadPolicySettings(AppStruct):
     ignored_terms: list[str] = msgspec.field(default_factory=list)
     # When non-empty, a release must match at least one of these to be considered.
     required_terms: list[str] = msgspec.field(default_factory=list)
-    # --- Upgrade/cutoff substrate (full feature lives in CollectionManagement). ---
+    # Upgrade/cutoff substrate (full feature lives in CollectionManagement).
     # Stop upgrading once a release-group's worst track reaches this tier.
     quality_cutoff: str = "lossless"
     # Master opt-in for replacing held lower-quality files with better ones.
@@ -212,19 +237,39 @@ class DownloadPolicySettings(AppStruct):
     recycle_bin_path: str = ""
     # Recycled files older than this are pruned by the periodic task.
     recycle_retention_days: int = 30
-    # --- Cost control (CollectionManagement Feature C). 0 = unlimited. Caps BLOCK
+    # Cost control (CollectionManagement Feature C). 0 = unlimited. Caps BLOCK
     # new non-upgrade grabs at/over the ceiling; nothing is ever auto-evicted (A3).
     # Per-user values are defaults; user_quotas rows override them (NULL = inherit).
     max_library_size_gb: int = 0
     default_request_quota_count: int = 0
     default_request_quota_days: int = 7
     default_storage_quota_gb: int = 0
-    # --- Background upgrade scan (CollectionManagement Phase 5; opt-in, default OFF).
+    # Background upgrade scan (CollectionManagement Phase 5; opt-in, default OFF).
     # Runs only while upgrade_allowed is ALSO on; enqueues at most
     # background_upgrade_max_per_run origin='upgrade' grabs per sweep.
     background_upgrade_scan_enabled: bool = False
     background_upgrade_scan_interval_hours: int = 12
     background_upgrade_max_per_run: int = 3
+    # v2 ordered format-quality recipe. Empty preserves the v1 policy shape and
+    # semantics; non-empty values are validated strictly before PUT conversion.
+    quality_recipe: list[QualityRecipeEntry] = msgspec.field(default_factory=list)
+    # Read-only status metadata used when a legacy policy cannot be projected
+    # without silently dropping codecs. These values are stripped before save.
+    quality_recipe_status: Literal["v1", "v2", "non_convertible", "invalid"] = "v1"
+    quality_recipe_error: str | None = None
+    # Legacy v1 order/quality fields remain for rollback and old persisted blobs.
+    quality_preference_order: list[str] = msgspec.field(default_factory=list)
+    preferred_lossy_bitrate_kbps: int | None = None
+    lossy_min_bitrate_kbps: int | None = None
+    lossy_max_bitrate_kbps: int | None = None
+    # Within-lossless detail target/caps - canonical tier stays ``lossless``.
+    lossless_preference: str = "highest"  # cd|24_48|24_96|24_192|highest
+    lossless_max_bit_depth: int | None = None
+    lossless_max_sample_rate_hz: int | None = None
+    unknown_quality_behavior: str = (
+        "allow_as_fallback"  # reject|review|allow_as_fallback
+    )
+    source_selection_mode: str = "source_first"  # source_first|quality_first
 
     def __post_init__(self) -> None:
         _validate_range(
@@ -306,6 +351,135 @@ class DownloadPolicySettings(AppStruct):
         if _rank[self.quality_cutoff] > _rank[self.quality_max]:
             self.quality_cutoff = self.quality_max
 
+        # --- Acquisition-quality field normalization (stored-data resilient,
+        # mirrors the legacy tier-key handling above: an invalid STORED value
+        # heals to the existing-install default instead of bricking every
+        # config load). User-submitted policies go through
+        # ``validate_new_quality_fields`` first, which raises instead of
+        # healing - submitted fields are never silently clamped.
+        from services.native.acquisition.quality import derive_default_order
+
+        accepted = derive_default_order(self.quality_min, self.quality_max)
+        order = list(self.quality_preference_order)
+        order_ok = len(order) == len(accepted) and sorted(order) == sorted(accepted)
+        self.quality_preference_order = order if order_ok else list(accepted)
+        _lossless_prefs = {"cd", "24_48", "24_96", "24_192", "highest"}
+        if self.lossless_preference not in _lossless_prefs:
+            self.lossless_preference = "highest"
+        _unknown_rules = {"reject", "review", "allow_as_fallback"}
+        if self.unknown_quality_behavior not in _unknown_rules:
+            self.unknown_quality_behavior = "allow_as_fallback"
+        _source_modes = {"source_first", "quality_first"}
+        if self.source_selection_mode not in _source_modes:
+            self.source_selection_mode = "source_first"
+        for name in (
+            "preferred_lossy_bitrate_kbps",
+            "lossy_min_bitrate_kbps",
+            "lossy_max_bitrate_kbps",
+        ):
+            value = getattr(self, name)
+            if value is not None and not (
+                _QUALITY_KBPS_MIN <= value <= _QUALITY_KBPS_MAX
+            ):
+                setattr(self, name, None)
+        if (
+            self.lossy_min_bitrate_kbps is not None
+            and self.lossy_max_bitrate_kbps is not None
+            and self.lossy_min_bitrate_kbps > self.lossy_max_bitrate_kbps
+        ):
+            self.lossy_min_bitrate_kbps = None
+            self.lossy_max_bitrate_kbps = None
+        for name, low, high in (
+            ("lossless_max_bit_depth", 1, 64),
+            ("lossless_max_sample_rate_hz", 8000, 768000),
+        ):
+            value = getattr(self, name)
+            if value is not None and not (low <= value <= high):
+                setattr(self, name, None)
+
+
+_QUALITY_KBPS_MIN = 16
+_QUALITY_KBPS_MAX = 2048
+
+
+def validate_new_quality_fields(payload: Mapping[str, Any]) -> None:
+    """STRICT validation of a user-submitted download-policy BODY (the raw
+    deserialized mapping, BEFORE ``DownloadPolicySettings`` construction -
+    its ``__post_init__`` heals stored-data drift and would erase the evidence).
+    Duplicates, missing accepted tiers, out-of-range endpoints, invalid
+    bounds, impossible target/bound combinations and unknown enum labels
+    raise ValueError; the route maps that to a 400."""
+    from services.native.acquisition.quality import normalize_order
+
+    quality_min = payload.get("quality_min", "mp3_320")
+    quality_max = payload.get("quality_max", "lossless")
+    submitted_order = payload.get("quality_preference_order")
+    if submitted_order:  # [] / missing = derive (same contract as GET→PUT round-trip)
+        normalize_order(list(submitted_order), quality_min, quality_max)
+    submitted_recipe = payload.get("quality_recipe")
+    if submitted_recipe is not None:
+        if not isinstance(submitted_recipe, list):
+            raise ValueError("quality_recipe must be a list")
+        if submitted_recipe:
+            if payload.get("flac_mp3_only", True) is not True:
+                raise ValueError(
+                    "quality_recipe requires flac_mp3_only=true; "
+                    "replace the non-convertible policy first"
+                )
+            try:
+                entries = [
+                    msgspec.convert(item, type=QualityRecipeEntry, strict=True)
+                    for item in submitted_recipe
+                ]
+                validate_quality_recipe(entries)
+            except (msgspec.ValidationError, TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from exc
+    _lossless_prefs = {"cd", "24_48", "24_96", "24_192", "highest"}
+    _unknown_rules = {"reject", "review", "allow_as_fallback"}
+    _source_modes = {"source_first", "quality_first"}
+    lossless_preference = payload.get("lossless_preference", "highest")
+    if lossless_preference not in _lossless_prefs:
+        raise ValueError(f"invalid lossless_preference: {lossless_preference!r}")
+    unknown_quality_behavior = payload.get(
+        "unknown_quality_behavior", "allow_as_fallback"
+    )
+    if unknown_quality_behavior not in _unknown_rules:
+        raise ValueError(
+            f"invalid unknown_quality_behavior: {unknown_quality_behavior!r}"
+        )
+    source_selection_mode = payload.get("source_selection_mode", "source_first")
+    if source_selection_mode not in _source_modes:
+        raise ValueError(f"invalid source_selection_mode: {source_selection_mode!r}")
+    numbers = (
+        ("preferred_lossy_bitrate_kbps", payload.get("preferred_lossy_bitrate_kbps")),
+        ("lossy_min_bitrate_kbps", payload.get("lossy_min_bitrate_kbps")),
+        ("lossy_max_bitrate_kbps", payload.get("lossy_max_bitrate_kbps")),
+    )
+    for name, value in numbers:
+        if value is not None and not (_QUALITY_KBPS_MIN <= value <= _QUALITY_KBPS_MAX):
+            raise ValueError(
+                f"{name} must be between {_QUALITY_KBPS_MIN} and {_QUALITY_KBPS_MAX} kbps"
+            )
+    lossy_min = payload.get("lossy_min_bitrate_kbps")
+    lossy_max = payload.get("lossy_max_bitrate_kbps")
+    if lossy_min is not None and lossy_max is not None and lossy_min > lossy_max:
+        raise ValueError("lossy_min_bitrate_kbps exceeds lossy_max_bitrate_kbps")
+    target = payload.get("preferred_lossy_bitrate_kbps")
+    if target is not None:
+        if (lossy_min is not None and target < lossy_min) or (
+            lossy_max is not None and target > lossy_max
+        ):
+            raise ValueError(
+                "preferred_lossy_bitrate_kbps must sit inside "
+                "[lossy_min_bitrate_kbps, lossy_max_bitrate_kbps]"
+            )
+    depth = payload.get("lossless_max_bit_depth")
+    if depth is not None and not 1 <= depth <= 64:
+        raise ValueError("lossless_max_bit_depth must be 1..64 bits")
+    rate = payload.get("lossless_max_sample_rate_hz")
+    if rate is not None and not 8000 <= rate <= 768000:
+        raise ValueError("lossless_max_sample_rate_hz must be 8000..768000 Hz")
+
 
 class WantedWatcherSettings(AppStruct):
     """The wanted watcher (Wanted plan §5.4): granular opt-out toggles, no secrets.
@@ -346,7 +520,7 @@ class SabnzbdConnectionSettings(AppStruct):
 
 class NewznabIndexerSettings(AppStruct):
     """One configured Newznab indexer (D6). ``api_key`` is a Fernet-encrypted
-    secret, masked on read and preserved on a masked save - **per array element**.
+    secret, masked on read and preserved on a masked save - per array element.
     DroppedNeedle ships no indexers; the user adds their own (guardrail 1)."""
 
     id: str = ""
@@ -363,6 +537,28 @@ class NewznabIndexerSettings(AppStruct):
         if self.url and not self.url.startswith(("http://", "https://")):
             self.url = f"https://{self.url}"
         self.url = self.url.rstrip("/")
+
+
+class ProwlarrConnectionSettings(AppStruct):
+    """Single Prowlarr connection (Prowlarr multiplexes its own indexers, so one
+    connection is the complete model - not a list). ``api_key`` is a Fernet-encrypted
+    secret, masked on read, preserved on a masked save. URL normalization follows the
+    Lidarr-import precedent (LAN service, ``http://`` default), not SABnzbd's
+    https-forcing."""
+
+    enabled: bool = False
+    url: str = ""
+    api_key: str = ""
+
+    def __post_init__(self) -> None:
+        self.url = self.url.strip()
+        if self.url and not self.url.startswith(("http://", "https://")):
+            self.url = f"http://{self.url}"
+        self.url = self.url.rstrip("/")
+        for suffix in ("/api/v1", "/api"):
+            if self.url.endswith(suffix):
+                self.url = self.url[: -len(suffix)].rstrip("/")
+                break
 
 
 class LidarrImportConnectionSettings(AppStruct):
@@ -416,15 +612,20 @@ PLEX_TOKEN_MASK = "plex****"
 ACOUSTID_KEY_MASK = "acoustid****"
 DOWNLOAD_CLIENT_API_KEY_MASK = "slskd****"
 INDEXER_API_KEY_MASK = "indexer****"
+PROWLARR_API_KEY_MASK = "prowlarr****"
 SABNZBD_API_KEY_MASK = "sabnzbd****"
 LIDARR_IMPORT_API_KEY_MASK = "lidarr****"
 SPOTIFY_SECRET_MASK = "spotify****"
 
 
 class SpotifySettings(AppStruct):
+    # GH-298: optional admin-configured origin (scheme://host[:port]) the OAuth
+    # redirect URI is built from; empty keeps the request.base_url fallback.
+    # Not a secret - returned unmasked like client_id.
     client_id: str = ""
     client_secret: str = ""
     enabled: bool = False
+    spotify_redirect_origin: str = ""
 
 
 TICKETMASTER_KEY_MASK = "ticketmaster****"
@@ -506,11 +707,36 @@ class NavidromeConnectionSettings(AppStruct):
     username: str = ""
     password: str = ""
     enabled: bool = False
+    # .m3u8 export into a directory Navidrome scans. Off by default.
+    playlist_sync_enabled: bool = False
+    playlist_sync_path: str = ""
+    # Navidrome shows imported playlists to everyone, so "all" is opt-in.
+    playlist_sync_scope: str = "public"
+    # Remove an exported file once its playlist stops qualifying.
+    playlist_sync_remove_deleted: bool = True
 
     def __post_init__(self) -> None:
         self.navidrome_url = (
             self.navidrome_url.rstrip("/") if self.navidrome_url else ""
         )
+        self.playlist_sync_path = (
+            self.playlist_sync_path.strip() if self.playlist_sync_path else ""
+        )
+        if self.playlist_sync_scope not in {"public", "all"}:
+            self.playlist_sync_scope = "public"
+
+
+class NavidromePlaylistSyncResult(AppStruct):
+    success: bool = False
+    message: str = ""
+    written: int = 0
+    unchanged: int = 0
+    removed: int = 0
+    removal_failures: int = 0
+    skipped_empty: int = 0
+    skipped_not_ours: int = 0
+    tracks_missing_files: int = 0
+    tracks_unrepresentable: int = 0
 
 
 class PlexConnectionSettings(AppStruct):
@@ -642,6 +868,41 @@ class LibraryScanScheduleResponse(LibraryScanScheduleSettings):
     server_timezone: str = ""
 
 
+class LibraryScanDirtyScopes(AppStruct):
+    """S-01 Hook B dirty-mark hints: scope ids touched by the last settings
+    save that the scan supervisor has not consumed yet. Hints only - a crash
+    may lose them and the next rolling scan converges anyway."""
+
+    scope_ids: list[str] = msgspec.field(default_factory=list)
+
+
+class LibraryScanFilesystemWatcherSettings(AppStruct):
+    """S-01 Hook C knobs for the zero-dependency filesystem poller (D6).
+
+    The poller takes a recursive stat-only snapshot of every library root
+    every poll_interval_seconds and, when the snapshot moves, enqueues one
+    incremental automatic scan after batch_window_seconds so rapid bursts
+    (saves, renames, multi-file copies) collapse into a single request."""
+
+    enabled: bool = True
+    poll_interval_seconds: float = 300.0
+    batch_window_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        # Floors mirror the poller clamps in
+        # services.native.library_filesystem_watcher (1s minimum poll, batch
+        # must not go negative); reject at the boundary so bad values cannot
+        # persist instead of being silently clamped on every tick.
+        if self.poll_interval_seconds < 1.0:
+            raise msgspec.ValidationError(
+                "poll_interval_seconds must be at least 1.0"
+            )
+        if self.batch_window_seconds < 0.0:
+            raise msgspec.ValidationError(
+                "batch_window_seconds must be at least 0.0"
+            )
+
+
 class ScrobbleSettings(AppStruct):
     scrobble_to_lastfm: bool = False
     scrobble_to_listenbrainz: bool = False
@@ -653,17 +914,86 @@ class PrimaryMusicSourceSettings(AppStruct):
 
 _OFFICIAL_MB_RATE_LIMIT = 1.0
 _OFFICIAL_MB_CONCURRENT_SEARCHES = 6
+_BRAINZMASH_RATE_LIMIT = 10.0
+_BRAINZMASH_CONCURRENT_SEARCHES = 1
+
+# BrainzMash is deliberately a server-owned source.  The endpoint and disclosure
+# version are never accepted from a browser request.
+BRAINZMASH_DISCLOSURE_VERSION = "brainzmash-v1"
+MusicBrainzSourceMode = Literal["official", "mirror", "community", "brainzmash"]
 
 
-def is_official_musicbrainz(url: str) -> bool:
-    from urllib.parse import urlparse
+# P2 full-mirror tier (owner decision 2026-08-24): non-official endpoints are
+# user-owned or deliberately chosen infrastructure, so throughput there is a
+# user decision within these widened bounds. rate_limit == 0 is the "Unlimited"
+# sentinel: valid OFF-OFFICIAL ONLY - it bypasses the client-side limiter for
+# that host entirely. The official ceilings below are never raised.
+_MAX_MB_RATE_LIMIT = 500.0
+_MAX_MB_CONCURRENT_SEARCHES = 64
 
-    try:
-        parsed = urlparse(url.strip().rstrip("/"))
-        hostname = (parsed.hostname or "").lower()
-        return hostname in ("musicbrainz.org", "www.musicbrainz.org")
-    except (ValueError, AttributeError):
-        return False
+
+def is_musicbrainz_rate_policy_public_host(url: str) -> bool:
+    from repositories.musicbrainz_base import is_mb_rate_policy_public_host
+
+    return is_mb_rate_policy_public_host(url)
+
+
+class BrainzMashPendingProposal(AppStruct):
+    endpoint: str = BRAINZMASH_ENDPOINT
+    access_revision: str = ""
+    source_id: str = ""
+    generation: int = 0
+    disclosure_version: str = BRAINZMASH_DISCLOSURE_VERSION
+    consented: bool = False
+    verified: bool = False
+
+
+class BrainzMashActiveBinding(AppStruct):
+    endpoint: str = BRAINZMASH_ENDPOINT
+    access_revision: str = ""
+    source_id: str = ""
+    generation: int = 0
+    disclosure_version: str = BRAINZMASH_DISCLOSURE_VERSION
+    consented: bool = False
+    verified: bool = False
+
+
+class MusicBrainzBindingRequest(AppStruct):
+    access_revision: str
+    source_id: str
+    generation: int
+    disclosure_version: str
+
+
+class MusicBrainzSettingsUpdate(AppStruct):
+    source_mode: MusicBrainzSourceMode = "official"
+    api_url: str | None = None
+    rate_limit: float = 1.0
+    concurrent_searches: int = 6
+    community_acknowledged: bool | None = False
+
+    def __post_init__(self) -> None:
+        if self.source_mode in {"mirror", "community"} and not self.api_url:
+            raise msgspec.ValidationError(
+                "api_url is required for mirror and community sources"
+            )
+        if self.source_mode == "official":
+            from repositories.musicbrainz_base import OFFICIAL_MB_API_BASE
+
+            self.api_url = OFFICIAL_MB_API_BASE
+        elif self.api_url is not None:
+            self.api_url = self.api_url.strip().rstrip("/")
+            if self.source_mode in {
+                "mirror",
+                "community",
+            } and not self.api_url.startswith(("http://", "https://")):
+                raise msgspec.ValidationError(
+                    "api_url must be an absolute HTTP(S) URL for non-official sources"
+                )
+        if not math.isfinite(self.rate_limit):
+            raise msgspec.ValidationError("rate_limit must be finite")
+        if self.concurrent_searches < 1:
+            raise msgspec.ValidationError("concurrent_searches must be at least 1")
 
 
 class SecuritySettings(AppStruct):
@@ -676,28 +1006,120 @@ class SecuritySettings(AppStruct):
     hsts_include_subdomains: bool = False
     hsts_preload: bool = False
 
+    # Who may download library files (album zips + single tracks).
+    # "trusted" admits trusted AND admin roles (curator semantics).
+    library_download_access: Literal["everyone", "trusted", "admin"] = "everyone"
+
 
 class MusicBrainzConnectionSettings(AppStruct):
+    source_mode: MusicBrainzSourceMode = "official"
     api_url: str = "https://musicbrainz.org/ws/2"
     rate_limit: float = 1.0
     concurrent_searches: int = 6
+    community_acknowledged: bool = False
+    selected_source_mode: MusicBrainzSourceMode = "official"
+    source_id: str = ""
+    generation: int = 0
+    pending_brainzmash: BrainzMashPendingProposal | None = None
+    active_brainzmash: BrainzMashActiveBinding | None = None
+    source_quarantined: bool = False
+    quarantine_reason: str = ""
+    # Surfaced on the save/settings response: True when the official-host clamp
+    # had to force entered values down (or lift a sentinel 0 up) to the official
+    # limits. The frontend renders this as "values were clamped to official
+    # limits" - never a refusal, always applied.
+    clamped_to_official_limits: bool = False
 
     def __post_init__(self) -> None:
+        from repositories.musicbrainz_base import OFFICIAL_MB_API_BASE
+
+        if self.source_mode not in {
+            "official",
+            "mirror",
+            "community",
+            "brainzmash",
+        }:
+            raise msgspec.ValidationError("invalid MusicBrainz source_mode")
+        if self.selected_source_mode not in {
+            "official",
+            "mirror",
+            "community",
+            "brainzmash",
+        }:
+            raise msgspec.ValidationError("invalid selected MusicBrainz source_mode")
         self.api_url = self.api_url.strip()
-        if not self.api_url or not self.api_url.startswith(("http://", "https://")):
-            self.api_url = "https://musicbrainz.org/ws/2"
+        if self.source_mode == "official":
+            self.api_url = OFFICIAL_MB_API_BASE
+        elif self.source_mode == "brainzmash":
+            self.api_url = BRAINZMASH_ENDPOINT.rstrip("/")
+        elif not self.api_url or not self.api_url.startswith(("http://", "https://")):
+            raise msgspec.ValidationError(
+                "api_url must be an absolute HTTP(S) URL for non-official sources"
+            )
         self.api_url = self.api_url.rstrip("/")
-        if is_official_musicbrainz(self.api_url):
+        self.clamped_to_official_limits = False
+        if not math.isfinite(self.rate_limit):
+            raise msgspec.ValidationError("rate_limit must be finite")
+        if self.concurrent_searches < 1:
+            raise msgspec.ValidationError("concurrent_searches must be at least 1")
+        if self.source_mode == "brainzmash":
+            self.rate_limit = _BRAINZMASH_RATE_LIMIT
+            self.concurrent_searches = _BRAINZMASH_CONCURRENT_SEARCHES
+        if is_musicbrainz_rate_policy_public_host(self.api_url):
+            before = (self.rate_limit, self.concurrent_searches)
             self.rate_limit = min(self.rate_limit, _OFFICIAL_MB_RATE_LIMIT)
             self.concurrent_searches = min(
                 self.concurrent_searches, _OFFICIAL_MB_CONCURRENT_SEARCHES
             )
-        if self.rate_limit < 0.1 or self.rate_limit > 50.0:
-            raise msgspec.ValidationError("rate_limit must be between 0.1 and 50.0")
-        if self.concurrent_searches < 1 or self.concurrent_searches > 30:
-            raise msgspec.ValidationError(
-                "concurrent_searches must be between 1 and 30"
+            # The Unlimited sentinel is off-official only: on the official host
+            # a 0 lifts to the official rate instead of disabling the limiter.
+            if self.rate_limit <= 0:
+                self.rate_limit = _OFFICIAL_MB_RATE_LIMIT
+            self.clamped_to_official_limits = before != (
+                self.rate_limit,
+                self.concurrent_searches,
             )
+            return
+
+        if (
+            self.rate_limit < 0
+            or (0 < self.rate_limit < 0.1)
+            or (self.rate_limit > _MAX_MB_RATE_LIMIT)
+        ):
+            raise msgspec.ValidationError(
+                "rate_limit must be 0 (unlimited) or between 0.1 and "
+                f"{_MAX_MB_RATE_LIMIT}"
+            )
+        if (
+            self.concurrent_searches < 1
+            or self.concurrent_searches > _MAX_MB_CONCURRENT_SEARCHES
+        ):
+            raise msgspec.ValidationError(
+                f"concurrent_searches must be between 1 and {_MAX_MB_CONCURRENT_SEARCHES}"
+            )
+
+
+def is_brainzmash_active_binding_valid(
+    settings: MusicBrainzConnectionSettings,
+) -> bool:
+    """Return whether the pinned built-in BrainzMash source may serve traffic.
+
+    BrainzMash is the built-in source, so an interactive disclosure/verification
+    binding is optional rather than a prerequisite for the default. The source
+    identity and canonical endpoint checks still fence caches and transport to
+    the approved origin.
+    """
+
+    def exact_nonblank(value: str) -> bool:
+        return bool(value) and value == value.strip()
+
+    return bool(
+        not settings.source_quarantined
+        and settings.source_mode == "brainzmash"
+        and settings.api_url == BRAINZMASH_ENDPOINT.rstrip("/")
+        and settings.generation > 0
+        and exact_nonblank(settings.source_id)
+    )
 
 
 class ConnectAppsSettings(AppStruct):
@@ -706,6 +1128,10 @@ class ConnectAppsSettings(AppStruct):
 
     subsonic_enabled: bool = False
     jellyfin_enabled: bool = False
+    # Capability negotiation for clients that must distinguish the historical
+    # exact-track endpoint (which bypassed approval) from the approval-safe
+    # implementation. Older servers omit this field, so clients fail closed.
+    exact_track_approval_supported: bool = True
     transcoding_enabled: bool = True
     transcode_default_format: Literal["mp3", "opus"] = "mp3"
     transcode_max_bitrate_kbps: int = 320

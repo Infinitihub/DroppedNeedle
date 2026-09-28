@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 	import SearchArtistCard from '$lib/components/SearchArtistCard.svelte';
 	import ViewMoreAlbumCard from '$lib/components/ViewMoreAlbumCard.svelte';
@@ -16,7 +17,9 @@
 		applyAlbumEnrichment
 	} from '$lib/utils/enrichment';
 	import { createSearchEnrichmentBatcher } from '$lib/utils/searchEnrichmentBatcher';
+	import { getSearchStatusNotice } from '$lib/utils/searchStatus';
 	import {
+		REMOTE_ARTIST_PAGE_SIZE,
 		getLocalAlbumSearchQuery,
 		getLocalArtistSearchQuery,
 		getRemoteAlbumSearchQuery,
@@ -44,9 +47,17 @@
 	const artistQuery = getRemoteArtistSearchQuery(() => normalizedQuery);
 	const albumQuery = getRemoteAlbumSearchQuery(() => normalizedQuery);
 
-	let baseArtists = $derived(
-		mergeSearchArtists(localArtistQuery.data?.items ?? [], artistQuery.data?.results ?? [])
+	let remoteArtists = $derived(
+		(() => {
+			const results = (artistQuery.data?.results ?? []).slice(0, REMOTE_ARTIST_PAGE_SIZE);
+			const top = artistQuery.data?.top_result;
+			if (top && !results.some((artist) => artist.musicbrainz_id === top.musicbrainz_id)) {
+				return [top, ...results.slice(0, REMOTE_ARTIST_PAGE_SIZE - 1)];
+			}
+			return results;
+		})()
 	);
+	let baseArtists = $derived(mergeSearchArtists(localArtistQuery.data?.items ?? [], remoteArtists));
 	let baseAlbums = $derived(
 		mergeSearchAlbums(localAlbumQuery.data?.items ?? [], albumQuery.data?.results ?? [])
 	);
@@ -67,6 +78,8 @@
 	let albumStatus: SearchRemoteStatus = $derived(
 		albumQuery.isError ? 'error' : (albumQuery.data?.status ?? 'ok')
 	);
+	let artistNotice = $derived(getSearchStatusNotice(artistStatus, 'artists'));
+	let albumNotice = $derived(getSearchStatusNotice(albumStatus, 'albums'));
 	let loadingArtists = $derived(
 		(artistQuery.isPending || localArtistQuery.isPending) && artists.length === 0
 	);
@@ -94,8 +107,8 @@
 	);
 
 	function navigateToBucket(bucket: 'artists' | 'albums') {
-		if (data.query) {
-			goto(`/search/${bucket}?q=${encodeURIComponent(data.query)}`);
+		if (normalizedQuery) {
+			goto(withBasePath(`/search/${bucket}?q=${encodeURIComponent(normalizedQuery)}`));
 		}
 	}
 
@@ -139,12 +152,6 @@
 	onDestroy(() => {
 		enrichmentBatcher.dispose();
 	});
-
-	function statusMessage(status: SearchRemoteStatus, bucket: 'artists' | 'albums'): string {
-		if (status === 'timeout') return `MusicBrainz ${bucket} took too long to respond.`;
-		if (status === 'partial') return `Some MusicBrainz ${bucket} could not be loaded.`;
-		return `MusicBrainz ${bucket} are temporarily unavailable.`;
-	}
 </script>
 
 {#if hasSearched || isSearching}
@@ -199,11 +206,9 @@
 
 		<div>
 			<h2 class="text-xl font-bold mb-4">Artists</h2>
-			{#if artistStatus !== 'ok'}
-				<div class="alert alert-warning mb-3" role="status">
-					<span
-						>{statusMessage(artistStatus, 'artists')} Local and cached results remain available.</span
-					>
+			{#if artistNotice}
+				<div class="alert {artistNotice.className} mb-3" role="status">
+					<span>{artistNotice.message}</span>
 					<button class="btn btn-sm" onclick={() => artistQuery.refetch()}>
 						<RefreshCw class="h-4 w-4" /> Retry
 					</button>
@@ -249,18 +254,16 @@
 				<h2 class="text-xl font-bold">Albums</h2>
 				{#if displayedAlbums.length > 0}
 					<a
-						href={`/search/albums?q=${encodeURIComponent(data.query)}`}
+						href={`/search/albums?q=${encodeURIComponent(normalizedQuery)}`}
 						class="text-sm text-primary hover:underline"
 					>
 						View more <ArrowRight class="h-4 w-4 inline align-middle" />
 					</a>
 				{/if}
 			</div>
-			{#if albumStatus !== 'ok'}
-				<div class="alert alert-warning mb-3" role="status">
-					<span
-						>{statusMessage(albumStatus, 'albums')} Local and cached results remain available.</span
-					>
+			{#if albumNotice}
+				<div class="alert {albumNotice.className} mb-3" role="status">
+					<span>{albumNotice.message}</span>
 					<button class="btn btn-sm" onclick={() => albumQuery.refetch()}>
 						<RefreshCw class="h-4 w-4" /> Retry
 					</button>

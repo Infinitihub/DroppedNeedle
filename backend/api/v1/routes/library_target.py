@@ -2,10 +2,15 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+import msgspec.structs
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
+from starlette.datastructures import URL
 
+from api.v1.schemas.album import EditionPinBody, EditionPinResponse
 from api.v1.schemas.library_target import (
+    MarkAlbumFullRequest,
+    TargetNativeAlbum,
     TargetNativeAlbumDetail,
     TargetNativeAlbumsResponse,
     TargetNativeAlbumStatusResponse,
@@ -38,9 +43,10 @@ from api.v1.schemas.library import (
     TrackResolveRequest,
     TrackResolveResponse,
 )
-from api.v1.schemas.library_scan_target import LegacyScanShimResponse
+from api.v1.schemas.library_scan_target import ScanRunRequestedResponse
 from core.exceptions import ResourceNotFoundError, ValidationError
 from core.dependencies.type_aliases import (
+    AlbumServiceDep,
     LibraryPolicyResolverDep,
     PreferencesServiceDep,
     RequestHistoryStoreDep,
@@ -78,6 +84,16 @@ def _has_complete_album_coverage(coverage) -> bool:  # noqa: ANN001
         and coverage.supported
         and not coverage.missing_expected_tracks
     )
+
+
+def _path_relative_location(target: URL) -> str:
+    """Keep redirects same-origin without trusting request URL metadata.
+
+    ``request.url_for`` includes the ASGI root path; retain only its path and
+    query to preserve deployment prefixes without reflecting Host or scheme.
+    """
+    path = "/" + target.path.lstrip("/")
+    return f"{path}?{target.query}" if target.query else path
 
 
 @router.get("/albums/{album_id}/artwork/cached")
@@ -167,6 +183,16 @@ async def get_target_albums(
     return TargetNativeAlbumsResponse(items=items, total=total)
 
 
+@router.put("/albums/{album_id}/full", response_model=TargetNativeAlbum)
+async def set_target_album_marked_full(
+    album_id: str,
+    _user: CurrentUserDep,
+    service: TargetNativeLibraryServiceDep,
+    body: MarkAlbumFullRequest = MsgSpecBody(MarkAlbumFullRequest),
+) -> TargetNativeAlbum:
+    return await service.set_marked_full(album_id, body.marked_full)
+
+
 @router.get("/full-albums", response_model=TargetNativeAlbumsResponse)
 async def get_target_full_albums(
     _user: CurrentUserDep,
@@ -199,6 +225,8 @@ async def get_target_full_albums(
             break
 
         async def is_full(album) -> bool:  # noqa: ANN001
+            if album.marked_full:
+                return True
             async with semaphore:
                 try:
                     coverage = await coverage_service.get_coverage(
@@ -267,7 +295,8 @@ async def get_target_provider_ids(
     request_history: RequestHistoryStoreDep,
 ) -> LibraryMbidsResponse:
     provider_ids, requested_ids = await asyncio.gather(
-        service.provider_ids(), request_history.async_get_requested_mbids()
+        service.provider_ids(),
+        request_history.async_get_requested_mbids(request_kind="album"),
     )
     return LibraryMbidsResponse(
         mbids=provider_ids.musicbrainz_release_group_ids,
@@ -322,7 +351,9 @@ async def get_target_artist(
     canonical = await service.canonical_id("artist", artist_id)
     if canonical is not None and canonical != artist_id:
         return RedirectResponse(
-            request.url_for("target_artist_detail", artist_id=canonical),
+            _path_relative_location(
+                request.url_for("target_artist_detail", artist_id=canonical)
+            ),
             status_code=308,
         )
     artist = await service.artist(artist_id)
@@ -345,7 +376,9 @@ async def get_target_artist_albums(
     canonical = await service.canonical_id("artist", artist_id)
     if canonical is not None and canonical != artist_id:
         return RedirectResponse(
-            request.url_for("target_artist_albums", artist_id=canonical),
+            _path_relative_location(
+                request.url_for("target_artist_albums", artist_id=canonical)
+            ),
             status_code=308,
         )
     items = await service.artist_albums(artist_id)
@@ -371,7 +404,7 @@ async def get_target_artist_appearances(
             "target_artist_appearances", artist_id=canonical
         ).include_query_params(limit=limit, offset=offset)
         return RedirectResponse(
-            target,
+            _path_relative_location(target),
             status_code=308,
         )
     items, total, total_tracks = await service.artist_appearances(
@@ -396,17 +429,23 @@ async def get_target_album(
     album_id: str,
     _user: CurrentUserDep,
     service: TargetNativeLibraryServiceDep,
+    preferences: PreferencesServiceDep,
 ) -> TargetNativeAlbumDetail | RedirectResponse:
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
         return RedirectResponse(
-            request.url_for("target_album_detail", album_id=canonical),
+            _path_relative_location(
+                request.url_for("target_album_detail", album_id=canonical)
+            ),
             status_code=308,
         )
     album = await service.album_detail(album_id)
     if album is None:
         raise ResourceNotFoundError("Library album not found.")
-    return album
+    return msgspec.structs.replace(
+        album,
+        download_allowed=preferences.is_library_download_allowed(_user.role),
+    )
 
 
 @router.post(
@@ -605,6 +644,57 @@ async def get_target_album_copies(
     return TargetNativeAlbumsResponse(items=items, total=len(items))
 
 
+@router.get("/albums/{local_album_id}/edition", response_model=EditionPinResponse)
+async def get_local_album_edition_pin(
+    local_album_id: str,
+    _user: CurrentUserDep,
+    album_service: AlbumServiceDep,
+) -> EditionPinResponse:
+    """Read one local copy's edition pin (viewer-open, direct local-id path)."""
+    try:
+        pinned = await album_service.get_edition_pin_for_local_album(local_album_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
+        )
+    return EditionPinResponse(pinned_release_mbid=pinned)
+
+
+@router.put("/albums/{local_album_id}/edition", response_model=EditionPinResponse)
+async def set_local_album_edition_pin(
+    local_album_id: str,
+    curator: CurrentCuratorDep,
+    album_service: AlbumServiceDep,
+    body: EditionPinBody = MsgSpecBody(EditionPinBody),
+) -> EditionPinResponse:
+    """Pin one local copy's edition (curator-only, direct local-id path)."""
+    try:
+        await album_service.set_edition_pin_for_local_album(
+            local_album_id, body.release_mbid, curator.id
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
+        )
+    return EditionPinResponse(pinned_release_mbid=body.release_mbid)
+
+
+@router.delete("/albums/{local_album_id}/edition", response_model=EditionPinResponse)
+async def clear_local_album_edition_pin(
+    local_album_id: str,
+    _curator: CurrentCuratorDep,
+    album_service: AlbumServiceDep,
+) -> EditionPinResponse:
+    """Clear one local copy's pin back to Automatic (curator-only)."""
+    try:
+        await album_service.clear_edition_pin_for_local_album(local_album_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid album request"
+        )
+    return EditionPinResponse(pinned_release_mbid=None)
+
+
 @router.post("/resolve-tracks", response_model=TrackResolveResponse)
 async def resolve_target_tracks(
     _user: CurrentUserDep,
@@ -628,7 +718,9 @@ async def get_target_album_tracks(
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
         return RedirectResponse(
-            request.url_for("target_album_tracks", album_id=canonical),
+            _path_relative_location(
+                request.url_for("target_album_tracks", album_id=canonical)
+            ),
             status_code=308,
         )
     items = await service.album_tracks(album_id)
@@ -652,7 +744,9 @@ async def get_target_album_status(
     canonical = await service.canonical_id("album", album_id)
     if canonical is not None and canonical != album_id:
         return RedirectResponse(
-            request.url_for("target_album_status", album_id=canonical),
+            _path_relative_location(
+                request.url_for("target_album_status", album_id=canonical)
+            ),
             status_code=308,
         )
     policy = preferences.get_download_policy()
@@ -718,7 +812,7 @@ async def get_target_track_tags(
 
 @router.post(
     "/albums/{album_id}/rescan",
-    response_model=LegacyScanShimResponse,
+    response_model=ScanRunRequestedResponse,
     status_code=202,
 )
 async def rescan_target_album(
@@ -727,7 +821,7 @@ async def rescan_target_album(
     service: TargetNativeLibraryServiceDep,
     coordinator: TargetLibraryScanCoordinatorDep,
     resolver: LibraryPolicyResolverDep,
-) -> LegacyScanShimResponse:
+) -> ScanRunRequestedResponse:
     scopes = await service.album_rescan_scopes(album_id, resolver)
     if not scopes:
         raise ResourceNotFoundError("Library album not found.")
@@ -740,8 +834,11 @@ async def rescan_target_album(
             policy_revision=resolver.policy_revision,
         )
     )
-    return LegacyScanShimResponse(
-        status=result.disposition,
-        message="Album file rescan requested.",
+    return ScanRunRequestedResponse(
         run_id=result.run_id,
+        disposition=result.disposition,
+        state=result.state,
+        row_revision=result.row_revision,
+        queued_reason=result.queued_reason,
+        conflicting_kind=result.conflicting_kind,
     )

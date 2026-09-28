@@ -91,20 +91,9 @@ export interface GenreManagementSettings {
 }
 
 export type ArtworkProvider =
-	| 'cover_art_archive_release'
-	| 'cover_art_archive_release_group'
-	| 'local_files'
-	| 'embedded';
+	'cover_art_archive_release' | 'cover_art_archive_release_group' | 'local_files' | 'embedded';
 export type ArtworkImageType =
-	| 'front'
-	| 'back'
-	| 'booklet'
-	| 'medium'
-	| 'tray'
-	| 'obi'
-	| 'spine'
-	| 'track'
-	| 'other';
+	'front' | 'back' | 'booklet' | 'medium' | 'tray' | 'obi' | 'spine' | 'track' | 'other';
 
 export interface ArtworkManagementSettings {
 	embedded_enabled: boolean;
@@ -191,6 +180,9 @@ export interface LibraryManagementProfile {
 	organization: OrganizationManagementSettings;
 	file_behavior: FileBehaviorSettings;
 	enrichment: EnrichmentManagementSettings;
+	identity: {
+		automatic_edition_acceptance_enabled: boolean;
+	};
 	notification: {
 		refresh_external_servers: boolean;
 	};
@@ -218,6 +210,7 @@ export interface LibraryManagementRootOverrides {
 	naming_script_id: string | null;
 	multi_disc_naming_mode: 'inherit' | 'standard' | 'script';
 	multi_disc_naming_script_id: string | null;
+	automatic_edition_acceptance_enabled: boolean | null;
 }
 
 export interface LibraryManagementRootAssignment {
@@ -361,6 +354,7 @@ export interface LibraryManagementPreviewSummary {
 	reasons: Record<string, number>;
 	roots: Record<string, number>;
 	formats: Record<string, number>;
+	deferred_sources: Record<string, number>;
 	metadata_snapshot_ids: string[];
 }
 
@@ -386,6 +380,8 @@ export interface LibraryManagementPreviewDetailResponse {
 	expired: boolean;
 	stale: boolean;
 	stale_reasons: string[];
+	stale_input_count: number;
+	stale_sample_relative_paths: string[];
 	ready_for_confirmation: boolean;
 	operation_row_revision: number;
 	operation_event_revision: number;
@@ -450,6 +446,12 @@ export interface LibraryManagementActivationProof {
 	root_id: string;
 	job_id: string;
 	preview_token: string;
+}
+
+export interface LibraryManagementActivationHealthResponse {
+	stale_root_ids: string[];
+	blocked_root_ids: string[];
+	blocked_reason: string | null;
 }
 
 export interface LibraryManagementSettingsUpdateRequest {
@@ -563,6 +565,13 @@ export interface LibraryManagementApplyRequest {
 	confirmation?: boolean;
 }
 
+export interface LibraryManagementPreviewReissueResponse {
+	job_id: string;
+	preview_token: string;
+	created_at: number;
+	expires_at: number;
+}
+
 export interface LibraryManagementDiscardRequest {
 	expected_operation_row_revision: number;
 }
@@ -643,6 +652,10 @@ export interface LibraryManagementOperationHistoryItem {
 	target_root_id: string | null;
 	activation_preview: boolean;
 	selection: Record<string, unknown>;
+	eligible_count: number;
+	warning_count: number;
+	blocked_count: number;
+	expires_at: number | null;
 }
 
 export interface LibraryManagementOperationHistoryResponse {
@@ -657,6 +670,18 @@ export interface LibraryManagementRecoveryDiagnosticsResponse {
 	cleanup_pending_count: number;
 	oldest_updated_at: number | null;
 	state_counts: Record<string, number>;
+	needs_attention_bundles?: LibraryManagementNeedsAttentionBundle[];
+}
+
+export interface LibraryManagementNeedsAttentionBundle {
+	bundle_id: string;
+}
+
+export interface LibraryManagementImportBundleResolveResponse {
+	bundle_id: string;
+	state: string;
+	verified_files: number;
+	total_files: number;
 }
 
 export interface LibraryManagementHistoryParams {

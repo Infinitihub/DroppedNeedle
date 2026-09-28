@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { ChevronLeft, Disc3, ExternalLink, FileSearch, FileUp, Mic2 } from 'lucide-svelte';
+	import { ChevronLeft, Disc3, ExternalLink, FileSearch, FileUp, MicVocal } from 'lucide-svelte';
 	import ArtistImage from '$lib/components/ArtistImage.svelte';
 	import LibraryAlbumCard from '$lib/components/library/LibraryAlbumCard.svelte';
 	import ArtistAppearancesSection from '$lib/components/library/ArtistAppearancesSection.svelte';
@@ -13,6 +13,7 @@
 		getLibraryArtistDetailQuery
 	} from '$lib/queries/library/LibraryQueries.svelte';
 	import { createLibraryContributionMutation } from '$lib/queries/libraryContributions/LibraryContributionMutations.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 
 	interface Props {
 		artistId: string;
@@ -30,7 +31,7 @@
 
 	function openContribution(album: LibraryAlbumSummary): void {
 		if (album.contribution_id) {
-			void goto(`/library/contributions/${album.contribution_id}`);
+			void goto(withBasePath(`/library/contributions/${album.contribution_id}`));
 			return;
 		}
 		contributionMutation.mutate(album.id);
@@ -48,7 +49,9 @@
 <svelte:head><title>{artist?.name ?? 'Artist'} · Library</title></svelte:head>
 
 <main class="container mx-auto p-4 md:p-6 lg:p-8">
-	<button class="btn btn-ghost btn-sm mb-5 gap-2" onclick={() => goto('/library/artists')}
+	<button
+		class="btn btn-ghost btn-sm mb-5 gap-2"
+		onclick={() => goto(withBasePath('/library/artists'))}
 		><ChevronLeft class="h-4 w-4" /> Artists</button
 	>
 	{#if artistQuery.isLoading}
@@ -92,7 +95,7 @@
 					{/if}
 					{#if artist.appearance_track_count > 0}
 						<span class="inline-flex items-center gap-1.5 text-accent">
-							<Mic2 class="h-3.5 w-3.5" />
+							<MicVocal class="h-3.5 w-3.5" />
 							Appears on {artist.appearance_track_count}
 							{artist.appearance_track_count === 1 ? 'local track' : 'local tracks'}
 						</span>
@@ -141,7 +144,7 @@
 							class="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-5"
 						>
 							<div class="min-w-0">
-								<a class="font-semibold hover:underline" href={`/album/${album.id}`}
+								<a class="font-semibold hover:underline" href={withBasePath(`/album/${album.id}`)}
 									>{album.title}</a
 								>
 								<p class="mt-0.5 text-xs text-base-content/55">

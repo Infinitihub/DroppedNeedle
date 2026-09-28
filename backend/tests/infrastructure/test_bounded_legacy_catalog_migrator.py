@@ -1129,3 +1129,210 @@ async def test_bounded_migration_chunks_tracks_within_one_review_album(
         3,
     )
     assert await store.row_count("local_tracks") == 5
+
+
+@pytest.mark.asyncio
+async def test_double_migration_converges_catalog_exactly(tmp_path: Path) -> None:
+    """Two full migrate() runs over one seeded mixed legacy database converge:
+    the second run takes the completed-report short-circuit, does no phase
+    work, and leaves every counted table identical to the first run."""
+    root = tmp_path / "Music"
+    compilation = root / "Compilation"
+    compilation.mkdir(parents=True)
+    (compilation / "01.flac").write_bytes(b"a" * 100)
+    (compilation / "02.flac").write_bytes(b"b" * 200)
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    with sqlite3.connect(database) as connection:
+        _insert_legacy_library_file(
+            connection,
+            file_id="99999999-9999-4999-8999-000000000010",
+            path=root / "Local Only" / "01.flac",
+            title="Local Only Song",
+            track_number=1,
+            release_group_mbid=None,
+        )
+
+    def snapshot() -> dict[str, int]:
+        tables = (
+            "local_albums",
+            "local_tracks",
+            "local_album_aliases",
+            "local_artist_aliases",
+            "library_migration_provenance",
+            "library_user_favorites",
+            "library_play_history",
+            "library_playlist_tracks",
+            "library_identification_reviews",
+        )
+        with sqlite3.connect(database) as connection:
+            return {
+                table: int(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
+                for table in tables
+            }
+
+    first_store, first_migrator = _migrator(database, root, [])
+    first = await first_migrator.migrate("double-run", now=100)
+    assert first.report.state == "applied"
+    after_first = snapshot()
+    assert after_first["local_tracks"] > 0
+    assert after_first["library_migration_provenance"] > 0
+
+    second_progress: list[str] = []
+    _, second_migrator = _migrator(database, root, second_progress)
+    second = await second_migrator.migrate("double-run", now=200)
+
+    # Completed-report short-circuit: no phase work, zero blockers/skips.
+    assert second.report == first.report
+    assert second.blocker_count == 0
+    assert second.skipped_counts == {}
+    assert second.phase_timings_ms == {}
+    assert not any(
+        "Checking catalog compatibility" in item for item in second_progress
+    )
+    assert snapshot() == after_first
+
+
+@pytest.mark.asyncio
+async def test_first_run_skips_legacy_file_already_in_catalog(
+    tmp_path: Path,
+) -> None:
+    """GH-380: first-run migrate() must skip legacy rows already owned."""
+    root = tmp_path / "Music"
+    root.mkdir()
+    database = tmp_path / "library.db"
+    _create_source(database, root)
+    owned_path = root / "Local Owned" / "01.flac"
+    store = NativeLibraryStore(database, threading.Lock())
+    resolver = LibraryPolicyResolver(
+        TypedLibrarySettings(
+            library_roots=[
+                LibraryRootSettings(
+                    id="root-1",
+                    path=str(root),
+                    label="Music",
+                    policy="automatic",
+                )
+            ]
+        )
+    )
+    with sqlite3.connect(database) as connection:
+        _insert_legacy_library_file(
+            connection,
+            file_id="local-owned-1",
+            path=owned_path,
+            title="Owned Song",
+            track_number=1,
+            release_group_mbid=None,
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO local_artists (id, display_name, folded_name, "
+            "kind, created_at, updated_at) VALUES "
+            "('pre-existing-artist', 'Artist', 'artist', 'group', 1, 1)"
+        )
+        connection.execute(
+            "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+            "title_folded, album_artist_id, grouping_source, created_at, "
+            "updated_at) VALUES ('pre-existing-album', 'root-1', "
+            "'fk-pre-existing', 'Owned', 'owned', 'pre-existing-artist', "
+            "'automatic', 1, 1)"
+        )
+        connection.execute(
+            "INSERT INTO local_tracks (id, local_album_id, root_id, file_path, "
+            "relative_path, path_hash, file_size_bytes, file_mtime_ns, "
+            "stat_revision, title, title_folded, album_title, "
+            "album_title_folded, availability, ingest_source, imported_at, "
+            "membership_source, applied_policy, file_format) VALUES "
+            "('pre-existing-track', 'pre-existing-album', 'root-1', ?, ?, "
+            "'hash-owned', 100, 200, 'stat', 'Owned Song', 'owned song', "
+            "'Owned', 'owned', 'indexed', 'download', 1, 'automatic', "
+            "'automatic', 'flac')",
+            (str(owned_path), "Local Owned/01.flac"),
+        )
+    migrator = BoundedLegacyCatalogMigrator(
+        store,
+        resolver,
+        emit_progress=lambda _message: None,
+        batch_size=1,
+        skip_unmappable_paths=True,
+    )
+    outcome = await migrator.migrate("bounded-first-run-owned", now=100)
+    assert outcome.report.state == "applied"
+    assert outcome.skipped_counts.get("scan_owned_library_file", 0) == 1
+    assert "local-owned-1" in migrator._scan_owned_file_ids
+    with sqlite3.connect(database) as connection:
+        collisions = connection.execute(
+            "SELECT COUNT(*) FROM local_tracks WHERE file_path = ?",
+            (str(owned_path),),
+        ).fetchone()[0]
+    assert collisions == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_owned_skip_fires_with_default_flags_on_both_paths(
+    tmp_path: Path,
+) -> None:
+    """GH-380: the preflight existing-paths skip is unconditional.
+
+    It must fire with default flags (no skip_unmappable_paths) on both the
+    migrate() and migrate_pending() entry paths without a UNIQUE collision.
+    """
+    for index, entry in enumerate(("migrate", "migrate_pending")):
+        run_dir = tmp_path / f"run-{index}"
+        run_dir.mkdir()
+        root = run_dir / "Music"
+        root.mkdir()
+        database = run_dir / "library.db"
+        _create_source(database, root)
+        # First store construction creates the native schema.
+        _migrator(database, root, [])
+        owned_path = root / "Local Owned" / "01.flac"
+        with sqlite3.connect(database) as connection:
+            _insert_legacy_library_file(
+                connection,
+                file_id="local-owned-1",
+                path=owned_path,
+                title="Owned Song",
+                track_number=1,
+                release_group_mbid=None,
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO local_artists (id, display_name, "
+                "folded_name, kind, created_at, updated_at) VALUES "
+                "('pre-existing-artist', 'Artist', 'artist', 'group', 1, 1)"
+            )
+            connection.execute(
+                "INSERT INTO local_albums (id, root_id, grouping_key, title, "
+                "title_folded, album_artist_id, grouping_source, created_at, "
+                "updated_at) VALUES ('pre-existing-album', 'root-1', "
+                "'fk-pre-existing', 'Owned', 'owned', 'pre-existing-artist', "
+                "'automatic', 1, 1)"
+            )
+            connection.execute(
+                "INSERT INTO local_tracks (id, local_album_id, root_id, "
+                "file_path, relative_path, path_hash, file_size_bytes, "
+                "file_mtime_ns, stat_revision, title, title_folded, "
+                "album_title, album_title_folded, availability, ingest_source, "
+                "imported_at, membership_source, applied_policy, file_format) "
+                "VALUES ('pre-existing-track', 'pre-existing-album', 'root-1', "
+                "?, ?, 'hash-owned', 100, 200, 'stat', 'Owned Song', "
+                "'owned song', 'Owned', 'owned', 'indexed', 'download', 1, "
+                "'automatic', 'automatic', 'flac')",
+                (str(owned_path), "Local Owned/01.flac"),
+            )
+        _, migrator = _migrator(database, root, [])
+        if entry == "migrate":
+            outcome = await migrator.migrate("owned-unconditional", now=100)
+        else:
+            outcome = await migrator.migrate_pending("owned-unconditional", now=100)
+        assert outcome.report.state == "applied"
+        assert outcome.skipped_counts.get("scan_owned_library_file", 0) == 1
+        assert "local-owned-1" in migrator._scan_owned_file_ids
+        with sqlite3.connect(database) as connection:
+            collisions = connection.execute(
+                "SELECT COUNT(*) FROM local_tracks WHERE file_path = ?",
+                (str(owned_path),),
+            ).fetchone()[0]
+        assert collisions == 1

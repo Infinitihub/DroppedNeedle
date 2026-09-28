@@ -14,9 +14,15 @@ const adminTabs = new Set([
 	'get-it',
 	'plugins',
 	'security',
+	'diagnostics',
 	'wrapped',
-	'users'
+	'users',
+	'musicbrainz'
 ]);
+
+export function isSettingsTabVisible(id: string, isAdmin: boolean): boolean {
+	return isAdmin || !adminTabs.has(id);
+}
 
 const settingsTabLoaders: Record<string, SettingsLoader> = {
 	library: () => import('./SettingsLibrary.svelte'),
@@ -40,6 +46,7 @@ const settingsTabLoaders: Record<string, SettingsLoader> = {
 	'music-source': () => import('./SettingsMusicSource.svelte'),
 	cache: () => import('./SettingsCache.svelte'),
 	musicbrainz: () => import('./SettingsMusicBrainz.svelte'),
+	diagnostics: () => import('./SettingsDiagnostics.svelte'),
 	users: () => import('./SettingsUsers.svelte'),
 	security: () => import('./SettingsSecurity.svelte'),
 	plugins: () => import('./SettingsPlugins.svelte'),
@@ -47,9 +54,8 @@ const settingsTabLoaders: Record<string, SettingsLoader> = {
 	advanced: () => import('./SettingsAdvanced.svelte'),
 	about: () => import('./SettingsAbout.svelte')
 };
-
 export async function loadSettingsTab(id: string, isAdmin: boolean): Promise<Component | null> {
-	if (!isAdmin && adminTabs.has(id)) return null;
+	if (!isSettingsTabVisible(id, isAdmin)) return null;
 	const loader = settingsTabLoaders[id];
 	return loader ? (await loader()).default : null;
 }

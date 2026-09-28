@@ -6,12 +6,11 @@ import time
 from pathlib import PurePosixPath
 
 from fastapi import APIRouter, Query
-from fastapi.responses import StreamingResponse
 
 from api.v1.schemas.library_scan_target import (
+    DeferredIdentificationJobSummary,
     IdentificationControlRequestBody,
     IdentificationControlResponse,
-    LegacyScanShimResponse,
     LibraryActivityItem,
     LibraryActivityResponse,
     ScanControlRequestBody,
@@ -25,12 +24,11 @@ from api.v1.schemas.library_scan_target import (
     ScanRunRequestBody,
     ScanRunRequestedResponse,
 )
-from api.v1.schemas.library import LibraryScanStatusResponse
 from core.dependencies import (
     LibraryAdministrativeWorkServiceDep,
+    LibraryPolicyReconciliationServiceDep,
     LibraryPolicyResolverDep,
     MbProviderAvailabilityDep,
-    NativeLibraryStoreDep,
     TargetIdentificationQueueDep,
     TargetLibraryScanCoordinatorDep,
 )
@@ -38,7 +36,6 @@ from core.exceptions import ValidationError
 from infrastructure.msgspec_fastapi import MsgSpecBody, MsgSpecRoute
 from middleware import CurrentAdminDep, CurrentUserDep
 from models.library_work import LibraryWorkItem, ScanRequest, ScanScope
-from services.native.library_activity_events import activity_events
 
 router = APIRouter(
     route_class=MsgSpecRoute, prefix="/library", tags=["library-scan-target"]
@@ -113,6 +110,15 @@ def _selected_scopes(
         scopes.append(candidate)
     return scopes
 
+
+IDENTIFICATION_DRAIN_WORK_ITEM_ID = "identification-drain"
+"""Synthetic work-item id for the post-scan identification drain.
+
+Never persisted: scan-run history/detail/failure lookups hit the scan-runs
+tables (get_scan_run raises ResourceNotFoundError for unknown ids), so the
+synthetic id 404s there instead of resolving. Only the activity work_items
+list ever carries it, flagged with synthetic=True.
+"""
 
 @router.get("/activity", response_model=LibraryActivityResponse)
 async def library_activity(
@@ -306,6 +312,10 @@ async def library_activity(
                 deferred_reason_counts=identification_snapshot[
                     "deferred_reason_counts"
                 ],
+                deferred_jobs=[
+                    DeferredIdentificationJobSummary(**row)
+                    for row in identification_snapshot.get("deferred_jobs", [])
+                ],
                 attention_count=identification_snapshot["attention_count"],
                 priority_band=(
                     _IDENTIFICATION_PRIORITY_LABELS.get(active_priority, "Queued work")
@@ -391,27 +401,49 @@ async def library_activity(
                         failure_at=identification_snapshot["failure_at"],
                     )
                 )
+    if not runs:
+        deferred = int(identification_snapshot["deferred_count"])
+        if waiting + deferred > 0:
+            drain_control_state = identification_snapshot["control_state"]
+            if drain_control_state == "paused" and counts.get("running", 0):
+                drain_state = "pausing"
+            elif drain_control_state == "paused":
+                drain_state = "paused"
+            elif counts.get("running", 0) or identification_snapshot["claimable_count"]:
+                drain_state = "running"
+            else:
+                drain_state = "idle"
+            work_items.append(
+                LibraryWorkItem(
+                    id=IDENTIFICATION_DRAIN_WORK_ITEM_ID,
+                    kind="identification",
+                    state=drain_state,
+                    phase="awaiting_identification",
+                    effect="catalog_only",
+                    processed=0,
+                    total=None,
+                    unit="albums",
+                    indeterminate=True,
+                    remaining_count=waiting,
+                    started_at=identification_snapshot["started_at"],
+                    updated_at=float(
+                        identification_snapshot["updated_at"]
+                        or identification_snapshot["failure_at"]
+                        or 0.0
+                    ),
+                    warning_count=deferred,
+                    failed_count=int(counts.get("failed", 0)),
+                    priority=90,
+                    synthetic=True,
+                    catalog_settled=False,
+                    pending_identification=waiting,
+                )
+            )
     if current_user.role == "admin":
         work_items.extend(await administrative_work.active())
     work_items.sort(key=lambda item: (item.priority, -item.updated_at, item.id))
     return LibraryActivityResponse(
         items=items, work_items=work_items, revisions=revisions
-    )
-
-
-@router.get("/activity/stream")
-async def library_activity_stream(
-    _: CurrentUserDep,
-    identification: TargetIdentificationQueueDep,
-):
-    return StreamingResponse(
-        activity_events(identification),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
     )
 
 
@@ -453,30 +485,35 @@ async def resume_identification(
     return await _identification_control_response(identification, revision)
 
 
-@router.get("/operations/stream")
-async def library_operations_stream(
-    _: CurrentAdminDep,
-    identification: TargetIdentificationQueueDep,
-):
-    return await library_activity_stream(_, identification)
-
-
 @router.post("/scan-runs", response_model=ScanRunRequestedResponse, status_code=202)
 async def request_scan_run(
     current_admin: CurrentAdminDep,
     coordinator: TargetLibraryScanCoordinatorDep,
     resolver: LibraryPolicyResolverDep,
+    reconciliation: LibraryPolicyReconciliationServiceDep,
     body: ScanRunRequestBody = MsgSpecBody(ScanRunRequestBody),
 ) -> ScanRunRequestedResponse:
-    result = await coordinator.request_run(
-        ScanRequest(
-            kind=body.kind,
-            trigger="manual",
-            scopes=_selected_scopes(body, resolver),
+    if body.kind == "policy_reconcile":
+        # F-TARGETCATALOG-02: a policy Apply must run the frozen pending
+        # transition scopes (removed roots, deleted rules, same-ID re-paths)
+        # through the reconciliation service instead of rebuilding scopes from
+        # current settings. The service owns the expected-revision gate and
+        # keeps trigger="policy_apply".
+        result = await reconciliation.apply(
+            body.scope_ids,
+            expected_policy_revision=body.expected_policy_revision,
             requested_by_user_id=current_admin.id,
-            policy_revision=resolver.policy_revision,
         )
-    )
+    else:
+        result = await coordinator.request_run(
+            ScanRequest(
+                kind=body.kind,
+                trigger="manual",
+                scopes=_selected_scopes(body, resolver),
+                requested_by_user_id=current_admin.id,
+                policy_revision=resolver.policy_revision,
+            )
+        )
     return ScanRunRequestedResponse(
         run_id=result.run_id,
         disposition=result.disposition,
@@ -545,12 +582,11 @@ async def scan_run_detail(
 async def scan_run_failures(
     run_id: str,
     _: CurrentAdminDep,
-    store: NativeLibraryStoreDep,
+    coordinator: TargetLibraryScanCoordinatorDep,
     limit: int = Query(default=50, ge=1, le=200),
     cursor: int | None = Query(default=None, ge=1),
 ) -> ScanRunFailuresResponse:
-    await store.get_scan_run(run_id)
-    items, next_cursor = await store.list_scan_run_failures(
+    items, next_cursor = await coordinator.scan_run_failures(
         run_id, limit=limit, cursor_rowid=cursor
     )
     return ScanRunFailuresResponse(
@@ -613,74 +649,3 @@ async def stop_scan_run(
     body: ScanControlRequestBody = MsgSpecBody(ScanControlRequestBody),
 ) -> ScanControlResponse:
     return await _control(run_id, "stop", body, coordinator)
-
-
-@router.post("/scan/start", response_model=LegacyScanShimResponse, status_code=202)
-async def legacy_start_scan_shim(
-    current_admin: CurrentAdminDep,
-    coordinator: TargetLibraryScanCoordinatorDep,
-    resolver: LibraryPolicyResolverDep,
-    force: bool = Query(default=False),
-) -> LegacyScanShimResponse:
-    if force:
-        raise ValidationError(
-            "Force rescan has been replaced. Use Rescan files or Retry identification."
-        )
-    result = await coordinator.request_run(
-        ScanRequest(
-            kind="incremental",
-            trigger="manual",
-            requested_by_user_id=current_admin.id,
-            policy_revision=resolver.policy_revision,
-            scopes=_selected_scopes(
-                ScanRunRequestBody(expected_policy_revision=resolver.policy_revision),
-                resolver,
-            ),
-        )
-    )
-    return LegacyScanShimResponse(
-        status=result.disposition,
-        message="Library update requested.",
-        run_id=result.run_id,
-    )
-
-
-@router.post("/scan/cancel", response_model=LegacyScanShimResponse)
-async def legacy_cancel_scan_shim(
-    _: CurrentAdminDep,
-    coordinator: TargetLibraryScanCoordinatorDep,
-) -> LegacyScanShimResponse:
-    runs = await coordinator.current()
-    active = next((run for run in runs if run.state != "queued"), None)
-    if active is None:
-        raise ValidationError("No library update is running.")
-    await coordinator.control(active.id, "stop", active.row_revision)
-    return LegacyScanShimResponse(
-        status="stopping",
-        message="Stopping the library update.",
-        run_id=active.id,
-    )
-
-
-@router.get("/scan/status", response_model=LibraryScanStatusResponse)
-async def legacy_scan_status_shim(
-    _: CurrentUserDep,
-    coordinator: TargetLibraryScanCoordinatorDep,
-) -> LibraryScanStatusResponse:
-    runs = await coordinator.current()
-    if not runs:
-        return LibraryScanStatusResponse()
-    run = runs[0]
-    snapshot = await coordinator.snapshot(run.id)
-    counters = snapshot.counters
-    total = counters.get("total_count") or counters.get("discovered_count", 0)
-    return LibraryScanStatusResponse(
-        status="scanning",
-        total_files=total,
-        processed_files=counters.get("inspected_count", 0),
-        matched_files=counters.get("indexed_count", 0)
-        + counters.get("unchanged_count", 0),
-        failed_files=counters.get("errored_count", 0),
-        started_at=run.started_at,
-        updated_at=run.updated_at,
-    )

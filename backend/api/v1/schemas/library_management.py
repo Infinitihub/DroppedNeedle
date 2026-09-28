@@ -69,6 +69,53 @@ MAX_GENRE_RULES = 500
 MAX_PRESERVE_FIELDS = 100
 MAX_MANAGEMENT_NAME_LENGTH = 120
 
+LEGACY_DEFAULT_SIDECAR_PATTERNS: list[str] = [
+    "cover.jpg",
+    "cover.jpeg",
+    "cover.png",
+    "cover.webp",
+    "folder.jpg",
+    "folder.jpeg",
+    "folder.png",
+    "front.jpg",
+    "front.png",
+    "*.cue",
+    "*.log",
+    "*.lrc",
+    "*.m3u",
+    "*.m3u8",
+    "*.pls",
+]
+DEFAULT_SIDECAR_PATTERNS: list[str] = [
+    "cover.jpg",
+    "cover.jpeg",
+    "cover.png",
+    "cover.webp",
+    "folder.jpg",
+    "folder.jpeg",
+    "folder.png",
+    "front.jpg",
+    "front.png",
+    "back.jpg",
+    "back.jpeg",
+    "back.png",
+    "back.webp",
+    "booklet*.jpg",
+    "booklet*.jpeg",
+    "booklet*.png",
+    "booklet*.webp",
+    "medium*.jpg",
+    "medium*.jpeg",
+    "medium*.png",
+    "medium*.webp",
+    "*.cue",
+    "*.log",
+    "*.lrc",
+    "*.m3u",
+    "*.m3u8",
+    "*.pls",
+]
+
 FieldMode = Literal["disabled", "replace", "fill_missing", "merge", "preserve"]
 GenreMode = Literal["replace", "merge", "fill_missing"]
 GenreSource = Literal["musicbrainz", "listenbrainz", "lastfm", "existing_local"]
@@ -352,23 +399,7 @@ class OrganizationManagementSettings(AppStruct):
     )
     move_sidecars: bool = True
     sidecar_patterns: list[str] = msgspec.field(
-        default_factory=lambda: [
-            "cover.jpg",
-            "cover.jpeg",
-            "cover.png",
-            "cover.webp",
-            "folder.jpg",
-            "folder.jpeg",
-            "folder.png",
-            "front.jpg",
-            "front.png",
-            "*.cue",
-            "*.log",
-            "*.lrc",
-            "*.m3u",
-            "*.m3u8",
-            "*.pls",
-        ]
+        default_factory=lambda: list(DEFAULT_SIDECAR_PATTERNS)
     )
     source_cleanup: SourceCleanupMode = "remove_after_confirmed_move"
     remove_empty_directories: bool = True
@@ -407,6 +438,11 @@ class EnrichmentManagementSettings(AppStruct):
         default_factory=ReplayGainManagementSettings
     )
 
+class IdentityManagementSettings(AppStruct):
+    """Catalog-identity policy (no file writes). D-EDITION-AUTO S-3."""
+
+    automatic_edition_acceptance_enabled: bool = False
+
 
 class ProfileNotificationSettings(AppStruct):
     refresh_droppedneedle: bool = True
@@ -437,6 +473,9 @@ class LibraryManagementProfile(AppStruct):
     )
     enrichment: EnrichmentManagementSettings = msgspec.field(
         default_factory=EnrichmentManagementSettings
+    )
+    identity: IdentityManagementSettings = msgspec.field(
+        default_factory=IdentityManagementSettings
     )
     notification: ProfileNotificationSettings = msgspec.field(
         default_factory=ProfileNotificationSettings
@@ -474,6 +513,7 @@ class LibraryManagementRootOverrides(AppStruct):
     naming_script_id: str | None = None
     multi_disc_naming_mode: Literal["inherit", "standard", "script"] = "inherit"
     multi_disc_naming_script_id: str | None = None
+    automatic_edition_acceptance_enabled: bool | None = None
 
 
 class LibraryManagementRootAssignment(AppStruct):
@@ -540,6 +580,25 @@ class LibraryManagementChangeImpact(AppStruct):
     reasons: list[str] = msgspec.field(default_factory=list)
 
 
+class LibraryManagementActivationHealthResponse(AppStruct):
+    """Dry-run activation health for active automatic roots.
+
+    A root is stale when its saved activation no longer matches the
+    current effective profile, naming policy, or library policy - for
+    example after a default migration rewrote the profile - and needs a
+    fresh dry run. A root is blocked when no dry run could help: either
+    the whole library policy is unresolvable (unknown root, unavailable
+    path, recycle-bin overlap), in which case every active root is
+    blocked and `blocked_reason` carries the policy error, or that one
+    root's effective profile fails to resolve (no reason is attached).
+    `blocked_reason` is only set alongside a non-empty `blocked_root_ids`.
+    """
+
+    stale_root_ids: list[str] = msgspec.field(default_factory=list)
+    blocked_root_ids: list[str] = msgspec.field(default_factory=list)
+    blocked_reason: str | None = None
+
+
 class LibraryManagementPresetDiff(AppStruct):
     profile_id: str
     preset_origin: str | None = None
@@ -588,6 +647,17 @@ def _remove_default_multi_disc_naming(profile: dict[str, object]) -> None:
         organization.pop("multi_disc_naming_script_id", None)
 
 
+def _remove_default_identity_section(profile: dict[str, object]) -> None:
+    # D-EDITION-AUTO S-3: the identity section is new; keep stored profile
+    # and settings revisions stable while it sits at its default (all-off).
+    identity = profile.get("identity")
+    if (
+        isinstance(identity, dict)
+        and identity.get("automatic_edition_acceptance_enabled") is False
+    ):
+        profile.pop("identity")
+
+
 def profile_revision(profile: LibraryManagementProfile) -> str:
     payload = msgspec.to_builtins(profile)
     if not isinstance(payload, dict):
@@ -595,6 +665,7 @@ def profile_revision(profile: LibraryManagementProfile) -> str:
     payload.pop("revision", None)
     _remove_default_lyrics_preservation(payload)
     _remove_default_multi_disc_naming(payload)
+    _remove_default_identity_section(payload)
     return _stable_hash(payload)
 
 
@@ -616,6 +687,7 @@ def settings_revision(settings: LibraryManagementSettings) -> str:
             if isinstance(profile, dict):
                 _remove_default_lyrics_preservation(profile)
                 _remove_default_multi_disc_naming(profile)
+                _remove_default_identity_section(profile)
     return _stable_hash(payload)
 
 
@@ -671,6 +743,7 @@ def _validate_naming_language(source: str, script_name: str) -> None:
         "album_artists",
         "album_artist_sorts",
         "albumartist",
+        "initial",
         "year",
         "track",
         "disc",
@@ -1378,6 +1451,13 @@ def migrate_library_management_presets(
     settings: LibraryManagementSettings,
 ) -> LibraryManagementSettings:
     """Ratchet inert built-in presets without adopting customized organization."""
+
+    # Issue #401: pre-fix stored defaults missed back/booklet/medium artwork.
+    # Runs first: pristine v1/v2/v3 profiles persist the legacy list, so the
+    # known-organization check below only matches after this swap.
+    for profile in settings.profiles:
+        if profile.organization.sidecar_patterns == LEGACY_DEFAULT_SIDECAR_PATTERNS:
+            profile.organization.sidecar_patterns = list(DEFAULT_SIDECAR_PATTERNS)
 
     picard_profile = next(
         (

@@ -167,7 +167,13 @@ async def test_upgrade_replaces_worse_file_at_different_path(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.failed == []
@@ -196,7 +202,13 @@ async def test_upgrade_never_replaces_equal_or_better(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.succeeded == [str(old)]  # dedup kept the existing copy
@@ -214,7 +226,13 @@ async def test_user_origin_import_never_replaces(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="user")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="user",
+        )
     )
 
     assert result.succeeded == [str(old)]
@@ -230,7 +248,13 @@ async def test_same_path_upgrade_recycles_before_publish(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.succeeded == [str(old)]
@@ -256,7 +280,13 @@ async def test_no_recycle_bin_disables_replacement(tmp_path: Path):
     shutil.copy(_FLAC, downloads / "01 Airbag.flac")
 
     result = await fp.process_downloaded(
-        _manifest(ExpectedFile(filename="01 Airbag.flac", size=1), origin="upgrade")
+        _manifest(
+            ExpectedFile(
+                filename="01 Airbag.flac",
+                size=(downloads / "01 Airbag.flac").stat().st_size,
+            ),
+            origin="upgrade",
+        )
     )
 
     assert result.succeeded == [str(old)]
@@ -383,7 +413,9 @@ async def test_place_held_file_worse_upgrade_keeps_existing(tmp_path: Path):
     assert target == old
     assert old.exists() and old.read_bytes() == b"OLD-BYTES"
     assert _bin_files(bin_path) == []
-    assert held_file.exists()  # duplicate evidence is not deletion authority
+    # F-INDEXREC-04 (DECISIONS-LIVE): the validated redundant no-op consumes the
+    # held source; deletion authority remains limited to this no-op success.
+    assert not held_file.exists()
 
 
 @pytest.mark.asyncio
@@ -410,3 +442,140 @@ async def test_place_held_file_uses_persisted_origin_when_task_is_gone(tmp_path:
     assert Path(target).exists()
     assert not old.exists()
     assert len(_bin_files(bin_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_place_held_file_same_path_non_upgrade_consumes_source(tmp_path: Path):
+    """F-INDEXREC-04: an occupied same-path target that is not an upgrade is a
+    validated redundant no-op - the destination stays byte-identical and the
+    held source is consumed.
+
+    Verified-attribution rule (#418): this success rests on the occupying file's
+    catalog row covering the held track; a bare occupant raises ConflictError and
+    keeps the held source instead."""
+    fp, manager, library, _downloads, bin_path = _make(tmp_path)
+    existing = await _seed_existing(
+        manager,
+        library / "Radiohead/OK Computer (1997)/0101 Airbag.flac",
+        file_format="flac",
+        bit_rate=900,
+    )
+    held_file = tmp_path / "held" / "src.flac"
+    held_file.parent.mkdir()
+    shutil.copy(_FLAC, held_file)
+
+    target = await fp.place_held_file(_held(held_file, task_id=None))
+
+    assert Path(target) == existing
+    assert existing.read_bytes() == b"OLD-BYTES"
+    assert not held_file.exists()
+    assert _bin_files(bin_path) == []
+
+
+@pytest.mark.asyncio
+async def test_place_held_file_replace_without_recycle_bin_consumes_source(tmp_path: Path):
+    """F-INDEXREC-04: a same-path upgrade that cannot safely replace (no recycle
+    bin) returns the occupied destination as a no-op and consumes the source.
+
+    Verified-attribution rule (#418): the no-op success requires the occupant's
+    catalog row to cover the held track; without attribution this raises
+    ConflictError and the held source is preserved."""
+    fp, manager, library, _downloads, bin_path = _make(tmp_path, with_bin=False)
+    existing = await _seed_existing(
+        manager,
+        library / "Radiohead/OK Computer (1997)/0101 Airbag.flac",
+        file_format="mp3",
+        bit_rate=128,  # strictly worse than the held flac
+    )
+    held_file = tmp_path / "held" / "src.flac"
+    held_file.parent.mkdir()
+    shutil.copy(_FLAC, held_file)
+
+    target = await fp.place_held_file(_held(held_file, task_id=None))
+
+    assert Path(target) == existing
+    assert existing.read_bytes() == b"OLD-BYTES"
+    assert not held_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_place_held_file_unattributed_target_raises_conflict(tmp_path: Path):
+    """#418: a held import onto a bare occupied destination (no catalog row) is a
+    collision - ConflictError with a user-safe message, the destination stays
+    byte-identical, and the held source is preserved (F-INDEXREC-04 consumption
+    is gated on verified attribution only)."""
+    from core.exceptions import ConflictError
+
+    fp, _manager, library, _downloads, _bin = _make(tmp_path)
+    existing = library / "Radiohead/OK Computer (1997)/0101 Airbag.flac"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(b"FOREIGN-BYTES")
+    held_file = tmp_path / "held" / "src.flac"
+    held_file.parent.mkdir()
+    shutil.copy(_FLAC, held_file)
+
+    with pytest.raises(ConflictError) as excinfo:
+        await fp.place_held_file(_held(held_file, task_id=None))
+
+    assert "0101 Airbag.flac" in str(excinfo.value)
+    assert str(library) not in str(excinfo.value)  # no internal paths
+    assert existing.read_bytes() == b"FOREIGN-BYTES"
+    assert held_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_place_held_file_other_rg_target_raises_conflict(tmp_path: Path):
+    """#418: an occupant the catalog attributes to another release group is not
+    this track - ConflictError with the held source preserved."""
+    from core.exceptions import ConflictError
+
+    fp, manager, library, _downloads, _bin = _make(tmp_path)
+    existing = await _seed_existing(
+        manager,
+        library / "Radiohead/OK Computer (1997)/0101 Airbag.flac",
+        rg="rg-other",
+    )
+    held_file = tmp_path / "held" / "src.flac"
+    held_file.parent.mkdir()
+    shutil.copy(_FLAC, held_file)
+
+    with pytest.raises(ConflictError, match="already occupied"):
+        await fp.place_held_file(_held(held_file, task_id=None))
+
+    assert existing.read_bytes() == b"OLD-BYTES"
+    assert held_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_without_attribution_row_is_collision(tmp_path: Path):
+    """#418: strictly-better upgrade bytes onto a bare occupied destination are a
+    collision, not a replace - there is no catalog row to retire, and D10 forbids
+    a silent overwrite."""
+    from services.native.file_processor import TARGET_OCCUPIED
+
+    _MP3 = FIXTURES / "mp3_full_01.mp3"  # tier mp3_256; tags: track 3 "One"
+    fp, _manager, library, downloads, bin_path = _make(tmp_path)
+    # a tag-readable but strictly-worse occupant (mp3 ~191kbit) with NO catalog row
+    occupant = library / "Radiohead/OK Computer (1997)/0103 One.mp3"
+    occupant.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIXTURES / "management_full.mp3", occupant)
+    shutil.copy(_MP3, downloads / "song.mp3")
+
+    result = await fp.process_downloaded(
+        _manifest(
+            ExpectedFile(
+                filename="song.mp3",
+                size=(downloads / "song.mp3").stat().st_size,
+            ),
+            origin="upgrade",
+        )
+    )
+
+    assert result.succeeded == []
+    assert len(result.failed) == 1
+    assert result.failed[0].reason == TARGET_OCCUPIED
+    assert result.publisher_bundle_ids == []
+    assert result.workspace_disposition == "preserve"
+    assert occupant.read_bytes() == (FIXTURES / "management_full.mp3").read_bytes()
+    assert (downloads / "song.mp3").exists()
+    assert _bin_files(bin_path) == []

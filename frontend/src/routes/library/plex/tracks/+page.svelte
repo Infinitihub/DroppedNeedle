@@ -10,6 +10,7 @@
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import type { MenuItem } from '$lib/components/ContextMenu.svelte';
 	import LibraryFilterBar from '$lib/components/LibraryFilterBar.svelte';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { formatDurationSec } from '$lib/utils/formatting';
 	import { reveal } from '$lib/actions/reveal';
 	import {
@@ -19,7 +20,7 @@
 		Shuffle,
 		ListPlus,
 		ListStart,
-		Loader2
+		LoaderCircle
 	} from 'lucide-svelte';
 	import type { PlexTrackInfo, PlexTrackPage } from '$lib/types';
 
@@ -190,7 +191,11 @@
 	<div
 		class="mb-6 rounded-xl bg-base-200/30 backdrop-blur-sm border border-base-content/5 px-5 py-4 shadow-sm flex items-center gap-3"
 	>
-		<a href="/library/plex" class="btn btn-ghost btn-sm gap-1" aria-label="Back to Plex library">
+		<a
+			href={withBasePath('/library/plex')}
+			class="btn btn-ghost btn-sm gap-1"
+			aria-label="Back to Plex library"
+		>
 			<ChevronLeft class="h-4 w-4" />
 			Back
 		</a>
@@ -250,7 +255,7 @@
 						aria-busy="true"
 						aria-label="Stop loading tracks"
 					>
-						<Loader2 class="h-3.5 w-3.5 animate-spin" />
+						<LoaderCircle class="h-3.5 w-3.5 animate-spin" />
 						{loader.progressText ?? 'Loading tracks'}
 					</button>
 				{:else}

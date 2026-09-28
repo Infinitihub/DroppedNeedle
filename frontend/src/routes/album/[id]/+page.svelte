@@ -52,5 +52,5 @@
 		initialMergeTargetId={page.url.searchParams.get('mergeTarget')}
 	/>
 {:else}
-	<ProviderAlbumPage {data} />
+	<ProviderAlbumPage {data} {localAlbum} />
 {/if}

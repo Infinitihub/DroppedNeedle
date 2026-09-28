@@ -14,6 +14,7 @@ from core.exceptions import (
     ServiceDisabledUpstreamError,
 )
 from infrastructure.degradation import try_get_degradation_context
+from infrastructure.resilience.retry import CircuitOpenError
 from infrastructure.integration_result import IntegrationResult
 from models.library_management_canonical import CanonicalReleaseDocument
 from models.library_management_genres import GenreCandidate, GenreProjection
@@ -77,6 +78,7 @@ class GenreProjectionService:
                         if not settings.listenbrainz_curated_only or candidate.curated
                     )
                 except (
+                    CircuitOpenError,
                     ConfigurationError,
                     ExternalServiceError,
                     RateLimitedError,
@@ -107,7 +109,12 @@ class GenreProjectionService:
                         if value.weight is None
                         or value.weight >= settings.lastfm_minimum_weight
                     )
-                except (ConfigurationError, ExternalServiceError, RateLimitedError):
+                except (
+                    CircuitOpenError,
+                    ConfigurationError,
+                    ExternalServiceError,
+                    RateLimitedError,
+                ):
                     self._record_deferred("lastfm")
                     deferred.append("lastfm")
 
@@ -154,6 +161,28 @@ class GenreProjectionService:
                     if len(selected) >= settings.maximum_count:
                         break
 
+        # Upstream-defer fallback: "musicbrainz" candidates are derived locally
+        # from the canonical release and never defer, so when a configured
+        # remote source defers and the merged selection holds only those local
+        # candidates (or nothing), the result is a degraded partial projection.
+        # Prefer the user's existing file tags (capped) over presenting that
+        # partial result as the replace-mode outcome. `deferred` stays intact
+        # so callers still warn honestly. Selections carrying surviving remote
+        # enrichment, and healthy paths with no deferral, are untouched.
+        if (
+            settings.mode == "replace"
+            and deferred
+            and existing
+            and (
+                not selected
+                or all(candidate.provider == "musicbrainz" for candidate in selected)
+            )
+        ):
+            return GenreProjection(
+                genres=existing[: settings.maximum_count],
+                deferred_sources=tuple(deferred),
+                preserved_existing=True,
+            )
         if not selected and existing:
             return GenreProjection(
                 genres=existing[: settings.maximum_count],

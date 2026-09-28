@@ -3,16 +3,20 @@
 	import { browser } from '$app/environment';
 	import { goto, beforeNavigate, afterNavigate } from '$app/navigation';
 	import { resolve } from '$app/paths';
+	import { withBasePath, withoutBasePath } from '$lib/utils/basePath';
+	import { getApiUrl } from '$lib/api/api-utils';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { logout } from '$lib/utils/logout';
 	import { migratePageSourceKeys } from '$lib/stores/musicSource';
+	import { watchMusicBrainzSourceScope } from '$lib/queries/musicbrainz/sourceScope.svelte';
 	import { errorModal } from '$lib/stores/errorModal';
 	import { libraryStore } from '$lib/stores/library';
 	import { integrationStore } from '$lib/stores/integration';
-	import { initCacheTTLs } from '$lib/stores/cacheTtl';
+	import { initCacheTTLs } from '$lib/stores/cacheTtl.svelte';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { launchYouTubePlayback } from '$lib/player/launchYouTubePlayback';
 	import { playbackToast } from '$lib/stores/playbackToast.svelte';
+	import { toastStore } from '$lib/stores/toast';
 	import { scrobbleManager } from '$lib/stores/scrobble.svelte';
 	import { imageSettingsStore } from '$lib/stores/imageSettings';
 	import { serviceStatusStore } from '$lib/stores/serviceStatus';
@@ -54,14 +58,17 @@
 		Compass,
 		Menu,
 		Download,
+		Ellipsis,
 		PanelLeft,
 		TriangleAlert,
 		Info,
 		X,
+		Check,
 		UserRound,
 		Inbox,
 		ListMusic,
-		ArrowUpCircle,
+		ListChecks,
+		CircleArrowUp,
 		LogOut,
 		ShieldCheck,
 		Heart,
@@ -73,6 +80,7 @@
 	import ConcertsNavBadge from '$lib/components/ConcertsNavBadge.svelte';
 	import { createFollowingEvents } from '$lib/queries/following/FollowingEvents';
 	import { createLibraryActivityEvents } from '$lib/queries/library/LibraryActivityEvents';
+	import { muxEventStream } from '$lib/queries/events/MuxEventStream';
 	import LibraryActivityStrip from '$lib/components/library/LibraryActivityStrip.svelte';
 	import DownloadsNavBadge from '$lib/components/DownloadsNavBadge.svelte';
 	import PendingApprovalNavBadge from '$lib/components/PendingApprovalNavBadge.svelte';
@@ -94,6 +102,9 @@
 	let showNavigationProgress = $state(false);
 	let currentPath = $state('/');
 	let versionUpdateAvailable = $state(false);
+	// Settings runs as a fixed two-pane app surface: the tab rail and the content
+	// pane scroll, the document itself must not.
+	const isSettingsPane = $derived(currentPath.startsWith('/settings'));
 
 	const NAV_PROGRESS_DELAY_MS = 120;
 	const NAV_PROGRESS_MIN_VISIBLE_MS = 220;
@@ -118,7 +129,7 @@
 
 	afterNavigate(() => {
 		if (browser) {
-			currentPath = window.location.pathname;
+			currentPath = withoutBasePath(window.location.pathname);
 		}
 		navigationProgress.finish();
 	});
@@ -153,7 +164,7 @@
 		};
 
 		if (browser) {
-			currentPath = window.location.pathname;
+			currentPath = withoutBasePath(window.location.pathname);
 		}
 		document.addEventListener('keydown', handleGlobalKeydown);
 	});
@@ -199,11 +210,10 @@
 		return () => unregisterPlaylistModal(ref);
 	});
 
-	// Everything auth-gated must track the session reactively, not be checked once at
-	// mount: an in-app login/logout is a goto() that never remounts this layout, so a
-	// mount-time check left integrations disabled (and these services stopped) until a
-	// hard refresh (#155). The bodies run untracked so only the auth flag re-triggers
-	// them - nowPlayingReporter.start() synchronously reads player $state, which would
+	// auth-gated work must track the session reactively: an in-app login/logout is a
+	// goto() that never remounts this layout, so mount-time checks left integrations
+	// disabled until hard refresh (#155). bodies run untracked so only the auth flag
+	// re-triggers them - nowPlayingReporter.start() reads player $state and would
 	// otherwise restart every service on each play/pause.
 	$effect(() => {
 		const sessionUserId = authStore.user?.id ?? null;
@@ -239,6 +249,10 @@
 			});
 		}
 	});
+	$effect(() => {
+		if (!authStore.user?.id) return;
+		return watchMusicBrainzSourceScope();
+	});
 
 	$effect(() => {
 		const sessionUserId = authStore.user?.id;
@@ -250,12 +264,20 @@
 			// so it no longer waits on integration status
 			nowPlayingStore.start();
 			nowPlayingReporter.start();
+			// The tab's single multiplexed stream; connect last so the gated
+			// consumer starts (library activity's admin direct-refresh gate)
+			// see a disconnected mux and refresh exactly once via the first
+			// open instead of doubling with a direct refresh. syncStatus
+			// connects deferred after this on purpose - it has no gate and its
+			// seed/generation guard covers either order.
+			muxEventStream.connect();
 		});
 		return () => {
 			followingEvents.stop();
 			libraryActivityEvents.stop();
 			nowPlayingStore.stop();
 			nowPlayingReporter.stop();
+			muxEventStream.disconnect();
 		};
 	});
 
@@ -267,6 +289,7 @@
 			document.removeEventListener('keydown', handleGlobalKeydown);
 		}
 		syncStatus.disconnect();
+		muxEventStream.disconnect();
 		resetPlaylistModal();
 		discographyDownloadStore.close();
 		batchDownloadStore.clear();
@@ -326,13 +349,13 @@
 
 	function handleSearch() {
 		if (query.trim()) {
-			goto(`/search?q=${encodeURIComponent(query)}`);
+			goto(withBasePath(`/search?q=${encodeURIComponent(query)}`));
 		}
 	}
 
 	function handleModalSearch() {
 		if (modalQuery.trim()) {
-			goto(`/search?q=${encodeURIComponent(modalQuery)}`);
+			goto(withBasePath(`/search?q=${encodeURIComponent(modalQuery)}`));
 			const modal = document.getElementById('search_modal') as HTMLDialogElement;
 			if (modal) modal.close();
 			modalQuery = '';
@@ -355,7 +378,31 @@
 	}
 
 	function isLibraryNavActive(): boolean {
-		return isNavActive('/library') && !isNavActive('/library/management');
+		return (
+			isNavActive('/library') &&
+			!isNavActive('/library/management') &&
+			!isNavActive('/library/review')
+		);
+	}
+	function openMoreNav(): void {
+		(document.getElementById('more_nav_sheet') as HTMLDialogElement | null)?.showModal();
+	}
+
+	function closeMoreNav(): void {
+		(document.getElementById('more_nav_sheet') as HTMLDialogElement | null)?.close();
+	}
+
+	// The bottom bar only fits the primary destinations; everything else lives in
+	// the More sheet, so the More tab highlights for any of those paths (#182).
+	function isMoreNavActive(): boolean {
+		return (
+			isNavActive('/downloads') ||
+			isNavActive('/following') ||
+			isNavActive('/playlists') ||
+			isNavActive('/requests') ||
+			isNavActive('/library/management') ||
+			isNavActive('/library/review')
+		);
 	}
 
 	const integrations = fromStore(integrationStore);
@@ -376,14 +423,29 @@
 <div class="drawer md:drawer-open">
 	<input id="main-drawer" type="checkbox" class="drawer-toggle" />
 
-	<div class="drawer-content flex min-w-0 flex-col isolate">
+	<div
+		class="drawer-content flex min-w-0 flex-col isolate"
+		class:droppedneedle-pane-mode={isSettingsPane}
+	>
 		<div
 			class="droppedneedle-topbar navbar bg-base-100/95 backdrop-blur shadow-sm sticky top-0 z-50"
 		>
 			<div class="navbar-start w-auto">
-				<a href="/" class="btn btn-ghost px-2 max-xs:hidden sm:px-4" aria-label="Home">
-					<img src="/logo_wide.png" alt="DroppedNeedle" class="h-8 hidden sm:block" />
-					<img src="/logo_icon.png" alt="DroppedNeedle" class="h-8 block sm:hidden" />
+				<a
+					href={withBasePath('/')}
+					class="btn btn-ghost px-2 max-xs:hidden sm:px-4"
+					aria-label="Home"
+				>
+					<img
+						src={withBasePath('/logo_wide.png')}
+						alt="DroppedNeedle"
+						class="h-8 hidden sm:block"
+					/>
+					<img
+						src={withBasePath('/logo_icon.png')}
+						alt="DroppedNeedle"
+						class="h-8 block sm:hidden"
+					/>
 				</a>
 			</div>
 			<div class="navbar-center min-w-0 grow justify-center px-1 sm:px-4">
@@ -398,10 +460,14 @@
 			</div>
 			<div class="navbar-end w-auto pr-1 sm:pr-2">
 				<ServiceHealthIndicator />
-				<a href="/profile" class="btn btn-ghost btn-circle btn-md" aria-label="Profile">
+				<a
+					href={withBasePath('/profile')}
+					class="btn btn-ghost btn-circle btn-md"
+					aria-label="Profile"
+				>
 					{#if authStore.user?.avatar_url}
 						<img
-							src={authStore.user.avatar_url}
+							src={getApiUrl(authStore.user.avatar_url)}
 							alt="Profile"
 							class="h-7 w-7 rounded-full object-cover"
 						/>
@@ -419,14 +485,14 @@
 			class:droppedneedle-player-visible={playerStore.isPlayerVisible}
 		>
 			{@render children()}
-			<Footer />
+			{#if !isSettingsPane}<Footer />{/if}
 		</div>
 	</div>
 
 	<div class="drawer-side hidden md:block is-drawer-close:overflow-visible">
 		<label for="main-drawer" aria-label="close sidebar" class="drawer-overlay"></label>
 		<div
-			class="is-drawer-close:w-16 is-drawer-open:w-64 bg-base-200 flex flex-col items-start min-h-full"
+			class="is-drawer-close:w-16 is-drawer-open:w-64 bg-base-200 flex flex-col items-start min-h-full max-h-dvh overflow-y-auto overflow-x-hidden"
 		>
 			<ul class="menu w-full grow p-2 [&_li>*]:py-3">
 				<li>
@@ -444,7 +510,11 @@
 				<div class="divider my-0"></div>
 
 				<li>
-					<a href="/" class="is-drawer-close:tooltip is-drawer-close:tooltip-right" data-tip="Home">
+					<a
+						href={withBasePath('/')}
+						class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+						data-tip="Home"
+					>
 						<House class="h-6 w-6" />
 						<span class="is-drawer-close:hidden">Home</span>
 					</a>
@@ -452,7 +522,7 @@
 
 				<li>
 					<a
-						href="/discover"
+						href={withBasePath('/discover')}
 						class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 						data-tip="Discover"
 					>
@@ -463,7 +533,7 @@
 
 				<li>
 					<a
-						href="/library"
+						href={withBasePath('/library')}
 						class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 						class:menu-active={isLibraryNavActive()}
 						aria-current={isLibraryNavActive() ? 'page' : undefined}
@@ -484,7 +554,7 @@
 
 				<li>
 					<a
-						href="/downloads"
+						href={withBasePath('/downloads')}
 						class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 						data-tip="Downloads"
 					>
@@ -498,7 +568,7 @@
 
 				<li>
 					<a
-						href="/following"
+						href={withBasePath('/following')}
 						class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 						class:menu-active={isNavActive('/following')}
 						aria-current={isNavActive('/following') ? 'page' : undefined}
@@ -517,7 +587,7 @@
 				{#if downloadClientConfigured}
 					<li>
 						<a
-							href="/playlists"
+							href={withBasePath('/playlists')}
 							class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 							class:menu-active={isNavActive('/playlists')}
 							aria-current={isNavActive('/playlists') ? 'page' : undefined}
@@ -538,7 +608,7 @@
 				{#if downloadClientConfigured}
 					<li>
 						<a
-							href="/requests"
+							href={withBasePath('/requests')}
 							class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 							data-tip="Requests"
 						>
@@ -557,7 +627,7 @@
 					</li>
 					<li>
 						<a
-							href="/library/management"
+							href={withBasePath('/library/management')}
 							class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 							class:menu-active={isNavActive('/library/management')}
 							aria-current={isNavActive('/library/management') ? 'page' : undefined}
@@ -577,7 +647,7 @@
 					</li>
 					<li>
 						<a
-							href="/requests?tab=approvals"
+							href={withBasePath('/requests?tab=approvals')}
 							class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
 							data-tip="Approvals"
 						>
@@ -586,6 +656,19 @@
 								<PendingApprovalNavBadge />
 							</div>
 							<span class="is-drawer-close:hidden">Approvals</span>
+						</a>
+					</li>
+					<li>
+						<a
+							href={withBasePath('/library/review')}
+							class="is-drawer-close:tooltip is-drawer-close:tooltip-right"
+							class:menu-active={isNavActive('/library/review')}
+							aria-current={isNavActive('/library/review') ? 'page' : undefined}
+							aria-label="Review Queue"
+							data-tip="Review Queue"
+						>
+							<ListChecks class="h-6 w-6" />
+							<span class="is-drawer-close:hidden">Review Queue</span>
 						</a>
 					</li>
 				{/if}
@@ -597,7 +680,9 @@
 						data-tip={versionUpdateAvailable ? 'Settings - update available' : 'Settings'}
 					>
 						<a
-							href={versionUpdateAvailable ? '/settings?tab=about' : '/settings'}
+							href={versionUpdateAvailable
+								? withBasePath('/settings?tab=about')
+								: withBasePath('/settings')}
 							class="btn btn-ghost btn-circle relative"
 							aria-label={versionUpdateAvailable ? 'Settings - update available' : 'Settings'}
 						>
@@ -606,7 +691,7 @@
 								<span
 									class="absolute -top-0.5 -right-0.5 flex h-4.5 w-4.5 items-center justify-center rounded-full bg-accent text-accent-content shadow-sm shadow-accent/30"
 								>
-									<ArrowUpCircle class="h-3 w-3" />
+									<CircleArrowUp class="h-3 w-3" />
 								</span>
 							{/if}
 						</a>
@@ -634,9 +719,13 @@
 	</div>
 </div>
 
-<nav class="droppedneedle-bottom-nav md:hidden" aria-label="Primary navigation">
+<nav
+	class="droppedneedle-bottom-nav md:hidden"
+	class:droppedneedle-bottom-nav--no-settings={!authStore.isAdmin}
+	aria-label="Primary navigation"
+>
 	<a
-		href="/"
+		href={withBasePath('/')}
 		class="droppedneedle-bottom-nav__item"
 		class:active={currentPath === '/'}
 		aria-current={currentPath === '/' ? 'page' : undefined}
@@ -645,7 +734,7 @@
 		<span>Home</span>
 	</a>
 	<a
-		href="/discover"
+		href={withBasePath('/discover')}
 		class="droppedneedle-bottom-nav__item"
 		class:active={isNavActive('/discover')}
 		aria-current={isNavActive('/discover') ? 'page' : undefined}
@@ -664,10 +753,10 @@
 		<span>Search</span>
 	</button>
 	<a
-		href="/library"
+		href={withBasePath('/library')}
 		class="droppedneedle-bottom-nav__item"
-		class:active={isNavActive('/library')}
-		aria-current={isNavActive('/library') ? 'page' : undefined}
+		class:active={isLibraryNavActive()}
+		aria-current={isLibraryNavActive() ? 'page' : undefined}
 	>
 		<Menu />
 		<span>Library</span>
@@ -675,21 +764,145 @@
 			<span class="droppedneedle-bottom-nav__badge" aria-label="Library sync in progress"></span>
 		{/if}
 	</a>
-	<a
-		href={versionUpdateAvailable ? '/settings?tab=about' : '/settings'}
+	{#if authStore.isAdmin}
+		<a
+			href={versionUpdateAvailable
+				? withBasePath('/settings?tab=about')
+				: withBasePath('/settings')}
+			class="droppedneedle-bottom-nav__item"
+			class:active={isNavActive('/settings')}
+			aria-current={isNavActive('/settings') ? 'page' : undefined}
+		>
+			<Settings />
+			<span>Settings</span>
+			{#if versionUpdateAvailable}
+				<span class="droppedneedle-bottom-nav__badge" aria-label="Update available">
+					<CircleArrowUp class="h-3 w-3" />
+				</span>
+			{/if}
+		</a>
+	{/if}
+	<button
+		type="button"
 		class="droppedneedle-bottom-nav__item"
-		class:active={isNavActive('/settings')}
-		aria-current={isNavActive('/settings') ? 'page' : undefined}
+		class:active={isMoreNavActive()}
+		onclick={openMoreNav}
+		aria-label="More navigation options"
+		aria-haspopup="dialog"
 	>
-		<Settings />
-		<span>Settings</span>
-		{#if versionUpdateAvailable}
-			<span class="droppedneedle-bottom-nav__badge" aria-label="Update available">
-				<ArrowUpCircle class="h-3 w-3" />
-			</span>
-		{/if}
-	</a>
+		<Ellipsis />
+		<span>More</span>
+	</button>
 </nav>
+
+<dialog id="more_nav_sheet" class="modal modal-bottom sm:modal-middle" aria-label="More navigation">
+	<div class="modal-box p-2">
+		<form method="dialog">
+			<button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2" aria-label="Close"
+				><X class="h-4 w-4" /></button
+			>
+		</form>
+		<h3 class="font-bold text-lg px-2 pt-1 pb-2">More</h3>
+		<ul class="menu w-full">
+			<li>
+				<a
+					href={withBasePath('/downloads')}
+					class:menu-active={isNavActive('/downloads')}
+					aria-current={isNavActive('/downloads') ? 'page' : undefined}
+					onclick={closeMoreNav}
+				>
+					<Download class="h-6 w-6" />
+					Downloads
+				</a>
+			</li>
+			<li>
+				<a
+					href={withBasePath('/following')}
+					class:menu-active={isNavActive('/following')}
+					aria-current={isNavActive('/following') ? 'page' : undefined}
+					onclick={closeMoreNav}
+				>
+					<Heart class="h-6 w-6" />
+					Following
+				</a>
+			</li>
+			{#if downloadClientConfigured}
+				<li>
+					<a
+						href={withBasePath('/playlists')}
+						class:menu-active={isNavActive('/playlists')}
+						aria-current={isNavActive('/playlists') ? 'page' : undefined}
+						onclick={closeMoreNav}
+					>
+						<ListMusic class="h-6 w-6" />
+						Playlists
+					</a>
+				</li>
+				<li>
+					<a
+						href={withBasePath('/requests')}
+						class:menu-active={isNavActive('/requests')}
+						aria-current={isNavActive('/requests') ? 'page' : undefined}
+						onclick={closeMoreNav}
+					>
+						<Inbox class="h-6 w-6" />
+						Requests
+					</a>
+				</li>
+			{/if}
+			{#if authStore.isAdmin}
+				<li>
+					<a
+						href={withBasePath('/library/management')}
+						class:menu-active={isNavActive('/library/management')}
+						aria-current={isNavActive('/library/management') ? 'page' : undefined}
+						aria-label="Library Management"
+						onclick={closeMoreNav}
+					>
+						<span class="relative inline-flex h-6 w-6">
+							<LibraryBig class="h-6 w-6" />
+							<span
+								class="absolute -bottom-1.5 -right-1.5 grid h-4 w-4 place-items-center rounded-full bg-base-200 text-library-manage"
+							>
+								<Cog class="h-3 w-3" />
+							</span>
+						</span>
+						Library Management
+					</a>
+				</li>
+				<li>
+					<a
+						href={withBasePath('/requests?tab=approvals')}
+						class:menu-active={isNavActive('/requests')}
+						aria-current={isNavActive('/requests') ? 'page' : undefined}
+						onclick={closeMoreNav}
+					>
+						<span class="relative inline-flex">
+							<ShieldCheck class="h-6 w-6" />
+							<PendingApprovalNavBadge />
+						</span>
+						Approvals
+					</a>
+				</li>
+				<li>
+					<a
+						href={withBasePath('/library/review')}
+						class:menu-active={isNavActive('/library/review')}
+						aria-current={isNavActive('/library/review') ? 'page' : undefined}
+						aria-label="Review Queue"
+						onclick={closeMoreNav}
+					>
+						<ListChecks class="h-6 w-6" />
+						Review Queue
+					</a>
+				</li>
+			{/if}
+		</ul>
+	</div>
+	<form method="dialog" class="modal-backdrop">
+		<button aria-label="Close more navigation">close</button>
+	</form>
+</dialog>
 
 <dialog id="search_modal" class="modal">
 	<div class="modal-box overflow-visible">
@@ -786,6 +999,38 @@
 			<button
 				class="btn btn-ghost btn-xs btn-circle"
 				onclick={() => playbackToast.dismiss()}
+				aria-label="Dismiss"
+			>
+				<X class="h-3.5 w-3.5" />
+			</button>
+		</div>
+	</div>
+{/if}
+
+{#if $toastStore}
+	<div
+		class="droppedneedle-playback-toast fixed z-50 left-1/2 -translate-x-1/2"
+		class:droppedneedle-playback-toast--player={playerStore.isPlayerVisible}
+	>
+		<div
+			role="status"
+			class="alert {$toastStore.type === 'error'
+				? 'alert-error'
+				: $toastStore.type === 'success'
+					? 'alert-success'
+					: 'alert-info'} shadow-lg px-4 py-2 min-w-64 max-w-md"
+		>
+			{#if $toastStore.type === 'success'}
+				<Check class="h-5 w-5 shrink-0" />
+			{:else if $toastStore.type === 'error'}
+				<X class="h-5 w-5 shrink-0" />
+			{:else}
+				<Info class="h-5 w-5 shrink-0" />
+			{/if}
+			<span class="text-sm">{$toastStore.message}</span>
+			<button
+				class="btn btn-ghost btn-xs btn-circle"
+				onclick={() => toastStore.hide()}
 				aria-label="Dismiss"
 			>
 				<X class="h-3.5 w-3.5" />

@@ -1,11 +1,26 @@
 import asyncio
+import hashlib
+import json
 import logging
+import time
 from contextvars import ContextVar
 from typing import Any
+from functools import wraps
+from weakref import WeakValueDictionary
 
 from api.v1.schemas.discover import DiscoverQueueItemLight
+from core.exceptions import ConfigurationError
 from infrastructure.persistence import LibraryDB, MBIDStore
+from infrastructure.observability.optional_work import OptionalWorkDeferred, check_optional_dispatch
 from infrastructure.queue.priority_queue import RequestPriority
+from infrastructure.validators import is_valid_mbid
+from repositories.musicbrainz_base import (
+    capture_mb_source_context,
+    clear_mb_response_context,
+    get_mb_response_context,
+    is_mb_source_current,
+    mb_publish_if_current,
+)
 from repositories.protocols import (
     LibraryRepositoryProtocol,
     ListenBrainzRepositoryProtocol,
@@ -14,12 +29,18 @@ from repositories.protocols import (
 
 logger = logging.getLogger(__name__)
 
-# Set (per-task) by the background warmer's thorough build. When true, a build runs with its
-# section budgets relaxed AND resolves ALL pending album->release-group lookups instead of
-# capping at max_lookups - so a section like Top Picks fully personalises in one pass rather
-# than banking only ~10 albums per build and being frozen partially-personalised by the cache.
-# On-visit builds leave it False (stay fast + tightly budgeted).
-discover_build_thorough: ContextVar[bool] = ContextVar("discover_build_thorough", default=False)
+resolution_user: ContextVar[str | None] = ContextVar("resolution_user", default=None)
+
+
+def with_resolution_user(method):
+    @wraps(method)
+    async def scoped(self, user_id: str, *args, **kwargs):
+        token = resolution_user.set(user_id)
+        try:
+            return await method(self, user_id, *args, **kwargs)
+        finally:
+            resolution_user.reset(token)
+    return scoped
 
 
 class MbidResolutionService:
@@ -30,12 +51,19 @@ class MbidResolutionService:
         listenbrainz_repo: ListenBrainzRepositoryProtocol,
         library_db: LibraryDB | None = None,
         mbid_store: MBIDStore | None = None,
+        mb_canonical_store=None,
+        progress_store=None,
     ) -> None:
         self._mb_repo = musicbrainz_repo
         self._library_repo = library_repo
         self._lb_repo = listenbrainz_repo
         self._library_db = library_db
         self._mbid_store = mbid_store
+        # ST2 cutover: durable canonical map replaces mbid_resolution_map as
+        # the persistent tier for discover-lane release->RG.
+        self._mb_canonical_store = mb_canonical_store
+        self._progress_store = progress_store
+        self._progress_locks: WeakValueDictionary[tuple[str | None, str], asyncio.Lock] = WeakValueDictionary()
 
     @staticmethod
     def normalize_mbid(mbid: str | None) -> str | None:
@@ -45,13 +73,38 @@ class MbidResolutionService:
         return normalized or None
 
     async def resolve_lastfm_release_group_mbids(
+        self, album_mbids: list[str], *, max_lookups: int = 10,
+        allow_passthrough: bool = True,
+        resolver_cache: dict[str, str | None] | None = None,
+        user_id: str | None = None, work_key: str = "release-resolution",
+    ) -> dict[str, str]:
+        operation_context = capture_mb_source_context()
+        user_id = user_id or resolution_user.get()
+        key = (user_id, work_key)
+        lock = self._progress_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._progress_locks[key] = lock
+        async with lock:
+            if not is_mb_source_current(operation_context):
+                return {}
+            return await self._resolve_lastfm_release_group_mbids(
+                album_mbids, max_lookups=max_lookups,
+                allow_passthrough=allow_passthrough, resolver_cache=resolver_cache,
+                user_id=user_id, work_key=work_key,
+            )
+
+    async def _resolve_lastfm_release_group_mbids(
         self,
         album_mbids: list[str],
         *,
         max_lookups: int = 10,
         allow_passthrough: bool = True,
         resolver_cache: dict[str, str | None] | None = None,
+        user_id: str | None = None,
+        work_key: str = "release-resolution",
     ) -> dict[str, str]:
+        operation_context = capture_mb_source_context()
         normalized: list[str] = []
         seen: set[str] = set()
         for mbid in album_mbids:
@@ -63,8 +116,20 @@ class MbidResolutionService:
 
         if not normalized:
             return {}
+        normalized.sort()
 
         cache = resolver_cache if resolver_cache is not None else {}
+        cache_writes: set[str] = set()
+
+        def cache_value(mbid: str, value: str | None) -> None:
+            cache[mbid] = value
+            cache_writes.add(mbid)
+
+        def abort_for_source_change() -> dict[str, str]:
+            for mbid in cache_writes:
+                cache.pop(mbid, None)
+            return {}
+
         resolved: dict[str, str] = {}
         pending: list[str] = []
 
@@ -78,121 +143,168 @@ class MbidResolutionService:
                 continue
             pending.append(mbid)
 
-        if pending and self._mbid_store:
+        if pending and self._mb_canonical_store:
+            # ST2 cutover: the durable canonical map replaces
+            # mbid_resolution_map as the persistent read tier.
             try:
-                persisted = await self._mbid_store.get_mbid_resolution_map(pending)
+                persisted = await self._mb_canonical_store.get_release_to_rg_batch(
+                    pending,
+                    source_context=operation_context,
+                )
+                if not is_mb_source_current(operation_context):
+                    raise ConfigurationError(
+                        "MusicBrainz source changed during canonical read"
+                    )
                 still_pending: list[str] = []
                 for mbid in pending:
-                    if mbid in persisted:
-                        rg_mbid = persisted[mbid]
-                        cache[mbid] = rg_mbid
+                    if mbid.casefold() in persisted:
+                        rg_mbid = persisted[mbid.casefold()]
                         if rg_mbid:
                             resolved[mbid] = rg_mbid
+                            cache_value(mbid, rg_mbid)
                         elif allow_passthrough:
                             resolved[mbid] = mbid
+                            cache_value(mbid, mbid)
+                        else:
+                            cache_value(mbid, None)
                     else:
                         still_pending.append(mbid)
                 pending = still_pending
+            except ConfigurationError:
+                return abort_for_source_change()
+            except OptionalWorkDeferred:
+                raise
             except Exception:  # noqa: BLE001
-                logger.warning("Failed to load MBID resolution from persistent cache")
+                logger.warning("Failed to load from canonical store")
 
         if not pending:
+            if not is_mb_source_current(operation_context):
+                return abort_for_source_change()
             return resolved
 
-        new_resolutions: dict[str, str | None] = {}
-
-        # thorough (warmer) builds resolve everything; on-visit builds cap for speed
-        lookup_limit = len(pending) if discover_build_thorough.get() else max_lookups
-        lookup_mbids = pending[:lookup_limit]
-        skipped_mbids = pending[lookup_limit:]
-        for mbid in skipped_mbids:
+        user_id = user_id or resolution_user.get()
+        revision = hashlib.sha256(
+            json.dumps(
+                [operation_context.source_url, operation_context.generation,
+                 operation_context.source_mode, operation_context.source_id, normalized],
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        progress_key = f"mbid:{work_key}"
+        cursor = 0
+        lease = (
+            self._progress_store.user_lease(user_id)
+            if self._progress_store is not None and user_id is not None else None
+        )
+        if self._progress_store is not None and user_id is not None:
+            cursor = await self._progress_store.get_progress(user_id, progress_key, revision)
+        if not is_mb_source_current(operation_context):
+            return abort_for_source_change()
+        start = cursor % len(normalized)
+        pending_set = set(pending)
+        ordered = [
+            (index, normalized[index])
+            for offset in range(len(normalized))
+            if normalized[index := (start + offset) % len(normalized)] in pending_set
+        ]
+        selected = ordered[:max(0, min(max_lookups, 10))]
+        for mbid in pending:
             if allow_passthrough:
                 resolved[mbid] = mbid
-                cache[mbid] = mbid
-            else:
-                cache[mbid] = None
 
-        unresolved: list[str] = []
-
-        # Resolve release->RG and bank EACH hit the instant it lands (shielded), NOT after
-        # the whole gather. MusicBrainz is a hard 1 req/s, so during the ListenBrainz-
-        # popularity outage this gather drains slowly and is routinely cancelled mid-flight
-        # by a build budget. asyncio.gather is all-or-nothing: a cancellation at the await
-        # discards EVERY already-completed result, so persisting post-gather banked nothing
-        # and the store never warmed. Per-completion persistence means a cancelled build
-        # still keeps every resolution it earned, so on-visit reloads (and the prewarm)
-        # accumulate durably and personalisation converges.
-        async def _resolve_and_bank(mbid: str) -> None:
-            try:
-                result = await self._mb_repo.get_release_group_id_from_release(mbid)
-            except Exception:  # noqa: BLE001
-                unresolved.append(mbid)
+        async def save_cursor(index: int) -> None:
+            if self._progress_store is None or user_id is None:
                 return
-            rg_mbid = self.normalize_mbid(result)
-            if rg_mbid:
-                resolved[mbid] = rg_mbid
-                cache[mbid] = rg_mbid
-                await self._persist_resolutions({mbid: rg_mbid})
-            else:
-                unresolved.append(mbid)
-
-        await asyncio.gather(
-            *[_resolve_and_bank(mbid) for mbid in lookup_mbids],
-            return_exceptions=True,
-        )
-
-        if not unresolved:
-            return resolved
-
-        # BACKGROUND_SYNC: these run inside background discover builds. At the default
-        # USER_INITIATED they'd compete with real user page loads AND re-arm the priority
-        # queue's user-activity timer, starving the build's own background lookups. The
-        # primary release->RG lookup on this path is already BACKGROUND_SYNC.
-        rg_checks = await asyncio.gather(
-            *[
-                self._mb_repo.get_release_group_by_id(
-                    mbid, includes=["artist-credits"], priority=RequestPriority.BACKGROUND_SYNC
+            check_optional_dispatch()
+            if not is_mb_source_current(operation_context):
+                raise ConfigurationError("MusicBrainz source changed during resolution")
+            async def publish() -> None:
+                if lease is not None and not lease.active:
+                    raise OptionalWorkDeferred()
+                await self._progress_store.save_progress(
+                    user_id, progress_key, revision, index, time.time()
                 )
-                for mbid in unresolved
-            ],
-            return_exceptions=True,
+            if not await mb_publish_if_current(operation_context, publish):
+                raise ConfigurationError("MusicBrainz source changed during resolution")
+
+        for index, mbid in selected:
+            try:
+                check_optional_dispatch()
+                if lease is not None and not lease.active:
+                    raise OptionalWorkDeferred()
+                # Claim the next position before dispatch so cancellation cannot
+                # strand the remaining inputs behind a persistently slow head.
+                await save_cursor(index + 1)
+                clear_mb_response_context()
+                try:
+                    result = await self._mb_repo.get_release_group_id_from_release(
+                        mbid, source_context=operation_context
+                    )
+                except (OptionalWorkDeferred, ConfigurationError):
+                    raise
+                except Exception:  # noqa: BLE001
+                    result = None
+                response_context = get_mb_response_context() or operation_context
+                if response_context != operation_context or not is_mb_source_current(operation_context):
+                    return abort_for_source_change()
+                rg_mbid = self.normalize_mbid(result)
+                if not rg_mbid:
+                    clear_mb_response_context()
+                    # The release probe above accepts arbitrary Last.fm input,
+                    # but this RG fallback probe needs a lookup-shaped id:
+                    # invalid strings skip the wire.
+                    checked = None
+                    if is_valid_mbid(mbid):
+                        try:
+                            checked = await self._mb_repo.get_release_group_by_id(
+                                mbid, includes=["artist-credits"],
+                                priority=RequestPriority.BACKGROUND_SYNC,
+                                source_context=operation_context,
+                            )
+                        except (OptionalWorkDeferred, ConfigurationError):
+                            raise
+                        except Exception:  # noqa: BLE001
+                            checked = None
+                    response_context = get_mb_response_context() or operation_context
+                    if response_context != operation_context or not is_mb_source_current(operation_context):
+                        return abort_for_source_change()
+                    if isinstance(checked, dict) and checked.get("id"):
+                        rg_mbid = mbid
+                if rg_mbid:
+                    resolved[mbid] = rg_mbid
+                    cache_value(mbid, rg_mbid)
+                    await self._persist_resolutions(
+                        {mbid: rg_mbid}, source_context=operation_context
+                    )
+            except OptionalWorkDeferred:
+                raise
+            except ConfigurationError:
+                return abort_for_source_change()
+
+        return (
+            resolved
+            if is_mb_source_current(operation_context)
+            else abort_for_source_change()
         )
 
-        for mbid, result in zip(unresolved, rg_checks):
-            if isinstance(result, Exception):
-                if allow_passthrough:
-                    resolved[mbid] = mbid
-                    cache[mbid] = mbid
-                else:
-                    cache[mbid] = None
-                continue
-            if isinstance(result, dict) and result.get("id"):
-                resolved[mbid] = mbid
-                cache[mbid] = mbid
-                new_resolutions[mbid] = mbid
-            elif allow_passthrough:
-                resolved[mbid] = mbid
-                cache[mbid] = mbid
-            else:
-                cache[mbid] = None
-                new_resolutions[mbid] = None
-
-        await self._persist_resolutions(new_resolutions)
-
-        return resolved
-
-    async def _persist_resolutions(self, new_resolutions: dict[str, str | None]) -> None:
-        """Durably bank resolved LB->RG mappings so the cache warms across builds.
-
-        Shielded: the discover build that drives this resolver may cancel it on a
-        budget timeout (Top Picks / radio / queue) while MB lookups are still draining
-        at 1 req/s. The SQLite write that records the lookups already completed must
-        finish regardless, or a starved build banks nothing and the next build re-does
-        the same 1/s resolutions from scratch."""
-        if not new_resolutions or not self._mbid_store:
+    async def _persist_resolutions(
+        self,
+        new_resolutions: dict[str, str | None],
+        *,
+        source_context=None,
+    ) -> None:
+        """Durably bank resolved LB->RG mappings under the source commit fence."""
+        if not new_resolutions or not self._mb_canonical_store:
             return
         try:
-            await asyncio.shield(self._mbid_store.save_mbid_resolution_map(dict(new_resolutions)))
+            if source_context is None:
+                return
+            await self._mb_canonical_store.save_release_to_rg(
+                {mbid: rg or "" for mbid, rg in new_resolutions.items()},
+                source_context=source_context,
+            )
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
             logger.warning("Failed to persist MBID resolutions")
 
@@ -206,12 +318,17 @@ class MbidResolutionService:
         is_wildcard: bool = False,
         resolver_cache: dict[str, str | None] | None = None,
         use_album_artist_name: bool = True,
+        user_id: str | None = None,
+        work_key: str | None = None,
     ) -> list[DiscoverQueueItemLight]:
         all_album_mbids: list[str] = []
         for _, albums in artist_albums_pairs:
             all_album_mbids.extend(a.mbid for a in albums if a.mbid)
         rg_mbid_map = await self.resolve_lastfm_release_group_mbids(
-            all_album_mbids, resolver_cache=resolver_cache,
+            all_album_mbids,
+            resolver_cache=resolver_cache,
+            user_id=user_id,
+            work_key=work_key or reason,
         )
         items: list[DiscoverQueueItemLight] = []
         seen_rg_mbids: set[str] = {mbid.lower() for mbid in (exclude or set())}
@@ -231,41 +348,39 @@ class MbidResolutionService:
                 rg_mbid_lower = rg_mbid.lower()
                 if rg_mbid_lower in seen_rg_mbids:
                     continue
-                artist_name = (album.artist_name or artist.name) if use_album_artist_name else artist.name
-                items.append(DiscoverQueueItemLight(
-                    release_group_mbid=rg_mbid,
-                    album_name=album.name,
-                    artist_name=artist_name,
-                    artist_mbid=artist_mbid or "",
-                    cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
-                    recommendation_reason=reason,
-                    is_wildcard=is_wildcard,
-                    in_library=False,
-                ))
+                artist_name = (
+                    (album.artist_name or artist.name)
+                    if use_album_artist_name
+                    else artist.name
+                )
+                items.append(
+                    DiscoverQueueItemLight(
+                        release_group_mbid=rg_mbid,
+                        album_name=album.name,
+                        artist_name=artist_name,
+                        artist_mbid=artist_mbid or "",
+                        cover_url=f"/api/v1/covers/release-group/{rg_mbid}?size=500",
+                        recommendation_reason=reason,
+                        is_wildcard=is_wildcard,
+                        in_library=False,
+                    )
+                )
                 seen_rg_mbids.add(rg_mbid_lower)
         return items
 
     async def resolve_release_mbids(
         self,
         release_ids: list[str],
+        *,
+        user_id: str | None = None,
+        work_key: str = "release-resolution",
     ) -> dict[str, str]:
         return await self.resolve_lastfm_release_group_mbids(
-            release_ids, allow_passthrough=False,
+            release_ids,
+            allow_passthrough=False,
+            user_id=user_id,
+            work_key=work_key,
         )
-
-    async def get_library_artist_mbids(
-        self, library_configured: bool, candidate_ids: list[str] | None = None
-    ) -> set[str]:
-        if not library_configured:
-            return set()
-        try:
-            if candidate_ids is not None:
-                return await self._library_repo.existing_artist_mbids(candidate_ids)
-            artists = await self._library_repo.get_home_artists(limit=500)
-            return {a.get("mbid", "").lower() for a in artists if a.get("mbid")}
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to fetch library artists from Lidarr")
-            return set()
 
     async def get_library_album_mbids(
         self, library_configured: bool, candidate_ids: list[str] | None = None
@@ -274,6 +389,8 @@ class MbidResolutionService:
             if self._library_db and candidate_ids is not None:
                 try:
                     return await self._library_db.existing_library_mbids(candidate_ids)
+                except OptionalWorkDeferred:
+                    raise
                 except Exception:  # noqa: BLE001
                     logger.warning("Failed to fetch album MBIDs from library cache")
             return set()
@@ -286,6 +403,8 @@ class MbidResolutionService:
                 for album in albums
                 if album.musicbrainz_id
             }
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
             logger.warning("Failed to fetch library album MBIDs from Lidarr")
             return set()
@@ -304,8 +423,12 @@ class MbidResolutionService:
                 range_="all_time",
                 count=100,
             )
+        except OptionalWorkDeferred:
+            raise
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to fetch user listened release groups from ListenBrainz")
+            logger.warning(
+                "Failed to fetch user listened release groups from ListenBrainz"
+            )
             return set()
         return {
             rg.release_group_mbid.lower()

@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import hashlib
+import logging
 from io import BytesIO
 import json
 from pathlib import Path
@@ -34,6 +35,7 @@ from infrastructure.persistence.download_store import DownloadStore
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from repositories.musicbrainz_management_models import MbManagementRelease
 from models.library_management import (
+    FILE_UNREADABLE,
     PATH_TOO_LONG,
     SCRIPT_VALIDATION_FAILED,
     LibraryManagementPlanItem,
@@ -63,6 +65,9 @@ from services.native.genre_normalizer import GenreNormalizer
 from services.native.genre_projection_service import GenreProjectionService
 from services.native.library_management_planner import LibraryManagementPlanner
 import services.native.library_management_planner as planner_module
+from services.native.library_management_preview_service import (
+    LibraryManagementPreviewService,
+)
 from services.native.library_management_publisher import LibraryManagementPublisher
 from services.native.library_management_worker import LibraryManagementWorker
 from services.native.library_management_undo_service import LibraryManagementUndoService
@@ -841,7 +846,9 @@ async def test_root_preview_persists_slow_planning_progress_between_page_boundar
             album_number=album_number,
         )
     planner = _planner(tmp_path, store, preferences)
-    timestamps = iter((0.0, 31.0, 31.0, 31.0, 31.0, 31.0))
+    # F-076 adds monotonic reads per inspection; keep a long 31s tail so
+    # the fake clock never exhausts while still crossing the persist interval
+    timestamps = iter((0.0, *(31.0 for _ in range(200))))
     planner._monotonic_clock = lambda: next(timestamps)  # noqa: SLF001
     handle = await planner.create_preview(
         selection=LibraryManagementSelection(kind="roots", ids=("root-1",)),
@@ -1227,6 +1234,11 @@ async def test_preview_falls_back_to_plain_lyrics_when_synced_is_unsupported(
         else []
     )
     assert capability["blockers"] == expected_blockers
+    if audio_format == "m4a":
+        assert item.reason_code == "FIELD_UNSUPPORTED_BY_FORMAT"
+        assert all(
+            blocker != item.reason_code for blocker in capability["blockers"]
+        )
     assert not any("lyrics_synced" in blocker for blocker in capability["blockers"])
     assert replacement.read_bytes() == before
 
@@ -2101,6 +2113,175 @@ async def test_preview_blocks_destination_collision_without_overwrite(
     assert destination.read_bytes() == b"occupied"
 
 
+def _add_catalog_collision_track(
+    database: Path,
+    source: Path,
+    *,
+    relative_path: str,
+    file_path: str,
+    availability: str,
+) -> None:
+    metadata = source.stat()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO local_tracks "
+            "(id, local_album_id, root_id, file_path, relative_path, path_hash, "
+            "file_size_bytes, file_mtime_ns, stat_revision, stat_revision_kind, "
+            "availability, tag_revision, title, title_folded, artist_name, "
+            "artist_name_folded, album_title, album_title_folded, album_artist_name, "
+            "album_artist_name_folded, disc_number, track_number, year, genre, "
+            "genre_folded, file_format, ingest_source, imported_at, membership_source) "
+            "VALUES ('collision-track', 'album-1', 'root-1', ?, ?, ?, "
+            "?, ?, ?, 'exact', ?, 'tag-1', 'Collision Track', 'collision track', "
+            "'Alpha', 'alpha', 'Management Album', 'management album', 'Alpha', "
+            "'alpha', 1, 2, 2024, 'Electronic', 'electronic', 'flac', 'scan', 1, "
+            "'automatic')",
+            (
+                file_path,
+                relative_path,
+                hashlib.sha256(relative_path.encode()).hexdigest(),
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                f"{metadata.st_size}:{metadata.st_mtime_ns}",
+                availability,
+            ),
+        )
+
+
+async def _run_collision_preview(tmp_path: Path, availability: str):
+    (
+        root,
+        source,
+        preferences,
+        store,
+        settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    destination_relative = (
+        "Johann Sebastian Bach; Glenn Gould/"
+        "Goldberg Variations, BWV 988 (1982)/01 - Aria.flac"
+    )
+    destination = root / destination_relative
+    assert not destination.exists()
+    _add_catalog_collision_track(
+        tmp_path / "library.db",
+        source,
+        relative_path=destination_relative,
+        file_path=str(destination),
+        availability=availability,
+    )
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    await planner.run_claimed_preview(claimed, "worker-1")
+    return await store.list_library_management_plan_items(handle.job_id)
+
+
+@pytest.mark.asyncio
+async def test_preview_ignores_missing_catalog_destination_collision(
+    tmp_path: Path,
+) -> None:
+    plan = await _run_collision_preview(tmp_path, availability="missing")
+
+    assert len(plan) == 1
+    assert plan[0].eligibility in {"eligible", "warning"}
+    assert plan[0].reason_code != "PATH_COLLISION_DIFFERENT"
+    assert not any(
+        evidence.get("existing_local_track_id") == "collision-track"
+        for evidence in json.loads(plan[0].collision_json)
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_still_blocks_excluded_catalog_destination_collision(
+    tmp_path: Path,
+) -> None:
+    plan = await _run_collision_preview(tmp_path, availability="excluded")
+    track_item = next(value for value in plan if value.local_track_id == "track-1")
+
+    assert track_item.eligibility == "blocked"
+    assert track_item.reason_code == "PATH_COLLISION_DIFFERENT"
+    assert any(
+        evidence.get("existing_local_track_id") == "collision-track"
+        for evidence in json.loads(track_item.collision_json)
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_still_blocks_indexed_catalog_destination_collision(
+    tmp_path: Path,
+) -> None:
+    plan = await _run_collision_preview(tmp_path, availability="indexed")
+    track_item = next(value for value in plan if value.local_track_id == "track-1")
+
+    assert track_item.eligibility == "blocked"
+    assert track_item.reason_code == "PATH_COLLISION_DIFFERENT"
+    assert any(
+        evidence.get("existing_local_track_id") == "collision-track"
+        for evidence in json.loads(track_item.collision_json)
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_ignores_missing_normalized_catalog_collision(
+    tmp_path: Path,
+) -> None:
+    (
+        root,
+        source,
+        preferences,
+        store,
+        settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    missing_relative = (
+        "Johann Sebastian Bach; Glenn Gould/"
+        "Goldberg Variations, BWV 988 (1982)/01 - ARIA.FLAC"
+    )
+    missing_path = root / missing_relative
+    assert not missing_path.exists()
+    _add_catalog_collision_track(
+        tmp_path / "library.db",
+        source,
+        relative_path=missing_relative,
+        file_path=str(missing_path),
+        availability="missing",
+    )
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    await planner.run_claimed_preview(claimed, "worker-1")
+    plan = await store.list_library_management_plan_items(handle.job_id)
+
+    assert len(plan) == 1
+    assert plan[0].eligibility in {"eligible", "warning"}
+    assert plan[0].reason_code != "PATH_COLLISION_DIFFERENT"
+    assert not any(
+        evidence.get("classification") == "normalized_catalog_path_collision"
+        for evidence in json.loads(plan[0].collision_json)
+    )
+
+
 def test_destination_collision_allows_case_only_rename_of_source(
     tmp_path: Path,
 ) -> None:
@@ -2159,6 +2340,136 @@ async def test_preview_marks_provider_deferral_as_warning(
 
     assert plan[0].eligibility == "warning"
     assert plan[0].reason_code == "OPTIONAL_ENRICHMENT_DEFERRED"
+
+@pytest.mark.asyncio
+async def test_preview_persists_per_source_deferred_detail_with_stable_codes(
+    tmp_path: Path,
+) -> None:
+    (
+        _root,
+        _source,
+        preferences,
+        store,
+        _settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.genres.sources = ["musicbrainz", "listenbrainz"]
+    profile.enrichment.lyrics.enabled = True
+    profile.enrichment.replaygain.enabled = True
+    profile.enrichment.replaygain.mode = "replace"
+    profile.artwork.external_enabled = True
+    saved = preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+    lyrics = AsyncMock()
+    lyrics.project.return_value = LyricsProjection(
+        status="deferred", reason="The lyrics provider is not available."
+    )
+    artwork_repository = AsyncMock()
+    artwork_repository.list_management_artwork.side_effect = ExternalServiceError(
+        "artwork provider down"
+    )
+    planner = _planner(
+        tmp_path,
+        store,
+        preferences,
+        artwork_repository=artwork_repository,
+        lyrics=lyrics,
+    )
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=saved.settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+
+    await planner.run_claimed_preview(claimed, "worker-1")
+    plan = await store.list_library_management_plan_items(handle.job_id)
+
+    assert plan[0].eligibility == "warning"
+    assert plan[0].reason_code == "OPTIONAL_ENRICHMENT_DEFERRED"
+    diff = json.loads(plan[0].diff_json)
+    capability = json.loads(plan[0].capability_json)
+    deferred = diff["deferred_sources"]
+    assert "genre:listenbrainz" in deferred
+    assert any(value.startswith("artwork:") for value in deferred)
+    assert "lyrics:deferred" in deferred
+    assert "replaygain:deferred" in deferred
+    assert capability["blockers"] == []
+    mapped = LibraryManagementPreviewService._item(plan[0])
+    assert mapped.diff["deferred_sources"] == deferred
+    assert mapped.reason_code == "OPTIONAL_ENRICHMENT_DEFERRED"
+    snapshot = await store.get_library_management_job_snapshot(handle.job_id)
+    assert snapshot is not None
+    summary = json.loads(snapshot.summary_json)
+    assert summary["reasons"] == {"OPTIONAL_ENRICHMENT_DEFERRED": 1}
+    assert summary["deferred_sources"]["genre:listenbrainz"] == 1
+    assert summary["deferred_sources"]["lyrics:deferred"] == 1
+    assert summary["deferred_sources"]["replaygain:deferred"] == 1
+    assert (
+        sum(
+            1
+            for key in summary["deferred_sources"]
+            if key.startswith("artwork:")
+        )
+        >= 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_warning_without_deferral_keeps_a_stable_reason_code(
+    tmp_path: Path,
+) -> None:
+    (
+        root,
+        _source,
+        preferences,
+        store,
+        _settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    (root / "notes.cue").write_bytes(b"cue")
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.organization.move_sidecars = True
+    saved = preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=saved.settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+
+    await planner.run_claimed_preview(claimed, "worker-1")
+    item = (await store.list_library_management_plan_items(handle.job_id))[0]
+    capability = json.loads(item.capability_json)
+
+    assert item.eligibility == "warning"
+    assert item.reason_code == "FIELD_UNSUPPORTED_BY_FORMAT"
+    assert "moved path-bearing sidecars are not rewritten" in capability["warnings"]
 
 
 @pytest.mark.asyncio
@@ -2272,6 +2583,30 @@ def test_sidecar_planning_is_album_relative_bounded_and_never_follows_symlinks(
         source, destination, profile, True
     )
     assert reason == "SIDECAR_COLLISION"
+
+
+def test_sidecar_planning_covers_back_booklet_and_medium_artwork(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir(parents=True)
+    destination.mkdir()
+    (source / "back.jpg").write_text("back", encoding="utf-8")
+    (source / "booklet01.jpg").write_text("booklet", encoding="utf-8")
+    (source / "medium2.jpg").write_text("medium", encoding="utf-8")
+    profile = picard_style_organizer_profile()
+
+    planned, reason = LibraryManagementPlanner._sidecars(
+        source, destination, profile, True
+    )
+
+    assert reason is None
+    assert sorted(item["source_relative_path"] for item in planned) == [
+        "back.jpg",
+        "booklet01.jpg",
+        "medium2.jpg",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2441,3 +2776,515 @@ async def test_preview_reuses_later_artwork_success_across_the_release_bundle(
         value["source_candidate_id"] for value in (*first_choices, *second_choices)
     } == {"exact-front"}
     assert all(item.reason_code != "OPTIONAL_ENRICHMENT_DEFERRED" for item in plan)
+
+
+def _braced_canonical_release(album_title: str) -> MbManagementRelease:
+    payload = json.loads(
+        (FIXTURES / "musicbrainz" / "management_release.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    payload["title"] = album_title
+    return msgspec.json.decode(json.dumps(payload).encode(), type=MbManagementRelease)
+
+
+def _external_artwork_settings(preferences) -> str:
+    current = preferences.get_library_management_settings()
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    profile.artwork.embedded_enabled = False
+    profile.artwork.external_enabled = True
+    saved = preferences.save_library_management_settings_if_current(
+        settings, expected_settings_revision=current.settings_revision
+    )
+    return saved.settings_revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "album_title",
+    ["Live {2020}", "Live {Deluxe}"],
+)
+async def test_preview_keeps_braced_album_directory_in_artwork_fallback(
+    tmp_path: Path,
+    album_title: str,
+) -> None:
+    """F-075/F-083: without an external naming script the composed fallback
+    path is normalized literally - brace-bearing album directories are neither
+    re-rendered as templates nor blocked with SCRIPT_VALIDATION_FAILED."""
+    (
+        root,
+        _source,
+        preferences,
+        store,
+        settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    saved_settings_revision = _external_artwork_settings(preferences)
+    planner = _planner(
+        tmp_path,
+        store,
+        preferences,
+        artwork_repository=_ArtworkRepository(),
+        canonical_release=_braced_canonical_release(album_title),
+    )
+    before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=saved_settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    await planner.run_claimed_preview(claimed, "worker-1")
+
+    plan = await store.list_library_management_plan_items(handle.job_id)
+    choices = json.loads(plan[0].artwork_choices_json)
+
+    assert plan[0].eligibility == "eligible"
+    assert plan[0].reason_code != SCRIPT_VALIDATION_FAILED
+    assert len(choices) == 1
+    assert choices[0]["output_kind"] == "external"
+    destination = str(choices[0]["destination_relative_path"])
+    # the standard template appends " (year)" after the album title
+    assert destination.startswith(
+        f"Johann Sebastian Bach; Glenn Gould/{album_title} (1982)/"
+    )
+    assert destination.endswith("cover.png")
+    # planning never writes: the tree is byte-for-byte what it was before
+    after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_preview_replay_after_operation_purge_reports_not_found(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-082: a purged operation row must surface not-found, not a
+    different-preview-request conflict, when the snapshot row survives."""
+    from core.exceptions import ResourceNotFoundError
+
+    (
+        root,
+        _source,
+        preferences,
+        store,
+        settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key="purged-preview",
+    )
+
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "DELETE FROM library_operation_jobs WHERE id=?", (handle.job_id,)
+        )
+
+    # the store's idempotency lookup lives in the operation row it just lost;
+    # activation coalescing can still hand back the surviving snapshot's id.
+    async def coalesced_purged_replay(*_args, **_kwargs):
+        return handle.job_id, False
+
+    monkeypatch.setattr(
+        store, "create_library_management_job", coalesced_purged_replay
+    )
+
+    with pytest.raises(ResourceNotFoundError, match="no longer exists"):
+        await planner.create_preview(
+            selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+            profile_id=PICARD_ORGANIZER_PROFILE_ID,
+            expected_settings_revision=settings_revision,
+            expected_policy_revision=policy_revision,
+            actor_user_id="admin",
+            idempotency_key="purged-preview",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sidecar_budget_charges_matched_candidates_not_walked_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-085: unrelated files in the source directory must not consume the
+    sidecar candidate budget (and the raw walk stays bounded separately)."""
+    monkeypatch.setattr(planner_module, "MAX_SIDECAR_ENTRIES", 2)
+
+    source_directory = tmp_path / "source-album"
+    source_directory.mkdir(parents=True)
+    destination_directory = tmp_path / "destination-album"
+    destination_directory.mkdir()
+    for index in range(10):
+        (source_directory / f"unrelated-{index}.txt").write_bytes(b"noise")
+    for index in range(2):
+        (source_directory / f"{index:02d}-side.cue").write_text("FILE a.flac WAVE")
+
+    matches, collision_reason = LibraryManagementPlanner._sidecars(
+        source_directory,
+        destination_directory,
+        picard_style_organizer_profile(),
+        bundle_first=True,
+    )
+
+    assert collision_reason is None
+    assert len(matches) == 2
+
+
+@pytest.mark.asyncio
+async def test_sidecar_candidate_budget_still_blocks_at_the_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-085: the candidate cap still fires once MATCHED sidecars exceed it."""
+    monkeypatch.setattr(planner_module, "MAX_SIDECAR_ENTRIES", 2)
+
+    source_directory = tmp_path / "source-album"
+    source_directory.mkdir(parents=True)
+    destination_directory = tmp_path / "destination-album"
+    destination_directory.mkdir()
+    for index in range(10):
+        (source_directory / f"unrelated-{index}.txt").write_bytes(b"noise")
+    for index in range(3):
+        (source_directory / f"{index:02d}-side.cue").write_text("FILE a.flac WAVE")
+
+    matches, collision_reason = LibraryManagementPlanner._sidecars(
+        source_directory,
+        destination_directory,
+        picard_style_organizer_profile(),
+        bundle_first=True,
+    )
+
+    assert collision_reason == "SIDECAR_COLLISION"
+    assert len(matches) == 2
+
+
+@pytest.mark.asyncio
+async def test_sidecar_walk_guard_still_bounds_pathological_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-085: the generous raw-walk guard (10x the candidate budget) still
+    aborts unbounded directories instead of walking forever."""
+    monkeypatch.setattr(planner_module, "MAX_SIDECAR_ENTRIES", 2)
+
+    source_directory = tmp_path / "source-album"
+    source_directory.mkdir(parents=True)
+    destination_directory = tmp_path / "destination-album"
+    destination_directory.mkdir()
+    for index in range(40):
+        (source_directory / f"unrelated-{index}.txt").write_bytes(b"noise")
+
+    matches, collision_reason = LibraryManagementPlanner._sidecars(
+        source_directory,
+        destination_directory,
+        picard_style_organizer_profile(),
+        bundle_first=True,
+    )
+
+    assert collision_reason == "SIDECAR_COLLISION"
+    assert matches == []
+
+
+def _inspection_subject(track_id: str, relative_path: str):
+    from models.library_management_planning import LibraryManagementSelectionSubject
+
+    return LibraryManagementSelectionSubject(
+        ordinal=0,
+        bundle_ordinal=0,
+        bundle_first=True,
+        local_album_id="album-1",
+        local_track_id=track_id,
+        album_revision=1,
+        track_revision=1,
+        root_id="root-1",
+        relative_path=relative_path,
+        file_path=f"/music/{relative_path}",
+        file_size_bytes=1,
+        file_mtime_ns=1,
+        stat_revision="1:1",
+        tag_revision="tag-1",
+        availability="indexed",
+        applied_policy="automatic",
+        file_format="flac",
+        disc_number=1,
+        track_number=1,
+        track_title="Track",
+        artist_name="Artist",
+        album_title="Album",
+        album_artist_name="Artist",
+        year=2024,
+        album_artwork_version=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_inspection_saturation_fails_fast_without_charging_root_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F-076/F-084: a saturated shared pool returns FILE_UNREADABLE promptly
+    and must NOT consume the per-root timeout budget (the root is not faulty)."""
+    import concurrent.futures
+
+    planner = _planner(tmp_path, AsyncMock(), AsyncMock())
+    monkeypatch.setattr(planner_module, "_source_inspection_inflight", {})
+    monkeypatch.setattr(planner_module, "_source_inspection_cooldown", {})
+    single = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(planner_module, "_SOURCE_INSPECTION_EXECUTOR", single)
+    monkeypatch.setattr(planner_module, "_INSPECTION_POOL_WORKERS", 1)
+
+    blocked = threading.Event()
+    started = threading.Event()
+
+    def hang(_subject, _roots):
+        started.set()
+        blocked.wait(timeout=5)
+
+    monkeypatch.setattr(planner, "_inspect_source", hang)
+    timed_out_sources: set[tuple[str, str, int, int]] = set()
+    budget_by_root: dict[str, int] = {}
+    subject_a = _inspection_subject("track-a", "a.flac")
+    subject_b = _inspection_subject("track-b", "b.flac")
+
+    first = asyncio.create_task(
+        planner._inspect_source_bounded(
+            subject_a,
+            {},
+            timed_out_sources=timed_out_sources,
+            timed_out_inspections_by_root=budget_by_root,
+        )
+    )
+    for _ in range(200):
+        if planner_module._source_inspection_inflight:
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    second = await planner._inspect_source_bounded(
+        subject_b,
+        {},
+        timed_out_sources=timed_out_sources,
+        timed_out_inspections_by_root=budget_by_root,
+    )
+
+    assert second.document is None and second.reason_code == FILE_UNREADABLE
+    # saturation is not a root fault: the budget stays untouched
+    assert budget_by_root.get("root-1", 0) == 0
+    assert "saturated" in caplog.text
+    with caplog.at_level(logging.WARNING):
+        pass
+
+    blocked.set()
+    await asyncio.wait_for(first, timeout=5)
+    single.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_inspection_cooldown_recover_after_abandoned_read_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-076/F-084: once an abandoned read finally completes, its cooldown
+    clears and the same source plans again without a process restart."""
+    planner = _planner(tmp_path, AsyncMock(), AsyncMock())
+    monkeypatch.setattr(planner_module, "_source_inspection_inflight", {})
+    monkeypatch.setattr(planner_module, "_source_inspection_cooldown", {})
+    monkeypatch.setattr(planner_module, "SOURCE_INSPECTION_TIMEOUT_SECONDS", 0.05)
+
+    release = threading.Event()
+    real_inspect = planner._inspect_source
+    inspection_calls = 0
+
+    def slow_then_healthy(subject, roots):
+        nonlocal inspection_calls
+        inspection_calls += 1
+        release.wait(timeout=5)
+        return real_inspect(subject, roots)
+
+    monkeypatch.setattr(planner, "_inspect_source", slow_then_healthy)
+    timed_out_sources: set[tuple[str, str, int, int]] = set()
+    budget_by_root: dict[str, int] = {}
+    subject = _inspection_subject("track-a", "a.flac")
+    roots = {"root-1": SimpleNamespace(path=str(tmp_path))}
+
+    timed_out = await planner._inspect_source_bounded(
+        subject,
+        roots,
+        timed_out_sources=timed_out_sources,
+        timed_out_inspections_by_root=budget_by_root,
+    )
+    assert timed_out.reason_code == FILE_UNREADABLE
+    assert budget_by_root["root-1"] == 1
+
+    # the abandoned read eventually completes -> cooldown cleared
+    release.set()
+    for _ in range(200):
+        if (
+            planner_module._source_inspection_cooldown.get(
+                planner._source_inspection_key(subject)
+            )
+            is None
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    # a later preview job owns a fresh per-job timeout set; the cooldown from
+    # the abandoned read must not leak into it once the read completed
+    recovered = await planner._inspect_source_bounded(
+        subject,
+        roots,
+        timed_out_sources=set(),
+        timed_out_inspections_by_root=budget_by_root,
+    )
+
+    # the retry actually re-submitted to the pool: the synthetic subject's
+    # recorded file_path lives outside the temp root, so the healthy lane's
+    # outcome is OUT_OF_ROOT rather than another cooldown short-circuit
+    assert recovered.reason_code == "OUT_OF_ROOT"
+    assert inspection_calls == 2
+    assert budget_by_root["root-1"] == 1
+
+
+def test_pinned_profile_holds_private_deep_copies(tmp_path: Path) -> None:
+    """F-078: mutating the live settings structs after pinning must never leak
+    into an already-sealed PinnedLibraryManagementProfile."""
+    from models.library_management_planning import pin_library_management_profile
+
+    _root, _source, preferences, _store, _settings_revision, _policy_revision = (
+        _configured(tmp_path)
+    )
+    settings = preferences.get_library_management_settings_raw()
+    profile = next(
+        value for value in settings.profiles if value.id == PICARD_ORGANIZER_PROFILE_ID
+    )
+    original_cleanup = profile.organization.source_cleanup
+    standard_script = next(
+        value
+        for value in settings.naming_scripts
+        if value.id == profile.organization.naming_script_id
+    )
+    original_standard_source = standard_script.source
+
+    pinned = pin_library_management_profile(settings, profile)
+
+    profile.name = "tampered-name"
+    profile.organization.source_cleanup = "keep"
+    standard_script.source = "{title}.flac"
+
+    assert pinned.profile.name != "tampered-name"
+    assert pinned.profile.organization.source_cleanup == original_cleanup
+    assert pinned.naming_script.source == original_standard_source
+
+
+@pytest.mark.asyncio
+async def test_seal_preview_succeeds_when_unrelated_catalog_revision_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        _root,
+        _source,
+        preferences,
+        store,
+        settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    original_finalize = store.finalize_library_management_preview
+
+    async def increment_catalog_before_finalize(*args, **kwargs):
+        with sqlite3.connect(tmp_path / "library.db") as connection:
+            connection.execute(
+                "UPDATE library_catalog_revision "
+                "SET value = value + 1 WHERE singleton = 1"
+            )
+        return await original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "finalize_library_management_preview",
+        increment_catalog_before_finalize,
+    )
+
+    snapshot = await planner.run_claimed_preview(claimed, "worker-1")
+
+    assert snapshot.phase == "ready"
+    plan = await store.list_library_management_plan_items(handle.job_id)
+    assert len(plan) == 1
+    assert plan[0].eligibility in {"eligible", "warning"}
+
+
+@pytest.mark.asyncio
+async def test_seal_preview_rejects_when_selected_track_stat_revision_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        _root,
+        _source,
+        preferences,
+        store,
+        settings_revision,
+        policy_revision,
+    ) = _configured(tmp_path)
+    planner = _planner(tmp_path, store, preferences)
+    handle = await planner.create_preview(
+        selection=LibraryManagementSelection(kind="tracks", ids=("track-1",)),
+        profile_id=PICARD_ORGANIZER_PROFILE_ID,
+        expected_settings_revision=settings_revision,
+        expected_policy_revision=policy_revision,
+        actor_user_id="admin",
+        idempotency_key=None,
+    )
+    claimed = await store.claim_operation_job(
+        "worker-1", now=100, lease_seconds=60, kind="library_management"
+    )
+    assert claimed is not None
+    original_finalize = store.finalize_library_management_preview
+
+    async def mutate_stat_before_finalize(*args, **kwargs):
+        with sqlite3.connect(tmp_path / "library.db") as connection:
+            connection.execute(
+                "UPDATE local_tracks SET stat_revision='changed' WHERE id='track-1'"
+            )
+        return await original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "finalize_library_management_preview",
+        mutate_stat_before_finalize,
+    )
+
+    with pytest.raises(StaleRevisionError, match="membership changed"):
+        await planner.run_claimed_preview(claimed, "worker-1")
+
+    snapshot = await store.get_library_management_job_snapshot(handle.job_id)
+    assert snapshot is not None
+    assert snapshot.phase == "planning"

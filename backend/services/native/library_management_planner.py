@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 import fnmatch
@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 import secrets
 import shutil
 import stat
+import threading
 import time
 import unicodedata
 import uuid
@@ -195,12 +196,33 @@ def _scrubbed_raw_tag_evidence(
 
 
 # Audio metadata reads can block indefinitely on a broken network mount. A dedicated
-# process-lifetime pool keeps those abandoned calls away from asyncio's shared executor
-# and caps the total resource debt across repeated previews.
+# process-lifetime pool keeps those abandoned calls away from asyncio's shared executor.
+# F-076: the pool size is independent of the per-root timeout budget, in-flight
+# submissions are tracked, and a saturated pool fails fast without poisoning a
+# root's fault budget - three hung mounts must not disable preview planning.
+_INSPECTION_POOL_WORKERS = min(8, max(4, os.cpu_count() or 4))
 _SOURCE_INSPECTION_EXECUTOR = ThreadPoolExecutor(
-    max_workers=MAX_TIMED_OUT_INSPECTIONS_PER_ROOT,
+    max_workers=_INSPECTION_POOL_WORKERS,
     thread_name_prefix="management-source-inspection",
 )
+_SOURCE_INSPECTION_COOLDOWN_SECONDS = SOURCE_INSPECTION_TIMEOUT_SECONDS * 4
+_source_inspection_lock = threading.Lock()
+_source_inspection_inflight: dict[
+    Future, tuple[tuple[str, str, int, int], float]
+] = {}
+_source_inspection_cooldown: dict[tuple[str, str, int, int], float] = {}
+
+
+def _forget_inspection_future(
+    future: Future,
+    source_key: tuple[str, str, int, int],
+) -> None:
+    with _source_inspection_lock:
+        _source_inspection_inflight.pop(future, None)
+        if not future.cancelled():
+            # an abandoned read that eventually finished means the mount is
+            # healthy again; clear the cooldown so retries recover (F-076)
+            _source_inspection_cooldown.pop(source_key, None)
 
 
 def _json(value: object) -> str:
@@ -406,9 +428,15 @@ class LibraryManagementPlanner:
                 else None
             )
             existing_token = _preview_token(existing_id, existing_idempotency_key)
+            if operation is None:
+                # F-082: the snapshot survived a history purge that reclaimed
+                # the operation row; retries must get not-found, not a
+                # mismatched-request conflict.
+                raise ResourceNotFoundError(
+                    "The preview request for this idempotency key no longer exists."
+                )
             request_matches = (
                 existing is not None
-                and operation is not None
                 and existing_idempotency_key is not None
                 and existing.preview_token_hash == _sha256_text(existing_token)
                 and existing.mode == snapshot.mode
@@ -1076,24 +1104,60 @@ class LibraryManagementPlanner:
             >= MAX_TIMED_OUT_INSPECTIONS_PER_ROOT
         ):
             return _SourceInspection(subject, None, None, "", FILE_UNREADABLE)
+        now = self._monotonic_clock()
+        with _source_inspection_lock:
+            in_flight = len(_source_inspection_inflight)
+            key_in_flight = any(
+                key == source_key for key, _submitted in _source_inspection_inflight.values()
+            )
+            cooldown_until = _source_inspection_cooldown.get(source_key)
+        if (
+            cooldown_until is not None
+            and now < cooldown_until
+            and key_in_flight
+        ):
+            # F-076: the previously abandoned read on this source is still
+            # occupying its thread; fail fast without charging the root budget.
+            return _SourceInspection(subject, None, None, "", FILE_UNREADABLE)
+        if in_flight >= _INSPECTION_POOL_WORKERS:
+            # F-076: saturation is a process-wide condition (hung mounts from
+            # any job), not a fault of this root - never consume its budget.
+            logger.warning(
+                "Library Management source inspection pool saturated: "
+                "root_id=%s track_id=%s",
+                subject.root_id,
+                subject.local_track_id,
+            )
+            return _SourceInspection(subject, None, None, "", FILE_UNREADABLE)
+        concurrent_future = _SOURCE_INSPECTION_EXECUTOR.submit(
+            self._inspect_source,
+            subject,
+            roots,
+        )
+        asyncio_future = asyncio.wrap_future(concurrent_future)
+        with _source_inspection_lock:
+            _source_inspection_inflight[concurrent_future] = (source_key, now)
+        concurrent_future.add_done_callback(
+            lambda done, key=source_key: _forget_inspection_future(done, key)
+        )
         try:
-            loop = asyncio.get_running_loop()
             return await asyncio.wait_for(
-                loop.run_in_executor(
-                    _SOURCE_INSPECTION_EXECUTOR,
-                    self._inspect_source,
-                    subject,
-                    roots,
-                ),
+                asyncio_future,
                 timeout=SOURCE_INSPECTION_TIMEOUT_SECONDS,
             )
         except TimeoutError:
+            concurrent_future.cancel()
+            with _source_inspection_lock:
+                _source_inspection_cooldown[source_key] = (
+                    self._monotonic_clock() + _SOURCE_INSPECTION_COOLDOWN_SECONDS
+                )
             timed_out_sources.add(source_key)
             timed_out_inspections_by_root[subject.root_id] = (
                 timed_out_inspections_by_root.get(subject.root_id, 0) + 1
             )
             logger.warning(
-                "Library Management source inspection timed out: root_id=%s track_id=%s",
+                "Library Management source inspection timed out: "
+                "root_id=%s track_id=%s",
                 subject.root_id,
                 subject.local_track_id,
             )
@@ -1277,9 +1341,15 @@ class LibraryManagementPlanner:
             if source.subject.bundle_first
             else msgspec.structs.replace(profile.artwork, external_enabled=False)
         )
+        # F-PERF-07: one bounded pass cache per album planning pass so the
+        # projection reuses this inspection instead of walking the directory
+        # twice. Discarded immediately after the projection completes.
+        artwork_pass_cache = self._artwork.new_pass_cache()
         existing_external = (
             await self._artwork.inspect_existing_external(
-                artwork_settings, source.path.parent
+                artwork_settings,
+                source.path.parent,
+                pass_cache=artwork_pass_cache,
             )
             if source.subject.bundle_first
             else ()
@@ -1289,6 +1359,7 @@ class LibraryManagementPlanner:
             release_mbid=canonical_release.identifiers.release_mbid,
             release_group_mbid=canonical_release.identifiers.release_group_mbid,
             album_directory=source.path.parent,
+            pass_cache=artwork_pass_cache,
             existing_embedded=tuple(
                 ExistingArtworkDescriptor(
                     image_type=value.image_type,
@@ -1392,7 +1463,8 @@ class LibraryManagementPlanner:
             destination_path,
         )
         catalog_collision = await self._store.get_target_track_by_path(
-            str(destination_path)
+            str(destination_path),
+            exclude_missing=True,
         )
         catalog_directory = PurePosixPath(destination_relative).parent
         catalog_siblings = await self._store.list_target_tracks_in_directory(
@@ -1400,6 +1472,7 @@ class LibraryManagementPlanner:
             ""
             if catalog_directory == PurePosixPath(".")
             else catalog_directory.as_posix(),
+            exclude_missing=True,
         )
         collisions, collision_reason = await asyncio.to_thread(
             self._destination_collisions,
@@ -1564,8 +1637,27 @@ class LibraryManagementPlanner:
             warnings.append("moved path-bearing sidecars are not rewritten")
         reason_code = source.reason_code
         eligibility = "eligible"
+        # B1: per-source deferred detail mirrors the import lane's
+        # management_warnings tags (automatic_import_management_service).
+        deferred_sources = (
+            *(f"genre:{value}" for value in genre_projection.deferred_sources),
+            *(f"artwork:{value}" for value in artwork_projection.deferred_sources),
+            *(
+                (f"lyrics:{lyrics_projection.status}",)
+                if lyrics_projection.status in {"deferred", "mismatch", "not_found"}
+                else ()
+            ),
+            *(
+                ("replaygain:deferred",)
+                if replaygain_analysis is not None
+                and replaygain_analysis.status == "deferred"
+                else ()
+            ),
+        )
         if blockers:
             eligibility = "blocked"
+            # B1: reason_code keeps the stable capability code; the full
+            # sentences stay in capability.blockers for the inspector.
             reason_code = FIELD_UNSUPPORTED_BY_FORMAT
         elif collision_reason is not None:
             eligibility = "blocked"
@@ -1573,25 +1665,22 @@ class LibraryManagementPlanner:
         elif sidecar_reason is not None or external_artwork_reason is not None:
             eligibility = "blocked"
             reason_code = sidecar_reason or external_artwork_reason
-        elif (
-            genre_projection.deferred_sources
-            or artwork_projection.deferred_sources
-            or lyrics_projection.status in {"deferred", "mismatch", "not_found"}
-            or (
-                replaygain_analysis is not None
-                and replaygain_analysis.status == "deferred"
-            )
-        ):
+        elif deferred_sources:
             eligibility = "warning"
             reason_code = OPTIONAL_ENRICHMENT_DEFERRED
         elif warnings:
             eligibility = "warning"
+            # B2: warning rows must carry a stable code, never NULL.
+            reason_code = FIELD_UNSUPPORTED_BY_FORMAT
         identity_track = next(
             value
             for value in identity.tracks
             if value.local_track_id == source.subject.local_track_id
         )
-        estimated = (
+        # F-077: every output stages through a destination-side hidden temp
+        # before its rename, so the transient peak on the volume is the written
+        # footprint twice; counting it once lets a passing seal hit ENOSPC.
+        estimated = 2 * (
             (
                 source.subject.file_size_bytes
                 if write_plan.requires_write or path_changed
@@ -1663,6 +1752,8 @@ class LibraryManagementPlanner:
                     )
                 }
             ),
+            # B1: per-source deferred detail the header/inspector can read.
+            "deferred_sources": list(deferred_sources),
             "source_relative_path": source.subject.relative_path,
             "destination_relative_path": destination_relative,
             "sidecars": sidecars,
@@ -1869,9 +1960,9 @@ class LibraryManagementPlanner:
                         evidence.append(
                             {
                                 "classification": "normalized_path_collision",
-                                "existing_relative_path": (existing_path)
-                                .relative_to(destination_root)
-                                .as_posix(),
+                                "existing_relative_path": (
+                                    existing_path.relative_to(destination_root)
+                                ).as_posix(),
                             }
                         )
                         return evidence, PATH_COLLISION_DIFFERENT
@@ -1896,6 +1987,11 @@ class LibraryManagementPlanner:
         destination_keys: set[str] = set()
         collision_reason: str | None = None
         examined = 0
+        matched_examined = 0
+        # F-085: the budget charges pattern-matched sidecar candidates only -
+        # a directory with >10k unrelated files must not false-block a bundle.
+        # A generous raw-walk guard still bounds pathological directories.
+        walk_guard = MAX_SIDECAR_ENTRIES * 10
         patterns = tuple(value.casefold() for value in organization.sidecar_patterns)
         for current_root, directories, files in os.walk(
             source_directory, followlinks=False
@@ -1906,7 +2002,7 @@ class LibraryManagementPlanner:
             )
             for name in sorted(files):
                 examined += 1
-                if examined > MAX_SIDECAR_ENTRIES:
+                if examined > walk_guard:
                     return matches, SIDECAR_COLLISION
                 path = current / name
                 relative = path.relative_to(source_directory).as_posix()
@@ -1926,6 +2022,9 @@ class LibraryManagementPlanner:
                     continue
                 if path.suffix.casefold() in AUDIO_EXTENSION_FORMATS:
                     continue
+                matched_examined += 1
+                if matched_examined > MAX_SIDECAR_ENTRIES:
+                    return matches, SIDECAR_COLLISION
                 target = destination_directory / PurePosixPath(relative)
                 destination_collision = bool(
                     target.exists()
@@ -2021,16 +2120,11 @@ class LibraryManagementPlanner:
             else:
                 stem = "cover" if output.image_type == "front" else output.image_type
                 raw_relative = (destination_parent / f"{stem}.{extension}").as_posix()
-                rendered = self._naming.format_management_path(
+                rendered = self._naming.format_management_literal_path(
                     raw_relative,
-                    named_document,
                     pinned.profile.organization.compatibility,
                     script_name="Default external artwork naming",
                     root=destination_root,
-                    artwork_type=output.image_type,
-                    artwork_comment=output.description,
-                    artwork_extension=extension,
-                    artwork_format=output.format,
                 )
                 relative = rendered.relative_path
                 collision_key = rendered.collision_key

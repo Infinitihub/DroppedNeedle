@@ -32,6 +32,7 @@ LibraryManagementImportJournalState = Literal[
     "rollback_pending",
     "rolled_back",
     "needs_attention",
+    "resolved",
 ]
 
 
@@ -64,6 +65,7 @@ class LibraryManagementImportFile(AppStruct):
     replacement_relative_path: str | None = None
     recycle_bin_path: str | None = None
     authoritative_mapping: bool = False
+    reviewed_recording_identity: bool = False
     release_track_mbid: str | None = None
     medium_position: int | None = None
     release_track_position: int | None = None
@@ -122,6 +124,7 @@ class LibraryManagementImportBundleRecord(AppStruct):
         "completed",
         "rolled_back",
         "needs_attention",
+        "resolved",
     ]
     result_json: str = "{}"
     created_at: float = 0.0
@@ -223,6 +226,8 @@ PATH_TOO_LONG = "PATH_TOO_LONG"
 SCRIPT_VALIDATION_FAILED = "SCRIPT_VALIDATION_FAILED"
 INSUFFICIENT_SPACE = "INSUFFICIENT_SPACE"
 BASELINE_UNAVAILABLE = "BASELINE_UNAVAILABLE"
+BASELINE_SNAPSHOT_MISSING = "BASELINE_SNAPSHOT_MISSING"
+BASELINE_SNAPSHOT_CORRUPT = "BASELINE_SNAPSHOT_CORRUPT"
 UNDO_EXPIRED = "UNDO_EXPIRED"
 RECOVERY_NEEDS_ATTENTION = "RECOVERY_NEEDS_ATTENTION"
 BUNDLE_BLOCKED = "BUNDLE_BLOCKED"
@@ -557,3 +562,4 @@ class LibraryManagementBundleCommitResult(AppStruct):
     catalog_revision: int
     snapshot_revision: int
     committed_journal_ids: tuple[str, ...]
+    committed_journal_revisions: dict[str, int]

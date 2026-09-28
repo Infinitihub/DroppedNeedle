@@ -5,6 +5,7 @@ from typing import Self
 import logging
 import os
 import msgspec
+from core.base_path import normalize_base_path
 from core.exceptions import ConfigurationError
 from infrastructure.file_utils import atomic_write_json, read_json
 
@@ -85,8 +86,16 @@ class Settings(BaseSettings):
     library_db_path: Path = Field(default=Path("/app/cache/library.db"), description="SQLite library database path")
     cover_cache_max_size_mb: int = Field(default=500, description="Maximum cover cache size in MB")
     trusted_proxy_ips: str = Field(
-        default="127.0.0.1",
+        default="127.0.0.1,::1",
         description="Comma-separated IPs/CIDRs trusted as reverse proxies for X-Forwarded-* headers. Configure the private proxy network in a reverse-proxy deployment; never use '*' on a directly reachable service.",
+    )
+    base_path: str = Field(
+        default="",
+        description=(
+            "Reverse-proxy deployment base path ('' or canonical '/seg[/seg]'). "
+            "BASE_PATH mounts the application under this prefix; validated "
+            "strictly by core.base_path.normalize_base_path."
+        ),
     )
     slskd_downloads_path: Path = Field(
         default=Path("/data/downloads/slskd"),
@@ -124,6 +133,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_url(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("base_path")
+    @classmethod
+    def validate_base_path(cls, v: str) -> str:
+        return normalize_base_path(v)
 
     @model_validator(mode='after')
     def validate_config(self) -> Self:

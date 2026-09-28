@@ -9,7 +9,9 @@ real-audio fixtures with the real tagger.
 
 import asyncio
 import shutil
+import sqlite3
 import threading
+import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +24,10 @@ from models.audio import AudioInfo, AudioTag
 from models.drop_import import ItemStatus, JobStatus
 from models.library_management import LibraryManagementImportResult
 from services.native.album_matcher import AlbumIdentifier, MBTrack, _ReleaseMeta
-from services.native.drop_import_service import DropImportService
+from services.native.drop_import_service import (
+    DropImportService,
+    _FORCED_MATCH_REJECTED,
+)
 from services.native.naming import NamingTemplateEngine
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "library"
@@ -59,7 +64,7 @@ def _meta(rg: str = "rg-1") -> _ReleaseMeta:
     )
 
 
-def _tracks() -> list[MBTrack]:
+def _tracks(*, with_release_track_mbids: bool = True) -> list[MBTrack]:
     return [
         MBTrack(
             title="Song One",
@@ -68,6 +73,7 @@ def _tracks() -> list[MBTrack]:
             absolute_position=1,
             length_ms=200_000,
             recording_mbid="rec-1",
+            release_track_mbid="rt-1" if with_release_track_mbids else None,
         ),
         MBTrack(
             title="Song Two",
@@ -76,6 +82,7 @@ def _tracks() -> list[MBTrack]:
             absolute_position=2,
             length_ms=200_000,
             recording_mbid="rec-2",
+            release_track_mbid="rt-2" if with_release_track_mbids else None,
         ),
     ]
 
@@ -203,7 +210,10 @@ def _build_service(
         library_manager=library,
         preferences_service=prefs,
         request_history=AsyncMock(async_get_record=AsyncMock(return_value=None)),
-        wanted_store=AsyncMock(get_watch=AsyncMock(return_value=None)),
+        wanted_store=AsyncMock(
+            get_watch=AsyncMock(return_value=SimpleNamespace(id="w-1")),
+            mark_fulfilled=AsyncMock(),
+        ),
         sse_publisher=AsyncMock(),
         on_import=AsyncMock(),
         staging_root=tmp_path / "imports",
@@ -242,7 +252,7 @@ def _accepted_match(rg: str = "rg-1"):
     )
 
 
-# -- extraction safety --
+# extraction safety
 
 
 def test_safe_extract_refuses_traversal_and_skips_non_audio(tmp_path):
@@ -324,7 +334,7 @@ def test_corrupt_zip_is_noted_not_fatal(tmp_path):
     assert dict(units).keys() == {"good"}
 
 
-# -- the happy path, end to end --
+# the happy path, end to end
 
 
 @pytest.mark.asyncio
@@ -517,6 +527,8 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
     args = service._requests.async_update_status.await_args
     assert args.args[0] == "rg-1"
     assert args.args[1] == "imported"
+    # F-NL-05 positive control: complete authoritative coverage fulfils the watch.
+    service._wanted.mark_fulfilled.assert_awaited_once_with("rg-1", "satisfied")
     events = [c.args[1] for c in service._sse.publish.await_args_list]
     assert "request_imported" in events
     channel = [
@@ -528,7 +540,241 @@ async def test_import_resolves_open_request_and_notifies_requester(tmp_path):
     service._on_import.assert_awaited_once()
 
 
-# -- duplicates and upgrades --
+# F-NL-05: request fulfillment gates on complete authoritative coverage
+
+
+def _configure_fulfillment_spy(service) -> None:
+    """Make every fulfillment side effect observable and default-open."""
+    record = SimpleNamespace(status="approved", user_id="requester-9")
+    service._requests.async_get_record = AsyncMock(return_value=record)
+    service._requests.async_update_status = AsyncMock()
+    service._wanted.get_watch = AsyncMock(
+        return_value=SimpleNamespace(id="w-1")
+    )
+    service._wanted.mark_fulfilled = AsyncMock()
+
+
+def _fulfillment_calls(service) -> dict:
+    events = [c.args[1] for c in service._sse.publish.await_args_list]
+    return {
+        "request_updated": service._requests.async_update_status.await_count,
+        "watch_fulfilled": service._wanted.mark_fulfilled.await_count,
+        "notified": "request_imported" in events,
+    }
+
+
+@pytest.mark.asyncio
+async def test_import_with_unreadable_file_does_not_fulfil_request(tmp_path):
+    """One published track plus one unreadable file leaves the request and
+    wanted watch open; the detail names both symptoms."""
+    tagger = FakeTagger(
+        {
+            # "02 Song Two.flac" is deliberately absent -> unreadable on read.
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, library, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+    # The survivor's fingerprint resolves to the first canonical position, so
+    # it publishes as a mapped track while its sibling stays unreadable.
+    service._fingerprinter.fingerprint = AsyncMock(
+        return_value=SimpleNamespace(status="pass", score=1.0, recording_id="rec-1")
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+        zf.writestr("album/02 Song Two.flac", b"b" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 1
+    assert "unreadable" in (item.detail or "")
+    assert "covers 1 of 2 album tracks" in (item.detail or "")
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+    service._on_import.assert_awaited_once()  # catalog refresh still happens
+
+
+@pytest.mark.asyncio
+async def test_import_with_skipped_mapped_position_does_not_fulfil_request(tmp_path):
+    """An equal-quality copy at one position is a skipped mapped position - the
+    other track publishes but nothing fulfils the request."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, library, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    async def position(rg, disc, pos):
+        if pos == 2:
+            return {
+                "file_path": str(tmp_path / f"existing-{pos}.flac"),
+                "recording_mbid": f"rec-{pos}",
+                "file_format": "flac",
+                "bit_rate": 1000,
+            }
+        return None
+
+    library.get_file_at_position = AsyncMock(side_effect=position)
+
+    upload = tmp_path / "upload.zip"
+    _zip_album(upload)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 1
+    assert "already in your library" in (item.detail or "")
+    assert "covers 1 of 2 album tracks" in (item.detail or "")
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+@pytest.mark.asyncio
+async def test_bonus_only_import_never_fulfils_request(tmp_path):
+    """A single unmapped bonus file publishes unmanaged and stays IMPORTED, but
+    an album request and wanted watch must remain open."""
+    tagger = FakeTagger({"99 Bonus.flac": (_tag("Some Other Song", 9), _info())})
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/99 Bonus.flac", b"c" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    if done.items[0].status == ItemStatus.NEEDS_REVIEW:
+        # the auto match was rejected; the user's manual choice is authoritative
+        await service.match_item(done.items[0].id, "rg-1", user_id="user-1", is_admin=False)
+
+    refreshed = await store.get_item(done.items[0].id)
+    assert refreshed.status == ItemStatus.IMPORTED
+    assert refreshed.files_imported == 1
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+@pytest.mark.asyncio
+async def test_complete_mapped_import_alongside_bonus_still_fulfils(tmp_path):
+    """Bonus files ride along with a fully covered mapped import without
+    blocking or reducing fulfillment."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+            "03 Extra Bonus.flac": (_tag("Extra Bonus", 3), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(return_value=_accepted_match())
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+        zf.writestr("album/02 Song Two.flac", b"b" * 64)
+        zf.writestr("album/03 Extra Bonus.flac", b"c" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    await _wait_job(store, job.id)
+
+    item = (await store.get_job(job.id)).items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 3
+    calls = _fulfillment_calls(service)
+    assert calls["request_updated"] == 1
+    assert calls["watch_fulfilled"] == 1
+    assert calls["notified"] is True
+
+
+@pytest.mark.asyncio
+async def test_missing_canonical_position_does_not_fulfil_request(tmp_path):
+    """Only one of two canonical positions arrives: covered 1 of 2, request and
+    watch stay open even though a file published successfully."""
+    tagger = FakeTagger({"01 Song One.flac": (_tag("Song One", 1), _info())})
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+    service._fingerprinter.fingerprint = AsyncMock(
+        return_value=SimpleNamespace(status="pass", score=1.0, recording_id="rec-1")
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    item = done.items[0]
+    assert item.status == ItemStatus.IMPORTED
+    assert item.files_imported == 1
+    assert "covers 1 of 2 album tracks" in (item.detail or "")
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+@pytest.mark.asyncio
+async def test_no_canonical_tracklist_never_fulfils_request(tmp_path):
+    """Without a canonical tracklist there is no completeness to infer - files
+    may publish, but the request and watch stay open."""
+    tagger = FakeTagger({"01 Song One.flac": (_tag("Song One", 1), _info())})
+    identifier = AsyncMock()
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), []))
+    service, store, _, _ = _build_service(tmp_path, tagger, identifier=identifier)
+    _configure_fulfillment_spy(service)
+
+    upload = tmp_path / "upload.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("album/01 Song One.flac", b"a" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    if done.items[0].status == ItemStatus.NEEDS_REVIEW:
+        await service.match_item(done.items[0].id, "rg-1", user_id="user-1", is_admin=False)
+
+    refreshed = await store.get_item(done.items[0].id)
+    assert refreshed.status == ItemStatus.IMPORTED
+    assert refreshed.files_imported == 1
+    calls = _fulfillment_calls(service)
+    assert calls == {"request_updated": 0, "watch_fulfilled": 0, "notified": False}
+
+
+# duplicates and upgrades
 
 
 @pytest.mark.asyncio
@@ -616,7 +862,7 @@ async def test_strictly_better_quality_upgrades_and_recycles(tmp_path):
     assert library.upsert_file.await_count == 2
 
 
-# -- needs_review, manual match, discard --
+# needs_review, manual match, discard
 
 
 @pytest.mark.asyncio
@@ -752,7 +998,7 @@ async def test_discard_removes_staged_files(tmp_path):
     assert not Path(job.staging_dir).exists()
 
 
-# -- single files and loose drops --
+# single files and loose drops
 
 
 @pytest.mark.asyncio
@@ -787,7 +1033,7 @@ async def test_single_file_identifies_via_fingerprint(tmp_path):
     library.upsert_file.assert_awaited_once()
 
 
-# -- housekeeping --
+# housekeeping
 
 
 @pytest.mark.asyncio
@@ -804,6 +1050,54 @@ async def test_sweep_stale_fails_processing_and_cleans_disk(tmp_path):
     job = await store.get_job("stale-job")
     assert job.status == JobStatus.FAILED
     assert not staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_stale_prunes_90d_old_needs_review_items(tmp_path):
+    """F-02: staged review items pin disk while contributions pin none, so the
+    startup sweep hard-deletes ``needs_review`` items whose parent job is 90d
+    old (clocked on the job ``created_at`` - items carry only a rewritten-on-
+    touch ``updated_at``) and unlinks their staged files. Younger reviews and
+    matched/discarded rows are untouched."""
+    tagger = FakeTagger({})
+    service, store, _, _ = _build_service(tmp_path, tagger)
+    db_path = tmp_path / "library.db"
+
+    async def _seed_review_job(job_id: str, age_days: float, name: str):
+        staging = tmp_path / "imports" / job_id
+        staging.mkdir(parents=True, exist_ok=True)
+        staged = staging / name
+        staged.write_bytes(b"audio")
+        await store.create_job(job_id, "user-1", "Harvey", "album.zip", str(staging))
+        await store.set_job_status(job_id, JobStatus.COMPLETED)
+        item_id = await store.add_item(job_id, "Mystery", [str(staged)], 1)
+        await store.update_item(
+            item_id, status=ItemStatus.NEEDS_REVIEW, detail="match it manually"
+        )
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE drop_import_jobs SET created_at = ? WHERE id = ?",
+                (time.time() - age_days * 86400, job_id),
+            )
+            connection.commit()
+        return item_id, staged
+
+    old_review, old_staged = await _seed_review_job("job-old", 91, "old.flac")
+    old_imported = await store.add_item("job-old", "Done", [], 0)
+    await store.update_item(old_imported, status=ItemStatus.IMPORTED)
+    old_discarded = await store.add_item("job-old", "Gone", [], 0)
+    await store.update_item(old_discarded, status=ItemStatus.DISCARDED)
+    young_review, young_staged = await _seed_review_job("job-young", 89, "young.flac")
+
+    await service.sweep_stale()
+
+    assert await store.get_item(old_review) is None
+    assert not old_staged.exists()
+    young = await store.get_item(young_review)
+    assert young is not None and young.status == ItemStatus.NEEDS_REVIEW
+    assert young_staged.exists()
+    assert (await store.get_item(old_imported)).status == ItemStatus.IMPORTED
+    assert (await store.get_item(old_discarded)).status == ItemStatus.DISCARDED
 
 
 @pytest.mark.asyncio
@@ -827,7 +1121,7 @@ async def test_create_job_requires_library_path(tmp_path):
         )
 
 
-# -- real audio, real tagger --
+# real audio, real tagger
 
 
 @pytest.mark.asyncio
@@ -862,7 +1156,7 @@ async def test_real_fixture_import_stamps_album_identity(tmp_path):
             disc=1,
             absolute_position=1,
             length_ms=int(info1.duration_seconds * 1000),
-            recording_mbid="rec-1",
+            recording_mbid="rec-airbag-0001",
         ),
         MBTrack(
             title=tag2.title or "Two",
@@ -870,7 +1164,7 @@ async def test_real_fixture_import_stamps_album_identity(tmp_path):
             disc=1,
             absolute_position=2,
             length_ms=int(info1.duration_seconds * 1000),
-            recording_mbid="rec-2",
+            recording_mbid="rec-paranoid-0002",
         ),
     ]
     identifier.release_tracks = AsyncMock(return_value=(meta, tracks))
@@ -897,3 +1191,375 @@ async def test_real_fixture_import_stamps_album_identity(tmp_path):
         stamped.musicbrainz_release_group_id == "11111111-1111-1111-1111-111111111111"
     )
     assert stamped.album == meta.album_title
+
+
+# ---------------------------------------------------------------------------
+# Phase-0 forced-path repro (LibraryFindings-All X-04 step 0.4(a), F-01 pre).
+# ---------------------------------------------------------------------------
+
+
+def _stale_tier1_tag(title: str, track: int, recording: str) -> AudioTag:
+    """Consistent Tier-1 MBIDs with STALE embedded IDs: the release-group
+    tag agrees across files (forced path) but the recording IDs and titles
+    no longer describe the tagged release (score above the 0.20 gate)."""
+    return AudioTag(
+        title=title,
+        artist="Test Artist",
+        album="Test Album",
+        track_number=track,
+        year=2020,
+        musicbrainz_release_group_id="rg-1",
+        musicbrainz_recording_id=recording,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier1_and_single_file_rejected_forced_match_routes_needs_review(
+    tmp_path,
+):
+    """F-01: a Tier-1 (and single-file) forced `_score_against` hit scoring
+    above the 0.20 accept gate must route NEEDS_REVIEW, never organise.
+    Pre-fix `_score_against` returns `_Identified` unconditionally, so the
+    stale-MBID album below is imported into the library.
+    Port choice: the isolated 2.2 worker's copy of this test was
+    byte-identical, so the Phase-0 original stays as the flip proof."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (
+                _stale_tier1_tag("Totally Different", 1, "rec-stale-1"),
+                _info(),
+            ),
+            "02 Song Two.flac": (
+                _stale_tier1_tag("Nothing Alike", 2, "rec-stale-2"),
+                _info(),
+            ),
+            "Song One.flac": (
+                # Fully-stale descriptives (not just the title): a single
+                # title-only mismatch dilutes to a gate pass and organises,
+                # so the single-file half must disagree on artist/album too
+                # to prove the forced-rejection route.
+                AudioTag(
+                    title="Totally Different",
+                    artist="Wrong Artist",
+                    album="Wrong Album",
+                    track_number=1,
+                    year=2020,
+                    musicbrainz_release_group_id="rg-1",
+                    musicbrainz_recording_id="rec-stale-1",
+                ),
+                _info(),
+            ),
+        }
+    )
+    service, store, library, library_root = _build_service(tmp_path, tagger)
+
+    album_upload = tmp_path / "stale-album.zip"
+    _zip_album(album_upload, folder="Stale Artist - Stale Album")
+    album_job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", album_upload)]
+    )
+    album_done = await _wait_job(store, album_job.id)
+    assert album_done.status == JobStatus.COMPLETED
+    assert len(album_done.items) == 1
+    assert album_done.items[0].status == ItemStatus.NEEDS_REVIEW
+
+    single_upload = tmp_path / "single.zip"
+    with zipfile.ZipFile(single_upload, "w") as zf:
+        zf.writestr("lone/Song One.flac", b"c" * 64)
+    single_job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("single.zip", single_upload)]
+    )
+    single_done = await _wait_job(store, single_job.id)
+    assert single_done.status == JobStatus.COMPLETED
+    assert len(single_done.items) == 1
+    assert single_done.items[0].status == ItemStatus.NEEDS_REVIEW
+
+    # Never organised: no library writes, no files moved into the library.
+    assert library.upsert_file.await_count == 0
+    assert list(library_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_free_music_album_origin_inherits_forced_gate_but_keeps_manual_match(
+    tmp_path,
+):
+    """F-01 / Free Music album-origin (`free_music_service.py` hands album
+    downloads to `DropImportService.create_job`): consistent RG MBIDs with
+    stale descriptives route NEEDS_REVIEW carrying FORCED_MATCH_REJECTED,
+    the staged files are retained, and the sanctioned human-authority bypass
+    (`match_item`, the user's explicit choice) still imports afterwards."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (
+                _stale_tier1_tag("Totally Different", 1, "rec-stale-1"),
+                _info(),
+            ),
+            "02 Song Two.flac": (
+                _stale_tier1_tag("Nothing Alike", 2, "rec-stale-2"),
+                _info(),
+            ),
+        }
+    )
+    service, store, library, library_root = _build_service(tmp_path, tagger)
+
+    album_upload = tmp_path / "free-music-album.zip"
+    _zip_album(album_upload, folder="Free Music - Fetched Album")
+    job = await service.create_job(
+        user_id="user-1", user_name="Free Music", uploads=[("album.zip", album_upload)]
+    )
+    done = await _wait_job(store, job.id)
+    assert done.status == JobStatus.COMPLETED
+    assert len(done.items) == 1
+    item = done.items[0]
+    assert item.status == ItemStatus.NEEDS_REVIEW
+    assert _FORCED_MATCH_REJECTED in (item.detail or "")
+    assert library.upsert_file.await_count == 0
+    assert list(library_root.iterdir()) == []
+
+    # The staged files survive review so the user can still match manually.
+    assert len(item.staging_paths) == 2
+    matched = await service.match_item(
+        item.id, "rg-1", user_id="user-1", is_admin=False
+    )
+    assert matched.status == ItemStatus.IMPORTED
+    assert len(sorted(library_root.rglob("*.flac"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_single_file_wrong_fingerprint_seed_routes_needs_review(tmp_path):
+    """F-01: a confident-but-wrong single-file fingerprint seed (score above
+    the 0.70 floor) resolving to a release the tags don't describe must route
+    NEEDS_REVIEW with FORCED_MATCH_REJECTED - never organise the wrong album.
+    Residual fail-open (documented, not closed here): a wrong seed whose
+    tracklist happens to fit inside the acceptance gate still organises -
+    audio truth is trusted once it clears the gate."""
+    tagger = FakeTagger(
+        {
+            "lone.flac": (
+                _tag("Junk Title", 1, artist="Junk Artist", album="Junk Album"),
+                _info(),
+            ),
+        }
+    )
+    fingerprinter = AsyncMock()
+    fingerprinter.fingerprint = AsyncMock(
+        return_value=SimpleNamespace(
+            status="pass", score=0.80, recording_id="rec-wrong"
+        )
+    )
+    service, store, library, library_root = _build_service(
+        tmp_path, tagger, fingerprinter=fingerprinter
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-wrong"
+    )
+
+    # Single-file zip, not a loose upload: create_job stages loose uploads
+    # with an NNN_ prefix that breaks FakeTagger basename keys.
+    upload = tmp_path / "single.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("lone.flac", b"x" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("single.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+    assert done.status == JobStatus.COMPLETED
+    assert len(done.items) == 1
+    item = done.items[0]
+    assert item.status == ItemStatus.NEEDS_REVIEW
+    assert _FORCED_MATCH_REJECTED in (item.detail or "")
+    assert library.upsert_file.await_count == 0
+    assert list(library_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_single_file_perfect_duration_match_without_proof_holds_for_review(
+    tmp_path,
+):
+    """Free Music conversion-origin hold-only lock, drop-side analogue: the
+    conversion path (`free_music_service.py` edition_conversion origin) goes
+    through the file processor and never enters the drop importer, so even a
+    perfect duration match never publishes from there. This lock pins the same
+    invariant on the drop side: a single file whose tags and duration agree
+    perfectly with a release still holds for review without MBID or
+    fingerprint proof - and carries the plain miss reason, never the forced
+    rejection token."""
+    tagger = FakeTagger(
+        {
+            # Exact descriptive agreement with the mocked release (including
+            # the 200s duration), but no MBID tags and no fingerprint.
+            "lone.flac": (_tag("Song One", 1), _info()),
+        }
+    )
+    service, store, library, library_root = _build_service(tmp_path, tagger)
+
+    # Single-file zip, not a loose upload: create_job stages loose uploads
+    # with an NNN_ prefix that breaks FakeTagger basename keys.
+    upload = tmp_path / "single.zip"
+    with zipfile.ZipFile(upload, "w") as zf:
+        zf.writestr("lone.flac", b"x" * 64)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("single.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+    assert done.status == JobStatus.COMPLETED
+    assert len(done.items) == 1
+    item = done.items[0]
+    assert item.status == ItemStatus.NEEDS_REVIEW
+    assert _FORCED_MATCH_REJECTED not in (item.detail or "")
+    assert library.upsert_file.await_count == 0
+    assert list(library_root.iterdir()) == []
+
+
+# Slice C (4.10b lane B): partial corroboration in _fingerprint_enrich.
+
+
+def _enrich_entries(tmp_path):
+    from services.native.drop_import_service import _Entry
+
+    first = tmp_path / "01 Song One.flac"
+    second = tmp_path / "02 Song Two.flac"
+    first.write_bytes(b"a" * 64)
+    second.write_bytes(b"b" * 64)
+    entries = [
+        _Entry(path=first, tag=_tag("Song One", 1), info=_info()),
+        _Entry(path=second, tag=_tag("Song Two", 2), info=_info()),
+    ]
+    return entries
+
+
+def _per_file_fingerprint(*, partial: bool):
+    from models.audio import FingerprintResult
+
+    async def _fingerprint(path: Path):
+        name = Path(path).name
+        recording = "rec-1" if "01" in name else "rec-2"
+        return FingerprintResult(
+            status="pass",
+            score=0.95,
+            recording_id=recording,
+            release_group_ids=["rg-1"],
+            partial_decode=partial,
+        )
+
+    return _fingerprint
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_enrich_ignores_partial_seeds(tmp_path):
+    """4.10b lane B: partial pass/>=0.70 never seeds an RG alone."""
+    tagger = FakeTagger({})
+    service, _, _, _ = _build_service(tmp_path, tagger)
+    service._fingerprinter.fingerprint = AsyncMock(
+        side_effect=_per_file_fingerprint(partial=True)
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    from services.native.drop_import_service import _Entry
+
+    entries = _enrich_entries(tmp_path)
+    locals_ = [service._to_local(entry) for entry in entries]
+
+    enriched, seeds = await service._fingerprint_enrich(entries, locals_)
+
+    assert seeds == []
+    assert [local.recording_mbid for local in enriched] == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_enrich_keeps_full_seeds_unchanged(tmp_path):
+    """4.10b lane B: full prints keep today's enrich + seed behavior."""
+    tagger = FakeTagger({})
+    service, _, _, _ = _build_service(tmp_path, tagger)
+    service._fingerprinter.fingerprint = AsyncMock(
+        side_effect=_per_file_fingerprint(partial=False)
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    entries = _enrich_entries(tmp_path)
+    locals_ = [service._to_local(entry) for entry in entries]
+
+    enriched, seeds = await service._fingerprint_enrich(entries, locals_)
+
+    assert seeds == ["rg-1"]
+    assert [local.recording_mbid for local in enriched] == ["rec-1", "rec-2"]
+
+
+@pytest.mark.asyncio
+async def test_partial_only_drop_never_organises_alone(tmp_path):
+    """4.10b lane B integration: partial-only evidence holds for review."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    # Tag-only fails so the audio second attempt runs; it would succeed
+    # only if fingerprint seeds survive (they must not for partial).
+    # Pre-fix the second call still fires (seeds present) and imports -
+    # post-fix no seeds means no second call and review.
+    identifier.identify = AsyncMock(
+        side_effect=[None, _accepted_match()]
+    )
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    fingerprinter = AsyncMock()
+    fingerprinter.fingerprint = AsyncMock(
+        side_effect=_per_file_fingerprint(partial=True)
+    )
+    service, store, library, _ = _build_service(
+        tmp_path, tagger, identifier=identifier, fingerprinter=fingerprinter
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    upload = tmp_path / "upload.zip"
+    _zip_album(upload)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    assert done.items[0].status == ItemStatus.NEEDS_REVIEW
+    library.upsert_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_full_print_drop_organises_unchanged(tmp_path):
+    """4.10b lane B integration: the same evidence with full prints imports."""
+    tagger = FakeTagger(
+        {
+            "01 Song One.flac": (_tag("Song One", 1), _info()),
+            "02 Song Two.flac": (_tag("Song Two", 2), _info()),
+        }
+    )
+    identifier = AsyncMock()
+    identifier.identify = AsyncMock(
+        side_effect=[None, _accepted_match()]
+    )
+    identifier.release_tracks = AsyncMock(return_value=(_meta(), _tracks()))
+    fingerprinter = AsyncMock()
+    fingerprinter.fingerprint = AsyncMock(
+        side_effect=_per_file_fingerprint(partial=False)
+    )
+    service, store, library, _ = _build_service(
+        tmp_path, tagger, identifier=identifier, fingerprinter=fingerprinter
+    )
+    service._mb_matcher.resolve_recording_to_release_group = AsyncMock(
+        return_value="rg-1"
+    )
+
+    upload = tmp_path / "upload.zip"
+    _zip_album(upload)
+    job = await service.create_job(
+        user_id="user-1", user_name="Harvey", uploads=[("album.zip", upload)]
+    )
+    done = await _wait_job(store, job.id)
+
+    assert done.items[0].status == ItemStatus.IMPORTED
+    assert library.upsert_file.await_count == 2

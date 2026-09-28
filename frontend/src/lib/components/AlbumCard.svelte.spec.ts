@@ -4,6 +4,12 @@ import { render } from 'vitest-browser-svelte';
 import AlbumCard from './AlbumCard.svelte';
 import type { Album, EnrichmentSource } from '$lib/types';
 
+// Stub the album-request mutation factory so the card renders without a QueryClientProvider
+// (same approach as the TopPicksDeck spec).
+vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
+	requestAlbum: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
+
 const baseAlbum: Album = {
 	title: 'OK Computer',
 	artist: 'Radiohead',
@@ -13,14 +19,14 @@ const baseAlbum: Album = {
 	listen_count: 1200000
 };
 
-function renderComponent(
+async function renderComponent(
 	overrides: Partial<{
 		album: Album;
 		enrichmentSource: EnrichmentSource;
 		onenrichmentrequest: () => void;
 	}> = {}
 ) {
-	return render(AlbumCard, {
+	return await render(AlbumCard, {
 		props: {
 			album: overrides.album ?? baseAlbum,
 			enrichmentSource: overrides.enrichmentSource ?? 'none',
@@ -31,18 +37,18 @@ function renderComponent(
 
 describe('AlbumCard.svelte', () => {
 	it('should display the album title', async () => {
-		renderComponent();
+		await renderComponent();
 		await expect.element(page.getByText('OK Computer')).toBeInTheDocument();
 	});
 
 	it('should display artist and year', async () => {
-		renderComponent();
+		await renderComponent();
 		await expect.element(page.getByText(/1997/)).toBeInTheDocument();
 		await expect.element(page.getByText(/Radiohead/)).toBeInTheDocument();
 	});
 
 	it('should show Last.fm branded badge when source is lastfm', async () => {
-		renderComponent({ enrichmentSource: 'lastfm' });
+		await renderComponent({ enrichmentSource: 'lastfm' });
 
 		const badge = page.getByTitle('Last.fm plays');
 		await expect.element(badge).toBeInTheDocument();
@@ -50,7 +56,7 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('should show ListenBrainz branded badge when source is listenbrainz', async () => {
-		renderComponent({ enrichmentSource: 'listenbrainz' });
+		await renderComponent({ enrichmentSource: 'listenbrainz' });
 
 		const badge = page.getByTitle('ListenBrainz plays');
 		await expect.element(badge).toBeInTheDocument();
@@ -58,7 +64,7 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('should show generic badge when source is none', async () => {
-		renderComponent({ enrichmentSource: 'none' });
+		await renderComponent({ enrichmentSource: 'none' });
 
 		const badge = page.getByTitle('Plays');
 		await expect.element(badge).toBeInTheDocument();
@@ -68,7 +74,7 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('should not render listen count badge when listen_count is null', async () => {
-		renderComponent({
+		await renderComponent({
 			album: { ...baseAlbum, listen_count: null },
 			enrichmentSource: 'lastfm'
 		});
@@ -77,7 +83,7 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('should render zero listen count as "0"', async () => {
-		renderComponent({
+		await renderComponent({
 			album: { ...baseAlbum, listen_count: 0 },
 			enrichmentSource: 'lastfm'
 		});
@@ -88,24 +94,26 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('should display formatted count for large numbers', async () => {
-		renderComponent({ enrichmentSource: 'listenbrainz' });
+		await renderComponent({ enrichmentSource: 'listenbrainz' });
 
 		await expect.element(page.getByText('LB 1.2M')).toBeInTheDocument();
 	});
 
 	it('requests optional enrichment on pointer intent', async () => {
-		expect.assertions(1);
+		expect.assertions(2);
 		const onenrichmentrequest = vi.fn();
-		renderComponent({ onenrichmentrequest });
+		await renderComponent({ onenrichmentrequest });
 
-		await page.getByRole('link', { name: 'Open OK Computer' }).hover();
+		const link = page.getByRole('link', { name: 'Open OK Computer' });
+		await expect.element(link).toBeInTheDocument();
+		link.element().dispatchEvent(new PointerEvent('pointerenter'));
 
 		expect(onenrichmentrequest).toHaveBeenCalledTimes(1);
 	});
 
 	it('does not enrich a local-only album with a local id', async () => {
 		const onenrichmentrequest = vi.fn();
-		renderComponent({
+		await renderComponent({
 			album: {
 				...baseAlbum,
 				musicbrainz_id: 'local-album-id',
@@ -121,7 +129,7 @@ describe('AlbumCard.svelte', () => {
 	});
 
 	it('should use album-specific title for lastfm source', async () => {
-		renderComponent({ enrichmentSource: 'lastfm' });
+		await renderComponent({ enrichmentSource: 'lastfm' });
 
 		const badge = page.getByTitle('Last.fm plays');
 		await expect.element(badge).toBeInTheDocument();

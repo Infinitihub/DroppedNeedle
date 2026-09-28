@@ -2,8 +2,8 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import {
-		AlertTriangle,
-		CheckCircle2,
+		TriangleAlert,
+		CircleCheckBig,
 		CirclePause,
 		CirclePlay,
 		Clock3,
@@ -28,6 +28,7 @@
 		getLibraryManagementOperationResultsQuery
 	} from '$lib/queries/library-management/LibraryManagementQueries.svelte';
 	import { rememberLibraryManagementPreviewToken } from '$lib/queries/library-management/LibraryManagementPreviewTokens';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { createUuid } from '$lib/utils/uuid';
 	import {
 		managementAudioFormat,
@@ -40,6 +41,7 @@
 		managementPlanChanges,
 		managementPlanTitle,
 		managementPlanTrackLabel,
+		managementReasonLabel,
 		titleManagementValue
 	} from './LibraryManagementDisplay';
 	import LibraryManagementAuditDossiers from './LibraryManagementAuditDossiers.svelte';
@@ -85,7 +87,7 @@
 	$effect(() => {
 		if (!redirectingReadyPreview && operation?.mode === 'preview' && operation.state === 'ready') {
 			redirectingReadyPreview = true;
-			void goto(`/library/management/previews/${encodeURIComponent(jobId)}`, {
+			void goto(withBasePath(`/library/management/previews/${encodeURIComponent(jobId)}`), {
 				replaceState: true
 			});
 		}
@@ -238,7 +240,7 @@
 			});
 			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
 			undoDialog.close();
-			await goto(`/library/management/previews/${encodeURIComponent(handle.job_id)}`);
+			await goto(withBasePath(`/library/management/previews/${encodeURIComponent(handle.job_id)}`));
 		} catch (error) {
 			undoError = error instanceof Error ? error.message : 'Could not create the undo preview.';
 		}
@@ -280,9 +282,12 @@
 			albumMbid: managementDesiredField(item.plan, 'musicbrainz_release_group_id'),
 			albumArtworkVersion: managementAlbumArtworkVersion(item.plan),
 			format: managementAudioFormat(item.plan),
-			status: titleManagementValue(item.failure_code ?? item.work_state),
+			status: item.failure_code
+				? managementReasonLabel(item.failure_code)
+				: titleManagementValue(item.work_state),
 			statusTone: resultTone(item),
-			reason: item.failure_code ? titleManagementValue(item.failure_code) : null,
+			reason: item.failure_code ? managementReasonLabel(item.failure_code) : null,
+			reasonCode: item.failure_code,
 			changes: managementPlanChanges(item.plan),
 			exceptional: Boolean(
 				item.failure_code || !['succeeded', 'completed'].includes(item.work_state)
@@ -310,15 +315,15 @@
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-7xl space-y-5">
-		<BackButton fallback="/library/management?tab=organize" />
+		<BackButton fallback={withBasePath('/library/management?tab=organize')} />
 
 		{#if operationQuery.isLoading || redirectingReadyPreview}
-			<div class="space-y-4">
+			<div class="space-y-4" role="status" aria-label="Loading organization operation">
 				<div class="skeleton h-48 rounded-2xl"></div>
 				<div class="skeleton h-72 rounded-2xl"></div>
 			</div>
 		{:else if operationQuery.isError}
-			<div class="alert alert-error">Could not load this Organization operation.</div>
+			<div class="alert alert-error" role="alert">Could not load this Organization operation.</div>
 		{:else if operation}
 			<header class="management-control-room p-5 sm:p-7">
 				<div class="flex flex-wrap items-start gap-4">
@@ -426,7 +431,7 @@
 					class={`alert ${terminalPresentation.className}`}
 					role={operation.state === 'failed' ? 'alert' : 'status'}
 				>
-					{#if operation.state === 'succeeded'}<CheckCircle2 class="h-5 w-5" />{:else}<AlertTriangle
+					{#if operation.state === 'succeeded'}<CircleCheckBig class="h-5 w-5" />{:else}<TriangleAlert
 							class="h-5 w-5"
 						/>{/if}<span
 						><strong>{terminalPresentation.label}</strong><br />{terminalPresentation.detail}</span
@@ -456,7 +461,7 @@
 									<p class="text-sm text-base-content/65">{refreshStatusCopy(delivery.state)}</p>
 									<p class="mt-0.5 text-xs text-base-content/45">
 										{delivery.attempts} of {delivery.max_attempts} attempts used{#if delivery.failure_code}
-											· {titleManagementValue(delivery.failure_code)}{/if}
+											· {managementReasonLabel(delivery.failure_code)}{/if}
 									</p>
 								</div>
 								<span
@@ -478,14 +483,18 @@
 						<p class="management-step">Audit trail</p>
 						<h2 class="font-display text-xl font-semibold">Per-file results</h2>
 					</div>
-					<a href="/library/management/history" class="btn btn-ghost btn-sm"
+					<a href={withBasePath('/library/management/history')} class="btn btn-ghost btn-sm"
 						><History class="h-4 w-4" /> All history</a
 					>
 				</div>
-				{#if resultsQuery.isLoading}<div class="space-y-2">
+				{#if resultsQuery.isLoading}<div
+						class="space-y-2"
+						role="status"
+						aria-label="Loading file results"
+					>
 						<div class="skeleton h-20"></div>
 						<div class="skeleton h-20"></div>
-					</div>{:else if resultsQuery.isError}<div class="alert alert-error">
+					</div>{:else if resultsQuery.isError}<div class="alert alert-error" role="alert">
 						Could not load operation results.
 					</div>{:else if results.length === 0}<div
 						class="rounded-xl border border-dashed border-base-content/15 p-5 text-sm text-base-content/50"
@@ -540,8 +549,9 @@
 					{#if operation.baseline_available_count > 0}<p class="mt-2 text-xs text-base-content/55">
 							{baselineStatus}
 						</p>{/if}
-					<a href="/library/management?runner=baseline_restore" class="btn btn-ghost btn-sm mt-3"
-						>Open baseline restore...</a
+					<a
+						href={withBasePath('/library/management?runner=baseline_restore')}
+						class="btn btn-ghost btn-sm mt-3">Open baseline restore...</a
 					>
 				</div>
 			</section>

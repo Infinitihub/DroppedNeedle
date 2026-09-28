@@ -18,7 +18,7 @@ drop-import handoff skips or upgrades an owned album after the fact.
 
 from typing import TYPE_CHECKING, Callable
 
-from core.exceptions import ProviderIdentityRequiredError
+from core.exceptions import ProviderIdentityRequiredError, ResourceNotFoundError
 from infrastructure.queue.priority_queue import RequestPriority
 
 if TYPE_CHECKING:
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from services.native.free_music_service import FreeMusicService
     from services.preferences_service import PreferencesService
     from services.native.library_ownership_service import LibraryOwnershipService
+    from services.plugin_sources import PluginSourceRegistry
 
 
 class AcquisitionDispatcher:
@@ -38,15 +39,24 @@ class AcquisitionDispatcher:
         preferences_service: "PreferencesService",
         ownership_service: "LibraryOwnershipService | None" = None,
         get_album_service: "Callable[[], AlbumService] | None" = None,
+        plugin_sources: "PluginSourceRegistry | None" = None,
     ) -> None:
         self._get_download_service = get_download_service
         self._get_free_music_service = get_free_music_service
         self._prefs = preferences_service
         self._ownership = ownership_service
         self._get_album_service = get_album_service
+        self._plugin_sources = plugin_sources
+
+    def _use_plugin_sources(self) -> bool:
+        return bool(
+            self._plugin_sources is not None and self._plugin_sources.is_any_source_ready()
+        )
 
     def _use_free_music(self) -> bool:
         if self._prefs.is_builtin_download_ready():
+            return False
+        if self._use_plugin_sources():
             return False
         return self._get_free_music_service().is_ready()
 
@@ -78,6 +88,20 @@ class AcquisitionDispatcher:
                 "Free Music needs the album tracklist before it can choose a source."
             )
         return album.total_tracks
+
+    async def get_quality_snapshot_summary(
+        self, task_id: str, user_id: str, user_role: str
+    ) -> str | None:
+        """Read the summary pinned to the just-created task, regardless of backend."""
+        try:
+            task = await self._get_download_service().get_task(
+                task_id, user_id, user_role
+            )
+        except ResourceNotFoundError:
+            task = await self._get_free_music_service().get_task(
+                task_id, user_id=user_id, is_admin=user_role == "admin"
+            )
+        return getattr(task, "quality_snapshot_summary", None)
 
     async def request_album(
         self,

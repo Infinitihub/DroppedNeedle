@@ -33,7 +33,12 @@ const {
 	mockAlbumDiscoveryCache: { set: vi.fn() },
 	mockAlbumLastFmCache: { set: vi.fn() },
 	mockAlbumYouTubeCache: { get: vi.fn(), set: vi.fn() },
-	mockAlbumSourceMatchCache: { get: vi.fn(), set: vi.fn() },
+	mockAlbumSourceMatchCache: {
+		get: vi.fn(),
+		set: vi.fn(),
+		remove: vi.fn(),
+		isStale: vi.fn(() => false)
+	},
 	mockDownloadsData: { value: undefined as unknown },
 	mockHeldData: { value: { items: [] } as unknown },
 	mockLibraryStatusData: { value: undefined as unknown },
@@ -52,6 +57,10 @@ vi.mock('$lib/stores/library', () => ({
 		isInLibrary: vi.fn(() => false),
 		isRequested: vi.fn(() => false)
 	}
+}));
+
+const { mockRemoveTrack } = vi.hoisted(() => ({
+	mockRemoveTrack: { mutate: vi.fn(), isPending: false }
 }));
 
 const integrationState = {
@@ -105,7 +114,8 @@ vi.mock('$lib/utils/albumDetailCache', () => ({
 	albumDiscoveryCache: mockAlbumDiscoveryCache,
 	albumLastFmCache: mockAlbumLastFmCache,
 	albumYouTubeCache: mockAlbumYouTubeCache,
-	albumSourceMatchCache: mockAlbumSourceMatchCache
+	albumSourceMatchCache: mockAlbumSourceMatchCache,
+	albumSourceMatchCacheKey: (id: string) => `key:${id}`
 }));
 
 vi.mock('$lib/utils/serviceStatus', () => ({
@@ -130,7 +140,15 @@ vi.mock('$lib/queries/library/LibraryQueries.svelte', () => ({
 		data: undefined,
 		isLoading: false,
 		isError: false
-	})
+	}),
+	// ProviderAlbumPage now statically imports LocalAlbumPage →
+	// LocalAlbumTrackList + AlbumOrganizationDialog, which need these at
+	// import time.
+	getLibraryAlbumTracksQuery: () => ({
+		data: { items: [], total: 0 },
+		isLoading: false
+	}),
+	getLibraryAlbumsQuery: () => ({ data: { items: [] }, isLoading: false })
 }));
 
 // Where-to-buy section (Get it): stub so the page renders without a QueryClientProvider
@@ -156,7 +174,12 @@ vi.mock('$lib/queries/downloads/DownloadMutations.svelte', () => ({
 	stopAutoRetry: () => ({ mutate: vi.fn(), isPending: false }),
 	requestTrack: () => ({ mutate: vi.fn(), isPending: false }),
 	importHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
-	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false })
+	discardHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
+	reverifyHeldTrack: () => ({ mutate: vi.fn(), isPending: false }),
+	requestAlbum: () => ({
+		mutateAsync: vi.fn().mockResolvedValue({ success: true }),
+		isPending: false
+	})
 }));
 
 vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
@@ -167,7 +190,10 @@ vi.mock('$lib/queries/albums/EditionQueries.svelte', () => ({
 	}),
 	setEditionPin: () => ({ mutateAsync: mockSetPin, isPending: false }),
 	clearEditionPin: () => ({ mutateAsync: vi.fn(), isPending: false }),
-	acquireEdition: () => ({ mutateAsync: vi.fn(), isPending: false })
+	acquireEdition: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	getLocalAlbumEditionPinQuery: () => ({ data: undefined, isLoading: false, isError: false }),
+	setLocalAlbumEditionPin: () => ({ mutateAsync: vi.fn(), isPending: false }),
+	clearLocalAlbumEditionPin: () => ({ mutateAsync: vi.fn(), isPending: false })
 }));
 
 vi.mock('$lib/queries/downloads/UpgradeQueries.svelte', () => ({
@@ -202,13 +228,8 @@ vi.mock('$lib/queries/library/LibraryMutations.svelte', async (importOriginal) =
 	rescanAlbum: () => ({ mutateAsync: vi.fn(), isPending: false }),
 	// the orphan-review section (P5) creates its removal mutation at init - stub it
 	// so the page renders without a QueryClientProvider
-	removeLibraryTrack: () => ({ mutate: vi.fn(), isPending: false })
+	removeLibraryTrack: () => mockRemoveTrack
 }));
-
-vi.mock('$lib/utils/albumRequest', () => ({
-	requestAlbum: vi.fn().mockResolvedValue({ success: true })
-}));
-
 vi.mock('$lib/components/AlbumImage.svelte', () => {
 	const Comp = function () {};
 	Comp.prototype = {};
@@ -225,11 +246,6 @@ vi.mock('$lib/components/DiscoveryAlbumCarousel.svelte', () => {
 	return { default: Comp };
 });
 vi.mock('$lib/components/LastFmAlbumEnrichment.svelte', () => {
-	const Comp = function () {};
-	Comp.prototype = {};
-	return { default: Comp };
-});
-vi.mock('$lib/components/ContextMenu.svelte', () => {
 	const Comp = function () {};
 	Comp.prototype = {};
 	return { default: Comp };
@@ -280,6 +296,8 @@ vi.mock('$lib/player/launchLocalPlayback', () => ({ launchLocalPlayback: vi.fn()
 vi.mock('$lib/player/launchNavidromePlayback', () => ({ launchNavidromePlayback: vi.fn() }));
 
 import AlbumPage from './ProviderAlbumPage.svelte';
+import { authStore } from '$lib/stores/authStore.svelte';
+import { toAuthUser } from '$lib/queries/auth/types';
 import type { DownloadTask } from '$lib/types';
 
 const albumId = '3f3a6d95-326e-4384-80b0-0744f20f24ff';
@@ -577,7 +595,7 @@ describe('album detail page track rendering', () => {
 			orphans: []
 		};
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -613,7 +631,7 @@ describe('album detail page track rendering', () => {
 			]
 		};
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -673,7 +691,7 @@ describe('album detail page track rendering', () => {
 			}
 		);
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -686,7 +704,7 @@ describe('album detail page track rendering', () => {
 
 	it('renders visible grouped track rows alongside source bars', async () => {
 		expect.assertions(6);
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -731,7 +749,7 @@ describe('album detail page track rendering', () => {
 			return true;
 		});
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -751,7 +769,7 @@ describe('album detail page track rendering', () => {
 			page_size: 100
 		};
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -781,7 +799,7 @@ describe('album detail page track rendering', () => {
 			page_size: 100
 		};
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -823,6 +841,7 @@ describe('album detail page track rendering', () => {
 				original_filename: `${track}.flac`,
 				file_format: 'flac',
 				duration_seconds: 200,
+				expected_duration_seconds: null,
 				reason: 'management:BUNDLE_BLOCKED',
 				reason_detail:
 					'The durable publication evidence no longer agrees with its journal. Nothing was overwritten.',
@@ -837,7 +856,7 @@ describe('album detail page track rendering', () => {
 			}))
 		};
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -862,7 +881,7 @@ describe('album detail page track rendering', () => {
 		expect.assertions(2);
 		mockDownloadsData.value = { items: [], page: 1, page_size: 100 };
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
@@ -921,10 +940,113 @@ describe('album detail page track rendering', () => {
 			page_size: 100
 		};
 
-		render(AlbumPage, {
+		await render(AlbumPage, {
 			props: { data: { albumId } }
 		} as Parameters<typeof render<typeof AlbumPage>>[1]);
 
 		await expect.element(page.getByTitle('Downloading 42%')).toBeVisible();
+	});
+
+	beforeEach(() => {
+		mockRemoveTrack.mutate.mockClear();
+		mockRemoveTrack.isPending = false;
+		authStore.setUser(
+			toAuthUser({
+				id: 'user-1',
+				display_name: 'AdminTest',
+				role: 'admin',
+				email: null,
+				avatar_url: null,
+				username: 'AdminTest',
+				username_display: 'AdminTest'
+			})
+		);
+	});
+
+	function localMatchFetchCount(): number {
+		return mockPageFetch.mock.calls.filter(([url]) =>
+			String(url).includes('/api/v1/local/albums/match/')
+		).length;
+	}
+
+	async function openRemoveFileDialog(): Promise<void> {
+		const row = page
+			.getByRole('listitem')
+			.filter({ hasText: 'Infinite ❤️ Without Fulfillment' })
+			.first();
+		await row.getByLabelText('More actions').click();
+		await page.getByRole('menuitem', { name: 'Remove file' }).click();
+		await expect.element(page.getByRole('dialog')).toBeVisible();
+	}
+
+	it('removes the file with the captured ids and refetches only that album', async () => {
+		await render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+		await openRemoveFileDialog();
+
+		await page.getByRole('dialog').getByRole('button', { name: 'Remove', exact: true }).click();
+
+		expect(mockRemoveTrack.mutate).toHaveBeenCalledTimes(1);
+		const [, options] = mockRemoveTrack.mutate.mock.calls[0];
+
+		const before = localMatchFetchCount();
+		await options.onSuccess();
+		await vi.waitFor(() => expect(localMatchFetchCount()).toBe(before + 1));
+		expect(
+			mockPageFetch.mock.calls
+				.filter(([url]) => String(url).includes('/api/v1/local/albums/match/'))
+				.every(([url]) => String(url).endsWith(albumId))
+		).toBe(true);
+		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
+	});
+
+	it('cancel closes the dialog without removing the file', async () => {
+		await render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+		await openRemoveFileDialog();
+
+		await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click();
+
+		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
+		expect(mockRemoveTrack.mutate).not.toHaveBeenCalled();
+	});
+
+	it('surfaces a removal failure in the dialog and refetches nothing', async () => {
+		await render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+		await openRemoveFileDialog();
+
+		await page.getByRole('dialog').getByRole('button', { name: 'Remove', exact: true }).click();
+		const [, options] = mockRemoveTrack.mutate.mock.calls[0];
+		const before = localMatchFetchCount();
+		options.onError();
+
+		await expect.element(page.getByRole('alert')).toHaveTextContent("Couldn't remove this file");
+		await expect.element(page.getByRole('dialog')).toBeVisible();
+		expect(localMatchFetchCount()).toBe(before);
+	});
+
+	it('drops the dialog on navigation and never refetches the old album', async () => {
+		const view = await render(AlbumPage, {
+			props: { data: { albumId } }
+		} as Parameters<typeof render<typeof AlbumPage>>[1]);
+		await openRemoveFileDialog();
+		await page.getByRole('dialog').getByRole('button', { name: 'Remove', exact: true }).click();
+		const [, options] = mockRemoveTrack.mutate.mock.calls[0];
+
+		const otherAlbumId = '5b0f0f11-1111-4111-8111-111111111111';
+		await view.rerender({
+			data: { albumId: otherAlbumId }
+		});
+
+		await expect.element(page.getByRole('dialog')).not.toBeInTheDocument();
+		const before = mockPageFetch.mock.calls.filter(([url]) => String(url).endsWith(albumId)).length;
+		await options.onSuccess();
+		expect(mockPageFetch.mock.calls.filter(([url]) => String(url).endsWith(albumId)).length).toBe(
+			before
+		);
 	});
 });

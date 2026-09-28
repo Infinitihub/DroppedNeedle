@@ -4,11 +4,11 @@
 	import {
 		ArrowRight,
 		BookOpenCheck,
-		CheckCircle2,
+		CircleCheckBig,
 		Clock3,
 		FolderCog,
 		HardDrive,
-		Layers3,
+		Layers,
 		ShieldAlert,
 		Sparkles,
 		Tags,
@@ -25,7 +25,8 @@
 	import { LIBRARY_MANAGEMENT_CONFIRMATION_PHRASE } from '$lib/queries/library-management/LibraryManagementConfirmation';
 	import {
 		applyLibraryManagementPreviewMutation,
-		createLibraryManagementDuplicateResolutionMutation
+		createLibraryManagementDuplicateResolutionMutation,
+		reissueLibraryManagementPreviewMutation
 	} from '$lib/queries/library-management/LibraryManagementMutations.svelte';
 	import {
 		getLibraryManagementPlanItemsQuery,
@@ -37,6 +38,7 @@
 		readLibraryManagementPreviewToken,
 		rememberLibraryManagementPreviewToken
 	} from '$lib/queries/library-management/LibraryManagementPreviewTokens';
+	import { withBasePath } from '$lib/utils/basePath';
 	import type {
 		DuplicateResolutionAction,
 		LibraryManagementPlanItem,
@@ -45,6 +47,7 @@
 	} from '$lib/queries/library-management/types';
 	import { createUuid } from '$lib/utils/uuid';
 	import {
+		firstDeferredSource,
 		managementAudioFormat,
 		managementAlbumArtworkVersion,
 		managementArtworkPreviewHash,
@@ -56,6 +59,7 @@
 		managementPlanIsExceptional,
 		managementPlanTitle,
 		managementPlanTrackLabel,
+		managementReasonLabel,
 		titleManagementValue,
 		type ManagementCollision
 	} from './LibraryManagementDisplay';
@@ -99,7 +103,10 @@
 	let collisionClass = $state('');
 	let hasPreservedValue = $state(false);
 	let hasRepresentationLoss = $state(false);
-	let previewToken = $derived(readLibraryManagementPreviewToken(jobId));
+	let reissuedToken = $state<string | null>(null);
+	let reissueAttemptedJobId = $state<string | null>(null);
+	let reissueFailed = $state(false);
+	let previewToken = $derived(reissuedToken ?? readLibraryManagementPreviewToken(jobId));
 	let confirmation = $state('');
 	let applyError = $state('');
 	let applyDialog: HTMLDialogElement;
@@ -143,6 +150,7 @@
 		})
 	);
 	const applyPreview = applyLibraryManagementPreviewMutation();
+	const reissuePreview = reissueLibraryManagementPreviewMutation();
 	const createResolution = createLibraryManagementDuplicateResolutionMutation();
 
 	const preview = $derived(previewQuery.data ?? null);
@@ -153,6 +161,69 @@
 	);
 	const applyCount = $derived(
 		(preview?.summary.eligible_count ?? 0) + (preview?.summary.warning_count ?? 0)
+	);
+	const activationPreview = $derived(
+		Boolean(preview && preview.proposed_settings_revision !== null)
+	);
+	const zeroAppliable = $derived(
+		Boolean(
+			preview &&
+			preview.state === 'ready' &&
+			!preview.stale &&
+			!preview.expired &&
+			!activationPreview &&
+			applyCount === 0
+		)
+	);
+	const topBlockers = $derived(
+		Object.entries(preview?.summary.reasons ?? {})
+			.sort((left, right) => right[1] - left[1])
+			.slice(0, 3)
+	);
+	const deferredSources = $derived(
+		Object.entries(preview?.summary.deferred_sources ?? {})
+			.sort((left, right) => right[1] - left[1])
+			.slice(0, 3)
+	);
+
+	function qualifiedReasonLabel(code: string, deferredSource: string | null = null): string {
+		if (code !== 'OPTIONAL_ENRICHMENT_DEFERRED') return managementReasonLabel(code);
+		const base = 'Optional enrichment deferred · still applicable with warnings';
+		return deferredSource ? `${base} (${deferredSource})` : base;
+	}
+
+	function inspectorReasonLabel(code: string): string {
+		return qualifiedReasonLabel(code);
+	}
+
+	function staleBannerDetail(): string {
+		if (!preview) return '';
+		const labels = preview.stale_reasons.map((code) => qualifiedReasonLabel(code)).join(' · ');
+		// Persisted query-cache entries from before this fix lack the new keys.
+		const staleInputCount = preview.stale_input_count ?? 0;
+		if (!preview.stale_reasons.includes('FILE_CHANGED') || staleInputCount <= 0) return labels;
+		// Mirrors backend _STALE_INPUT_SAMPLE_LIMIT; the backend already caps.
+		const samples = (preview.stale_sample_relative_paths ?? []).slice(0, 5);
+		const shown = samples.join(', ');
+		const remaining = staleInputCount - samples.length;
+		const sampleText = shown
+			? `${shown}${remaining > 0 ? ` (+${remaining.toLocaleString()} more)` : ''}`
+			: '';
+		const fileText = `${staleInputCount.toLocaleString()} ${staleInputCount === 1 ? 'file' : 'files'}`;
+		return `${labels}. ${fileText} changed since planning${sampleText ? `: ${sampleText}` : ''}. Generate a fresh preview.`;
+	}
+
+	const culpritRelease = $derived.by(() => {
+		const top = topBlockers[0]?.[0];
+		if (!top) return null;
+		const item = items.find((candidate) => candidate.reason_code === top);
+		return item ? item.bundle_ordinal + 1 : null;
+	});
+	const sortedRoots = $derived(
+		Object.entries(preview?.summary.roots ?? {}).sort((left, right) => right[1] - left[1])
+	);
+	const sortedFormats = $derived(
+		Object.entries(preview?.summary.formats ?? {}).sort((left, right) => right[1] - left[1])
 	);
 	const applyFileLabel = $derived(`${applyCount} ${applyCount === 1 ? 'file' : 'files'}`);
 	const applyAction = $derived.by<ApplyActionCopy>(() => {
@@ -201,9 +272,6 @@
 				};
 		}
 	});
-	const activationPreview = $derived(
-		Boolean(preview && preview.proposed_settings_revision !== null)
-	);
 	const canApply = $derived(
 		Boolean(
 			preview?.ready_for_confirmation &&
@@ -215,16 +283,33 @@
 		)
 	);
 	const recycleAvailable = $derived(Boolean(settingsQuery.data?.recycle_bin_path.trim()));
+	// Dead previews (stale/expired/non-ready/terminal/zero items) must not claim pinned
+	// metadata. Neutral copy keeps the badge in place; hiding it would shift the header.
+	const isDeadPreview = $derived(
+		!preview ||
+			preview.stale ||
+			preview.expired ||
+			preview.state !== 'ready' ||
+			Boolean(preview.terminal_code) ||
+			preview.summary.item_count === 0
+	);
 	const providerStatus = $derived(
-		preview?.summary.reasons.METADATA_UNAVAILABLE
-			? 'Required metadata unavailable'
-			: preview?.summary.reasons.OPTIONAL_ENRICHMENT_DEFERRED
-				? 'Optional enrichment deferred'
-				: 'Required metadata pinned'
+		isDeadPreview
+			? 'Provider status unavailable'
+			: preview?.summary.reasons.METADATA_UNAVAILABLE
+				? 'Required metadata unavailable'
+				: deferredSources.length
+					? `Deferred: ${deferredSources[0][0]} ×${deferredSources[0][1].toLocaleString()}`
+					: preview?.summary.reasons.OPTIONAL_ENRICHMENT_DEFERRED
+						? qualifiedReasonLabel('OPTIONAL_ENRICHMENT_DEFERRED')
+						: 'Required metadata pinned'
 	);
 	const identityBlockerCount = $derived(
 		(preview?.summary.reasons.TRACK_NOT_MAPPED ?? 0) +
 			(preview?.summary.reasons.RELEASE_NOT_SELECTED ?? 0)
+	);
+	const sortedReasons = $derived(
+		Object.entries(preview?.summary.reasons ?? {}).sort((left, right) => right[1] - left[1])
 	);
 	const collisionRequestReady = $derived(
 		Boolean(
@@ -241,6 +326,29 @@
 		const events = createLibraryManagementEvents();
 		events.start();
 		return events.stop;
+	});
+
+	$effect(() => {
+		const currentJobId = jobId;
+		if (reissueAttemptedJobId !== null && reissueAttemptedJobId !== currentJobId) {
+			reissuedToken = null;
+			reissueFailed = false;
+			reissueAttemptedJobId = null;
+			return;
+		}
+		const detail = previewQuery.data ?? null;
+		if (
+			detail === null ||
+			reissueAttemptedJobId === currentJobId ||
+			activationPreview ||
+			detail.state !== 'ready' ||
+			detail.expired ||
+			detail.stale ||
+			(reissuedToken ?? readLibraryManagementPreviewToken(currentJobId)) !== null
+		)
+			return;
+		reissueAttemptedJobId = currentJobId;
+		void resumePreviewToken(currentJobId);
 	});
 
 	$effect(() => {
@@ -268,18 +376,6 @@
 		return `${rootLabel(root)} · ${relative ?? 'No path'}`;
 	}
 
-	function managementReasonLabel(value: string): string {
-		return (
-			{
-				TRACK_NOT_MAPPED: 'Exact edition selected; track map missing',
-				RELEASE_NOT_SELECTED: 'Exact MusicBrainz edition not chosen',
-				FILE_UNREADABLE: 'File metadata could not be read',
-				PATH_TOO_LONG: 'Planned path exceeds the configured length limit',
-				SCRIPT_VALIDATION_FAILED: 'Profile script could not safely process this file'
-			}[value] ?? titleManagementValue(value)
-		);
-	}
-
 	function eligibilityTone(value: ManagementEligibility): ManagementAuditTone {
 		return value === 'eligible' ? 'success' : value === 'warning' ? 'warning' : 'error';
 	}
@@ -305,7 +401,10 @@
 			format: managementAudioFormat(item),
 			status: titleManagementValue(item.eligibility),
 			statusTone: eligibilityTone(item.eligibility),
-			reason: item.reason_code ? managementReasonLabel(item.reason_code) : null,
+			reason: item.reason_code
+				? qualifiedReasonLabel(item.reason_code, firstDeferredSource(item))
+				: null,
+			reasonCode: item.reason_code,
 			changes: managementPlanChanges(item),
 			exceptional: managementPlanIsExceptional(item),
 			sourceRoot: rootLabel(item.source_root_id),
@@ -347,6 +446,38 @@
 		catalogSearch = '';
 	}
 
+	async function resumePreviewToken(currentJobId: string): Promise<void> {
+		try {
+			const handle = await reissuePreview.mutateAsync({ jobId: currentJobId });
+			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
+			if (handle.job_id === jobId) reissuedToken = handle.preview_token;
+		} catch {
+			if (currentJobId === jobId) reissueFailed = true;
+		}
+	}
+
+	function retryTokenResume(): void {
+		if (!preview?.ready_for_confirmation) return;
+		reissueFailed = false;
+		reissueAttemptedJobId = null;
+	}
+
+	const applyDisabledReason = $derived.by((): string | null => {
+		if (canApply || activationPreview || preview?.state !== 'ready') return null;
+		if (preview.stale)
+			return `Apply is disabled: this preview is stale (${preview.stale_reasons.map(qualifiedReasonLabel).join(' · ') || 'inputs changed'}). Generate a fresh preview.`;
+		if (preview.expired)
+			return 'Apply is disabled: this preview expired. Generate a fresh preview.';
+		if (!preview.ready_for_confirmation)
+			return 'Apply is disabled: this preview is not awaiting confirmation.';
+		if (applyCount === 0) return 'Apply is disabled: no eligible files and no files with warnings.';
+		if (!previewToken)
+			return reissueFailed
+				? 'Apply is disabled: the private apply token is missing and resuming it failed.'
+				: 'Apply is disabled: resuming your private apply token.';
+		return 'Apply is disabled for this preview.';
+	});
+
 	function openApply(opener: HTMLButtonElement): void {
 		applyOpener = opener;
 		confirmation = '';
@@ -376,7 +507,9 @@
 			});
 			forgetLibraryManagementPreviewToken(jobId);
 			applyDialog.close();
-			await goto(`/library/management/operations/${encodeURIComponent(operation.id)}`);
+			await goto(
+				withBasePath(`/library/management/operations/${encodeURIComponent(operation.id)}`)
+			);
 		} catch (error) {
 			applyError = error instanceof Error ? error.message : 'Could not apply this preview.';
 		}
@@ -431,7 +564,7 @@
 			});
 			rememberLibraryManagementPreviewToken(handle.job_id, handle.preview_token);
 			collisionDialog.close();
-			await goto(`/library/management/previews/${encodeURIComponent(handle.job_id)}`);
+			await goto(withBasePath(`/library/management/previews/${encodeURIComponent(handle.job_id)}`));
 		} catch (error) {
 			collisionError =
 				error instanceof Error ? error.message : 'Could not create a resolution preview.';
@@ -448,7 +581,7 @@
 			{item}
 			{jobId}
 			{roots}
-			reasonLabel={managementReasonLabel}
+			reasonLabel={inspectorReasonLabel}
 			onresolve={openCollision}
 		/>
 	{/if}
@@ -456,22 +589,22 @@
 
 <div class="management-preview-shell px-4 py-8 sm:px-6 lg:px-8">
 	<main class="mx-auto max-w-7xl space-y-5">
-		<BackButton fallback="/library/management?tab=organize" />
+		<BackButton fallback={withBasePath('/library/management?tab=organize')} />
 
 		{#if previewQuery.isLoading || settingsQuery.isLoading || policyQuery.isLoading}
-			<div class="space-y-4">
+			<div class="space-y-4" role="status" aria-label="Loading organization preview">
 				<div class="skeleton h-40 rounded-2xl"></div>
 				<div class="skeleton h-72 rounded-2xl"></div>
 			</div>
 		{:else if previewQuery.isError || settingsQuery.isError || policyQuery.isError}
-			<div class="alert alert-error">Could not load this Organization preview.</div>
+			<div class="alert alert-error" role="alert">Could not load this Organization preview.</div>
 		{:else if preview}
 			<header class="management-control-room p-5 sm:p-7">
 				<div class="flex flex-wrap items-start gap-4">
 					<div class="management-write-mark"><FolderCog class="h-6 w-6" /></div>
 					<div class="min-w-0 flex-1">
 						<p class="management-kicker">
-							<ShieldAlert class="h-3.5 w-3.5" /> Read-only plan · no files changed
+							<ShieldAlert class="h-3.5 w-3.5" /> Applying is the first write action · no files changed
 						</p>
 						<h1 class="mt-1 font-display text-2xl font-bold sm:text-3xl">
 							{previewHeading(preview.mode)}
@@ -527,7 +660,7 @@
 						{quantity(preview.summary.path_change_count, 'path change')}</span
 					>
 					<span class="badge badge-outline"
-						><Layers3 class="h-3 w-3" />
+						><Layers class="h-3 w-3" />
 						{quantity(preview.summary.sidecar_change_count, 'sidecar change')}</span
 					>
 					<span class="badge badge-outline"
@@ -538,11 +671,11 @@
 			</header>
 
 			{#if preview.stale || preview.expired}
-				<div class="alert alert-error items-start">
+				<div class="alert alert-error items-start" role="alert">
 					<ShieldAlert class="mt-0.5 h-5 w-5" /><span
 						><strong>This preview cannot be applied.</strong><br />{preview.expired
 							? 'It expired. Generate a fresh preview.'
-							: preview.stale_reasons.map(titleManagementValue).join(' · ')}</span
+							: staleBannerDetail()}</span
 					>
 				</div>
 			{:else if preview.state === 'failed'}
@@ -572,7 +705,45 @@
 				</div>
 			{/if}
 
-			{#if preview.state === 'ready' && identityBlockerCount > 0}
+			{#if zeroAppliable}
+				<div class="alert alert-warning items-start" role="status">
+					<ShieldAlert class="mt-0.5 h-5 w-5" />
+					<div class="min-w-0 flex-1">
+						<strong>Nothing in this preview can be applied.</strong>
+						{#if topBlockers.length}
+							<p class="mt-1 text-sm">
+								Top blockers: {topBlockers
+									.map(
+										([code, count]) => `${qualifiedReasonLabel(code)} (${count.toLocaleString()})`
+									)
+									.join(' · ')}
+							</p>
+						{/if}
+						{#if culpritRelease !== null && topBlockers[0]}
+							<p class="mt-1 text-sm">
+								Start with Release {culpritRelease}: its blocked rows name the exact cause.
+								<button
+									class="link link-hover"
+									onclick={() => {
+										reasonCode = topBlockers[0][0];
+									}}>Filter to {qualifiedReasonLabel(topBlockers[0][0])}</button
+								>
+							</p>
+						{/if}
+						{#if identityBlockerCount > 0}
+							<p class="mt-1 text-sm">
+								Selecting a root chooses files; it does not choose each release's exact MusicBrainz
+								edition. Prepare identities first, then generate a fresh management preview.
+							</p>
+							<a
+								class="btn btn-outline btn-sm mt-3"
+								href={withBasePath('/library/management?tab=organize')}
+								>Open identity readiness <ArrowRight class="h-4 w-4" /></a
+							>
+						{/if}
+					</div>
+				</div>
+			{:else if preview.state === 'ready' && identityBlockerCount > 0}
 				<div class="alert alert-warning items-start">
 					<BookOpenCheck class="mt-0.5 h-5 w-5" />
 					<div class="min-w-0 flex-1">
@@ -582,9 +753,25 @@
 							Selecting a root chooses files; it does not choose each release's exact MusicBrainz
 							edition. Prepare identities first, then generate a fresh management preview.
 						</p>
-						<a class="btn btn-outline btn-sm mt-3" href="/library/management?tab=organize"
+						<a
+							class="btn btn-outline btn-sm mt-3"
+							href={withBasePath('/library/management?tab=organize')}
 							>Open identity readiness <ArrowRight class="h-4 w-4" /></a
 						>
+					</div>
+				</div>
+			{/if}
+
+			{#if deferredSources.length}
+				<div class="alert alert-info items-start" role="status">
+					<Sparkles class="mt-0.5 h-5 w-5" />
+					<div class="min-w-0 flex-1">
+						<strong>Optional enrichment deferred · files planned without it.</strong>
+						<p class="mt-1 text-sm">
+							Deferred warnings: {deferredSources
+								.map(([source, count]) => `${source} (${count.toLocaleString()})`)
+								.join(' · ')}
+						</p>
 					</div>
 				</div>
 			{/if}
@@ -604,9 +791,15 @@
 						><span>Outcome</span><select
 							class="select select-bordered select-sm bg-base-100"
 							bind:value={eligibility}
-							><option value="">All outcomes</option><option value="eligible">Eligible</option
-							><option value="warning">Warning</option><option value="blocked">Blocked</option
-							><option value="stale">Stale</option></select
+							><option value="">All outcomes</option><option value="eligible"
+								>Eligible ({(preview.summary.eligible_count ?? 0).toLocaleString()})</option
+							><option value="warning"
+								>Warning ({(preview.summary.warning_count ?? 0).toLocaleString()})</option
+							><option value="blocked"
+								>Blocked ({(preview.summary.blocked_count ?? 0).toLocaleString()})</option
+							><option value="stale"
+								>Stale ({(preview.summary.stale_count ?? 0).toLocaleString()})</option
+							></select
 						></label
 					>
 					<label class="grid gap-1 text-xs"
@@ -614,8 +807,8 @@
 							class="select select-bordered select-sm bg-base-100"
 							bind:value={reasonCode}
 							><option value="">All reasons</option
-							>{#each Object.keys(preview.summary.reasons) as reason (reason)}<option value={reason}
-									>{managementReasonLabel(reason)}</option
+							>{#each sortedReasons as [reason, count] (reason)}<option value={reason}
+									>{qualifiedReasonLabel(reason)} ({count.toLocaleString()})</option
 								>{/each}</select
 						></label
 					>
@@ -623,9 +816,8 @@
 						><span>Root</span><select
 							class="select select-bordered select-sm bg-base-100"
 							bind:value={rootId}
-							><option value="">All roots</option
-							>{#each Object.keys(preview.summary.roots) as root (root)}<option value={root}
-									>{rootLabel(root)}</option
+							><option value="">All roots</option>{#each sortedRoots as [root, count] (root)}<option
+									value={root}>{rootLabel(root)} ({count.toLocaleString()})</option
 								>{/each}</select
 						></label
 					>
@@ -634,8 +826,8 @@
 							class="select select-bordered select-sm bg-base-100"
 							bind:value={audioFormat}
 							><option value="">All formats</option
-							>{#each Object.keys(preview.summary.formats) as format (format)}<option value={format}
-									>{format.toUpperCase()}</option
+							>{#each sortedFormats as [format, count] (format)}<option value={format}
+									>{format.toUpperCase()} ({count.toLocaleString()})</option
 								>{/each}</select
 						></label
 					>
@@ -643,10 +835,16 @@
 						><span>Change</span><select
 							class="select select-bordered select-sm bg-base-100"
 							bind:value={changeKind}
-							><option value="">All changes</option><option value="tags">Tags</option><option
-								value="artwork">Artwork</option
-							><option value="path">Path</option><option value="sidecars">Sidecars</option><option
-								value="no_change">No change</option
+							><option value="">All changes</option><option value="tags"
+								>Tags ({preview.summary.tag_change_count.toLocaleString()})</option
+							><option value="artwork"
+								>Artwork ({preview.summary.artwork_change_count.toLocaleString()})</option
+							><option value="path"
+								>Path ({preview.summary.path_change_count.toLocaleString()})</option
+							><option value="sidecars"
+								>Sidecars ({preview.summary.sidecar_change_count.toLocaleString()})</option
+							><option value="no_change"
+								>No change ({preview.summary.no_change_count.toLocaleString()})</option
 							></select
 						></label
 					>
@@ -682,6 +880,8 @@
 							{#if catalogSearch.trim().length >= 2}
 								{#if catalogSearchQuery.isLoading}<div
 										class="skeleton h-16 rounded-xl"
+										role="status"
+										aria-label="Searching artists and releases"
 									></div>{:else if catalogSearchQuery.isError}<div
 										class="alert alert-error py-2 text-xs"
 										role="alert"
@@ -746,17 +946,37 @@
 			</section>
 
 			{#if itemsQuery.isLoading}
-				<div class="space-y-3">
+				<div class="space-y-3" role="status" aria-label="Loading preview files">
 					<div class="skeleton h-28 rounded-xl"></div>
 					<div class="skeleton h-28 rounded-xl"></div>
 				</div>
 			{:else if itemsQuery.isError}
-				<div class="alert alert-error">Could not load preview items.</div>
+				<div class="alert alert-error" role="alert">Could not load preview items.</div>
 			{:else if items.length === 0}
 				<div
 					class="rounded-2xl border border-dashed border-base-content/15 p-8 text-center text-base-content/50"
 				>
 					No files match these filters.
+					<div class="mt-3">
+						<button
+							class="btn btn-ghost btn-sm"
+							onclick={() => {
+								eligibility = '';
+								reasonCode = '';
+								rootId = '';
+								artistId = '';
+								artistLabel = '';
+								albumId = '';
+								albumLabel = '';
+								catalogSearch = '';
+								audioFormat = '';
+								changeKind = '';
+								collisionClass = '';
+								hasPreservedValue = false;
+								hasRepresentationLoss = false;
+							}}>Clear filters</button
+						>
+					</div>
 				</div>
 			{:else}
 				<LibraryManagementAuditDossiers
@@ -797,9 +1017,11 @@
 								{jobId}
 								expectedRevision={preview.operation_row_revision}
 								profileName={preview.profile_name}
-								ondiscard={() => goto('/library/management?tab=organize')}
+								ondiscard={() => goto(withBasePath('/library/management?tab=organize'))}
 							/>
-							<a href="/settings?tab=library" class="btn btn-ghost btn-sm">Library settings</a>
+							<a href={withBasePath('/settings?tab=library')} class="btn btn-ghost btn-sm"
+								>Library settings</a
+							>
 						</div>
 					</div>{:else}<div
 						bind:this={stickyFooterElement}
@@ -811,12 +1033,20 @@
 							<div>
 								<strong>{applyAction.barTitle}</strong>
 								<p class="text-xs text-base-content/55">{applyAction.barDetail}</p>
-								{#if !previewToken && preview.ready_for_confirmation}<p
-										class="mt-1 text-xs text-warning"
-									>
-										The private apply token is not in this browser session. Generate a fresh preview
-										to apply.
-									</p>{/if}
+								{#if applyDisabledReason}
+									<p class="mt-1 text-xs text-warning">{applyDisabledReason}</p>
+								{/if}
+								{#if !previewToken && preview.ready_for_confirmation}
+									{#if reissueFailed}
+										<button class="btn btn-ghost btn-xs mt-1" onclick={retryTokenResume}>
+											Retry token resume
+										</button>
+									{:else if reissueAttemptedJobId === jobId}
+										<p class="mt-1 text-xs text-base-content/55">
+											Resuming your private apply token…
+										</p>
+									{/if}
+								{/if}
 							</div>
 						</div>
 						<div class="flex flex-wrap items-center gap-1">
@@ -824,7 +1054,7 @@
 								{jobId}
 								expectedRevision={preview.operation_row_revision}
 								profileName={preview.profile_name}
-								ondiscard={() => goto('/library/management?tab=organize')}
+								ondiscard={() => goto(withBasePath('/library/management?tab=organize'))}
 							/>
 							<button
 								class="btn management-btn"
@@ -883,7 +1113,7 @@
 					applyPreview.isPending}
 				onclick={() => void apply()}
 				>{#if applyPreview.isPending}<span class="loading loading-spinner loading-sm"
-					></span>{/if}<CheckCircle2 class="h-4 w-4" />
+					></span>{/if}<CircleCheckBig class="h-4 w-4" />
 				{applyAction.confirmButton}</button
 			>
 		</div>

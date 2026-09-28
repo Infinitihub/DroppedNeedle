@@ -1,8 +1,10 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from api.v1.routes.library_target import router
 from api.v1.schemas.edition_conversion import (
@@ -24,8 +26,14 @@ from core.dependencies import (
     get_target_album_edition_finder_service,
     get_wanted_watcher_service,
 )
+from infrastructure.persistence.request_history import RequestHistoryStore
 from middleware import _get_current_admin, _get_current_curator
-from tests.helpers import build_test_client, override_admin_auth, override_user_auth
+from tests.helpers import (
+    add_production_exception_handlers,
+    build_test_client,
+    override_admin_auth,
+    override_user_auth,
+)
 
 
 @pytest.fixture
@@ -104,7 +112,8 @@ def app() -> FastAPI:
     application.dependency_overrides[get_preferences_service] = lambda: SimpleNamespace(
         get_download_policy=lambda: SimpleNamespace(
             quality_cutoff="lossless", upgrade_allowed=True
-        )
+        ),
+        is_library_download_allowed=lambda role: True,
     )
     return application
 
@@ -186,6 +195,8 @@ def test_every_target_library_route_rejects_unauthenticated(app: FastAPI) -> Non
     requests = [
         ("GET", "/library/artists", None),
         ("GET", "/library/albums", None),
+        ("GET", "/library/full-albums", None),
+        ("PUT", "/library/albums/a/full", {"marked_full": True}),
         ("GET", "/library/tracks", None),
         ("GET", "/library/stats", None),
         ("GET", "/library/mbids", None),
@@ -264,6 +275,41 @@ def test_album_detail_exposes_current_management_identity_readiness(
     assert response.json()["management_identity_readiness"] == (
         "track_mapping_required"
     )
+
+
+@pytest.mark.parametrize(
+    ("role", "allowed", "expected"),
+    [
+        ("user", True, True),
+        ("user", False, False),
+        ("admin", False, False),
+    ],
+)
+def test_album_detail_piggybacks_download_allowed(
+    app: FastAPI, role: str, allowed: bool, expected: bool
+) -> None:
+    override_user_auth(app, role=role)
+    native = app.dependency_overrides[get_target_native_library_service]()
+    native.album_detail.return_value = TargetNativeAlbumDetail(
+        id="album-1",
+        title="Album",
+        artist_name="Artist",
+        artist_id="artist-1",
+    )
+    seen: list[str] = []
+
+    def _check(caller_role: str) -> bool:
+        seen.append(caller_role)
+        return allowed
+
+    prefs = SimpleNamespace(is_library_download_allowed=_check)
+    app.dependency_overrides[get_preferences_service] = lambda: prefs
+
+    response = build_test_client(app).get("/library/albums/album-1")
+
+    assert response.status_code == 200
+    assert response.json()["download_allowed"] is expected
+    assert seen == [role]
 
 
 def test_admin_can_search_exact_releases_with_canonical_metadata(app: FastAPI) -> None:
@@ -423,10 +469,71 @@ def test_target_artist_appearances_alias_redirect_preserves_page(app: FastAPI) -
     )
 
     assert response.status_code == 308
-    assert response.headers["location"].endswith(
+    assert response.headers["location"] == (
         "/library/artists/local-artist/appearances?limit=20&offset=40"
     )
     service.artist_appearances.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (
+            "/library/artists/provider-artist",
+            "/library/artists/local-artist",
+        ),
+        (
+            "/library/artists/provider-artist/albums",
+            "/library/artists/local-artist/albums",
+        ),
+        (
+            "/library/artists/provider-artist/appearances?limit=20&offset=40",
+            "/library/artists/local-artist/appearances?limit=20&offset=40",
+        ),
+        ("/library/albums/provider-album", "/library/albums/local-album"),
+        (
+            "/library/albums/provider-album/tracks",
+            "/library/albums/local-album/tracks",
+        ),
+        (
+            "/library/albums/provider-album/status",
+            "/library/albums/local-album/status",
+        ),
+    ],
+)
+def test_all_target_alias_redirects_are_root_relative(
+    app: FastAPI, path: str, expected: str
+) -> None:
+    override_user_auth(app, role="user")
+    service = app.dependency_overrides[get_target_native_library_service]()
+
+    async def canonical_id(kind: str, _identifier: str) -> str:
+        return "local-artist" if kind == "artist" else "local-album"
+
+    service.canonical_id.side_effect = canonical_id
+    response = build_test_client(app).get(path, follow_redirects=False)
+
+    assert response.status_code == 308
+    assert response.headers["location"] == expected
+    assert "://" not in response.headers["location"]
+
+
+def test_target_alias_redirect_preserves_root_path(app: FastAPI) -> None:
+    override_user_auth(app, role="user")
+    service = app.dependency_overrides[get_target_native_library_service]()
+    service.canonical_id.return_value = "local-artist"
+    add_production_exception_handlers(app)
+    client = TestClient(app, raise_server_exceptions=False, root_path="/music")
+
+    response = client.get(
+        "/library/artists/provider-artist/appearances?limit=20&offset=40",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 308
+    assert response.headers["location"] == (
+        "/music/library/artists/local-artist/appearances?limit=20&offset=40"
+    )
 
 
 def test_target_provider_ids_preserve_existing_library_store_contract(
@@ -447,6 +554,45 @@ def test_target_provider_ids_preserve_existing_library_store_contract(
         "mbids": ["owned-rg"],
         "requested_mbids": ["requested-rg"],
     }
+    history.async_get_requested_mbids.assert_awaited_once_with(
+        request_kind="album"
+    )
+
+
+def test_target_provider_ids_requested_mbids_exclude_track_keys(
+    app: FastAPI, tmp_path
+) -> None:
+    override_user_auth(app, role="user")
+    service = app.dependency_overrides[get_target_native_library_service]()
+    service.provider_ids.return_value = SimpleNamespace(
+        musicbrainz_release_group_ids=["owned-rg"]
+    )
+    history = RequestHistoryStore(tmp_path / "requests.db")
+
+    async def _seed() -> None:
+        await history.async_record_request(
+            "requested-rg", "Requested Artist", "Requested Album"
+        )
+        await history.async_record_request(
+            "recording-1",
+            "Requested Artist",
+            "Requested Album",
+            track_title="Requested Track",
+            request_kind="track",
+        )
+
+    asyncio.run(_seed())
+    app.dependency_overrides[get_request_history_store] = lambda: history
+
+    response = build_test_client(app).get("/library/mbids")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mbids"] == ["owned-rg"]
+    # The exact-track row persists under its track-prefixed key and must
+    # never leak into the album requested-ID set.
+    assert "track:recording-1" not in payload["requested_mbids"]
+    assert payload["requested_mbids"] == ["requested-rg"]
 
 
 def test_target_membership_is_bounded_and_candidate_scoped(app: FastAPI) -> None:
@@ -512,6 +658,7 @@ def test_target_library_route_inventory_is_complete() -> None:
     assert inventory == {
         ("GET", "/library/artists"),
         ("GET", "/library/albums"),
+        ("GET", "/library/full-albums"),
         ("GET", "/library/tracks"),
         ("GET", "/library/stats"),
         ("GET", "/library/mbids"),
@@ -535,6 +682,8 @@ def test_target_library_route_inventory_is_complete() -> None:
         ("POST", "/library/resolve-tracks"),
         ("GET", "/library/albums/{album_id}/tracks"),
         ("GET", "/library/albums/{album_id}/status"),
+        ("GET", "/library/albums/{local_album_id}/edition"),
+        ("DELETE", "/library/albums/{local_album_id}/edition"),
         ("DELETE", "/library/album/{album_id}"),
         ("DELETE", "/library/tracks/{track_id}"),
         ("GET", "/library/tracks/{track_id}/tags"),

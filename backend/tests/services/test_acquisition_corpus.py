@@ -18,11 +18,14 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from api.v1.schemas.settings import DownloadPolicySettings
 
 from models.download import TargetAlbum, TargetTrack
+from models.download_manifest import ExpectedTrack
 from repositories.protocols.download_client import DownloadSearchResult
 from services.native.album_preflight_scorer import AlbumPreflightScorer
 from services.native.track_matcher import TrackMatcher
+from services.native.acquisition.quality import build_snapshot
 
 _CORPUS_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "acquisition_corpus"
 _CASES = sorted(_CORPUS_DIR.glob("*.json"))
@@ -58,6 +61,24 @@ def _store():
     return store
 
 
+def _policy_snapshot():
+    return build_snapshot(DownloadPolicySettings())
+
+
+def _expected_tracks(case: dict) -> list[ExpectedTrack]:
+    return [
+        ExpectedTrack(
+            track_number=t["track_number"],
+            disc_number=t.get("disc_number", 1),
+            duration_seconds=t.get("duration_seconds"),
+            recording_mbid=t.get("recording_mbid"),
+            title=t.get("title"),
+            release_track_mbid=t.get("release_track_mbid"),
+        )
+        for t in case.get("expected_tracks", [])
+    ]
+
+
 async def _rank_album(case: dict):
     target = case["target"]
     scorer = AlbumPreflightScorer(_store())
@@ -69,6 +90,8 @@ async def _rank_album(case: dict):
             track_count=target["track_count"],
         ),
         _results(case),
+        snapshot=_policy_snapshot(),
+        expected_tracks=_expected_tracks(case),
     )
 
 
@@ -84,6 +107,7 @@ async def _rank_single(case: dict):
             recording_mbid=target.get("recording_mbid"),
         ),
         _results(case),
+        snapshot=_policy_snapshot(),
     )
 
 
@@ -99,7 +123,9 @@ async def test_corpus_case(path: Path):
     case = _load(path)
     expect = case["expect"]
 
-    ranked = await (_rank_single(case) if case["kind"] == "single" else _rank_album(case))
+    ranked = await (
+        _rank_single(case) if case["kind"] == "single" else _rank_album(case)
+    )
     assert ranked, f"{case['name']}: scorer returned no candidates"
 
     if expect.get("no_auto"):
@@ -124,6 +150,15 @@ async def test_corpus_case(path: Path):
         picked = _by_parent(ranked, expect["picked_parent"])
         assert picked.tier != "rejected", (
             f"{case['name']}: the historically-picked candidate is now rejected"
+        )
+    if "overlap_max" in expect:
+        picked = _by_parent(ranked, expect["picked_parent"])
+        assert picked.track_overlap is not None, (
+            f"{case['name']}: expected a computed overlap on the picked candidate"
+        )
+        assert picked.track_overlap <= expect["overlap_max"], (
+            f"{case['name']}: overlap {picked.track_overlap:.3f} exceeds "
+            f"{expect['overlap_max']} - the wrong product reads as a match"
         )
 
     # The MB-degraded fallback: a single whose identity threading failed scores

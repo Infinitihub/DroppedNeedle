@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { withBasePath } from '$lib/utils/basePath';
 	import { API } from '$lib/constants';
 	import { api } from '$lib/api/client';
 	import { buildDiscoveryQueueFromLocal } from '$lib/player/queueHelpers';
@@ -19,7 +20,7 @@
 		Shuffle,
 		ListPlus,
 		ListStart,
-		Loader2,
+		LoaderCircle,
 		Music2,
 		Search,
 		X
@@ -148,7 +149,7 @@
 	<div class="flex items-center gap-4 mb-6">
 		<button
 			class="btn btn-ghost btn-circle"
-			onclick={() => goto('/library')}
+			onclick={() => goto(withBasePath('/library'))}
 			aria-label="Back to library"
 		>
 			<ChevronLeft class="w-6 h-6" />
@@ -230,7 +231,7 @@
 					aria-busy="true"
 					aria-label="Stop loading tracks"
 				>
-					<Loader2 class="h-3.5 w-3.5 animate-spin" />
+					<LoaderCircle class="h-3.5 w-3.5 animate-spin" />
 					{loader.progressText ?? 'Loading tracks'}
 				</button>
 			{:else}
@@ -272,7 +273,7 @@
 				>
 					<div class="relative h-12 w-12 shrink-0">
 						<AlbumImage
-							mbid={track.album_id}
+							mbid={track.musicbrainz_release_group_id ?? ''}
 							source="local"
 							available={track.cover_available}
 							alt={track.album_title}

@@ -6,9 +6,9 @@ service/persistence-layer domain types.
 """
 
 from infrastructure.msgspec_fastapi import AppStruct
+from models.acquisition_quality import AudioQualityEvidence, QualityDecision
 from repositories.protocols.download_client import DownloadSearchResult
-from repositories.protocols.indexer import UsenetRelease
-
+from repositories.protocols.indexer import PluginSearchResult, UsenetRelease
 
 class ScoredCandidate(AppStruct):
     """A scored acquisition candidate - the convergence point for both sources
@@ -31,13 +31,25 @@ class ScoredCandidate(AppStruct):
     parent_directory: str = ""
     files: list[DownloadSearchResult] = []
     usenet_release: UsenetRelease | None = None
+    # Plugin release for a ``plugin:<name>`` candidate; None for soulseek/usenet.
+    # Optional + defaulted so pre-feature blobs decode unchanged (strict=False).
+    plugin_release: PluginSearchResult | None = None
     coherence: float = 0.0
     file_confidence: float = 0.0
     final_score: float = 0.0
     tier: str = "rejected"
+    # Grab-time tracklist overlap (0..1) when the rank knew the pinned
+    # edition's tracklist, else None (pre-feature blobs, manual searches, and
+    # unresolvable tracklists). Folds into final_score; shown on review cards.
+    track_overlap: float | None = None
     # Response-only pointer into the persisted candidate list. It lets a current-policy
     # review projection reorder/filter older blobs without changing what a Pick indexes.
     candidate_index: int | None = None
+    # Nested acquisition-quality evaluation (Acquisition plan). Optional +
+    # defaulted so pre-feature blobs decode unchanged; new blobs carry the
+    # per-candidate evidence/decision used by review and restart flows.
+    quality_evidence: AudioQualityEvidence | None = None
+    quality_decision: QualityDecision | None = None
 
 
 class DownloadsMountStatus(AppStruct):
@@ -78,6 +90,9 @@ class TargetTrack(AppStruct):
     release_group_mbid: str | None = None
 
 
+
+
+
 class SearchJob(AppStruct):
     """A search job row (``search_jobs``). Candidates are stored separately in
     the ``candidates_blob`` column and exposed via the store's
@@ -97,6 +112,11 @@ class SearchJob(AppStruct):
     created_at: float = 0.0
     completed_at: float | None = None
     updated_at: float = 0.0
+    # Immutable acquisition-quality snapshot pinned at creation for manual and
+    # task-linked searches; old rows decode as None.
+    quality_snapshot_json: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_snapshot_summary: str | None = None
 
 
 class DownloadActivitySummary(AppStruct):
@@ -172,6 +192,18 @@ class DownloadTask(AppStruct):
     attempt_number: int = 0
     attempt_total: int = 0
     has_next_source: bool = False
+    # Immutable acquisition-quality snapshot pinned at task creation (the
+    # policy that governs search/score/failover for THIS row; later settings
+    # saves never mutate it - restart-with-current-policy is the refresh).
+    quality_snapshot_json: str | None = None
+    quality_snapshot_hash: str | None = None
+    quality_snapshot_summary: str | None = None
+    # Stable step index within the snapshot order (None = unknown/legacy row).
+    quality_preference_step: int | None = None
+    # Evidence labels for the selected candidate (probed or source-reported).
+    quality_certainty: str | None = None
+    quality_provenance: str | None = None
+    manual_quality_override: bool = False
     staging_path: str | None = None
     final_path: str | None = None
     error_message: str | None = None
@@ -182,3 +214,9 @@ class DownloadTask(AppStruct):
     completed_at: float | None = None
     cancelled_at: float | None = None
     updated_at: float = 0.0
+    # Wrong-product verdict: set when an album import processed files but
+    # imported nothing and every failure was tag-verification (the grabbed
+    # folder is a different product wearing the right name). The detail names
+    # the grabbed folder; member evidence stays on the per-file held rows.
+    wrong_product_verdict_at: float | None = None
+    wrong_product_detail: str | None = None

@@ -1,8 +1,8 @@
 /**
  * State machine for the always-visible Discover Queue deck.
  *
- * Load order favours instant paint: localStorage queue (resume) -> background-built
- * queue via GET /queue (already enriched + cover-prewarmed) -> inline build fallback.
+ * Load order favours instant paint after source validation: localStorage resume,
+ * then lightweight server candidates. Only the current and next card hydrate.
  * The queue is consumed-once and mutated locally (advance/ignore/jump), so it lives
  * here rather than in TanStack Query; every mutation persists to localStorage.
  */
@@ -10,7 +10,7 @@ import { API } from '$lib/constants';
 import { api } from '$lib/api/client';
 import { authStore } from '$lib/stores/authStore.svelte';
 import { discoverQueueStatusStore } from '$lib/stores/discoverQueueStatus';
-import { getCacheTTLs } from '$lib/stores/cacheTtl';
+import { getCacheTTLs } from '$lib/stores/cacheTtl.svelte';
 import {
 	getQueueCachedData,
 	removeQueueCachedData,
@@ -18,7 +18,13 @@ import {
 } from '$lib/utils/discoverQueueCache';
 import { isAbortError } from '$lib/utils/errorHandling';
 import { invalidateDiscoverRecommendations } from '$lib/queries/discover/DiscoverInvalidation';
-import { SvelteMap } from 'svelte/reactivity';
+import { recordDiscoverActivity } from '$lib/queries/discover/DiscoverDemand.svelte';
+import {
+	musicBrainzSourceKey,
+	subscribeMusicBrainzSourceScope,
+	watchMusicBrainzSourceScope
+} from '$lib/queries/musicbrainz/sourceScope.svelte';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import type {
 	DiscoverQueueEnrichment,
 	DiscoverQueueItemFull,
@@ -41,12 +47,33 @@ function emptyEnrichment(): DiscoverQueueEnrichment {
 	};
 }
 
+function dedupeByMbid(items: DiscoverQueueItemFull[]): DiscoverQueueItemFull[] {
+	const seen = new SvelteSet<string>();
+	const unique: DiscoverQueueItemFull[] = [];
+	for (const item of items) {
+		const mbid = item.release_group_mbid;
+		if (!mbid || seen.has(mbid)) continue;
+		seen.add(mbid);
+		unique.push(item);
+	}
+	return unique;
+}
+
 function createDiscoverQueueDeck() {
 	let phase = $state<DeckPhase>('idle');
 	let queue = $state<DiscoverQueueItemFull[]>([]);
 	let currentIndex = $state(0);
 	let queueId = $state('');
 	let errorMessage = $state('');
+	let replacing = $state(false);
+	let generation = $state(0);
+	let sourceUnsub: (() => void) | null = null;
+	let storageUnsub: (() => void) | null = null;
+	let isVisible = () => true;
+
+	function requestKey(): string {
+		return `${generation}:${JSON.stringify(musicBrainzSourceKey())}`;
+	}
 
 	let abortController: AbortController | null = null;
 	let statusUnsub: (() => void) | null = null;
@@ -91,11 +118,12 @@ function createDiscoverQueueDeck() {
 				primed = true;
 				return;
 			}
-			if (phase !== 'building' && phase !== 'finished') return;
+			if (phase !== 'building' && phase !== 'finished' && !replacing) return;
 			if (s.status === 'ready') {
 				void fetchQueue();
-			} else if (s.status === 'error' && phase === 'building') {
-				phase = 'error';
+			} else if (s.status === 'error') {
+				replacing = false;
+				phase = queue.length ? 'ready' : 'error';
 				errorMessage = s.error ?? 'Queue build failed';
 				stopWatchingStatus();
 			}
@@ -104,12 +132,16 @@ function createDiscoverQueueDeck() {
 
 	async function fetchQueue(): Promise<void> {
 		stopWatchingStatus();
-		phase = 'loading';
+		const key = requestKey();
+		if (!queue.length) phase = 'loading';
 		try {
 			const data = await api.global.get<DiscoverQueueResponse>(API.discoverQueue(), {
 				signal: abortController?.signal
 			});
-			queue = data.items.map((item) => ({ ...item }));
+			if (key !== requestKey() || abortController?.signal.aborted) return;
+			generation++;
+			replacing = false;
+			queue = dedupeByMbid(data.items.map((item) => ({ ...item })));
 			queueId = data.queue_id;
 			currentIndex = 0;
 			inFlightEnrich.clear();
@@ -121,18 +153,17 @@ function createDiscoverQueueDeck() {
 			persist();
 			void enrichWindow();
 			discoverQueueStatusStore.markConsumed();
-			if (getCacheTTLs().discoverQueueAutoGenerate) {
-				void discoverQueueStatusStore.triggerGenerate(false);
-			}
 		} catch (e) {
-			if (isAbortError(e)) return;
-			phase = 'error';
+			if (isAbortError(e) || key !== requestKey()) return;
+			replacing = false;
+			phase = queue.length ? 'ready' : 'error';
 			errorMessage = 'Could not load your discovery queue';
 		}
 	}
 
 	async function validateCachedQueue(): Promise<void> {
 		if (queue.length === 0) return;
+		const key = requestKey();
 		try {
 			const mbids = queue.map((i) => i.release_group_mbid);
 			const data = await api.global.post<{ in_library?: string[] }>(
@@ -140,7 +171,8 @@ function createDiscoverQueueDeck() {
 				{ release_group_mbids: mbids },
 				{ signal: abortController?.signal }
 			);
-			const inLibrary = new Set(data.in_library || []);
+			if (key !== requestKey()) return;
+			const inLibrary = new SvelteSet(data.in_library || []);
 			if (inLibrary.size > 0) {
 				queue = queue.filter((i) => !inLibrary.has(i.release_group_mbid));
 				if (currentIndex >= queue.length) currentIndex = Math.max(0, queue.length - 1);
@@ -159,6 +191,7 @@ function createDiscoverQueueDeck() {
 		if (!item || item.enrichment) return;
 
 		const mbid = item.release_group_mbid;
+		const key = requestKey();
 		const existing = inFlightEnrich.get(mbid);
 		if (existing) {
 			await existing;
@@ -171,20 +204,21 @@ function createDiscoverQueueDeck() {
 				const data = await api.global.get<DiscoverQueueEnrichment>(API.discoverQueueEnrich(mbid), {
 					signal
 				});
+				if (key !== requestKey()) return null;
 				const idx = queue.findIndex((q) => q.release_group_mbid === mbid);
 				if (idx >= 0 && !queue[idx].enrichment) {
 					queue[idx] = { ...queue[idx], enrichment: data };
 				}
 				return data;
 			} catch (e) {
-				if (isAbortError(e)) return null;
+				if (isAbortError(e) || key !== requestKey()) return null;
 				const idx = queue.findIndex((q) => q.release_group_mbid === mbid);
 				if (idx >= 0 && !queue[idx].enrichment) {
 					queue[idx] = { ...queue[idx], enrichment: emptyEnrichment() };
 				}
 				return null;
 			} finally {
-				inFlightEnrich.delete(mbid);
+				if (key === requestKey()) inFlightEnrich.delete(mbid);
 			}
 		})();
 		inFlightEnrich.set(mbid, promise);
@@ -193,15 +227,17 @@ function createDiscoverQueueDeck() {
 
 	async function enrichWindow(): Promise<void> {
 		if (queue.length === 0) return;
-		await enrichItem(currentIndex);
-		for (let i = 1; i <= 2; i++) {
-			if (currentIndex + i < queue.length) {
-				void enrichItem(currentIndex + i);
-			}
-		}
+		void enrichItem(currentIndex);
+		void enrichItem(currentIndex + 1);
 	}
 
 	return {
+		get requestKey() {
+			return requestKey();
+		},
+		get replacing() {
+			return replacing;
+		},
 		get phase() {
 			return phase;
 		},
@@ -221,18 +257,55 @@ function createDiscoverQueueDeck() {
 			return errorMessage;
 		},
 
-		async init(): Promise<void> {
+		async init(getVisible?: () => boolean): Promise<void> {
+			if (getVisible) isVisible = getVisible;
+			generation++;
+			const session = generation;
+			sourceUnsub?.();
+			storageUnsub?.();
+			sourceUnsub = null;
+			storageUnsub = null;
+			queue = [];
+			phase = 'loading';
+			replacing = false;
+			inFlightEnrich.clear();
 			abortController?.abort();
 			abortController = new AbortController();
 			// clean up any watcher/poll timer left over from a prior init without an
 			// intervening destroy (HMR, double-mount) so we don't orphan a poll loop
 			stopWatchingStatus();
-			discoverQueueStatusStore.stopPolling();
+			discoverQueueStatusStore.reset();
+			try {
+				await recordDiscoverActivity({ feature: 'queue' }, abortController.signal);
+			} catch (e) {
+				if (session !== generation || isAbortError(e)) return;
+				phase = 'error';
+				errorMessage = 'Could not verify your discovery source. Retry to load your queue.';
+				return;
+			}
+			if (session !== generation) return;
+			errorMessage = '';
+			sourceUnsub = subscribeMusicBrainzSourceScope(() => {
+				removeQueueCachedData(userId());
+				if (isVisible()) void this.init();
+				else this.destroy();
+			});
+			storageUnsub = watchMusicBrainzSourceScope();
 
 			const cached = getQueueCachedData(userId());
-			if (cached && cached.data.items.length > 0) {
-				queue = cached.data.items;
-				currentIndex = Math.min(cached.data.currentIndex, cached.data.items.length - 1);
+			const cachedCurrentMbid = cached
+				? cached.data.items[cached.data.currentIndex]?.release_group_mbid
+				: undefined;
+			const cachedItems = cached ? dedupeByMbid(cached.data.items) : [];
+			if (cached && cachedItems.length > 0) {
+				queue = cachedItems;
+				const resumedIndex = cachedCurrentMbid
+					? queue.findIndex((item) => item.release_group_mbid === cachedCurrentMbid)
+					: -1;
+				currentIndex =
+					resumedIndex >= 0
+						? resumedIndex
+						: Math.max(0, Math.min(cached.data.currentIndex, queue.length - 1));
 				queueId = cached.data.queueId;
 				phase = 'ready';
 				await validateCachedQueue();
@@ -242,6 +315,7 @@ function createDiscoverQueueDeck() {
 
 			phase = 'loading';
 			const status = await discoverQueueStatusStore.fetchStatus();
+			if (session !== generation) return;
 			if (status?.status === 'ready') {
 				await fetchQueue();
 				return;
@@ -319,6 +393,7 @@ function createDiscoverQueueDeck() {
 		async ignoreCurrent(): Promise<void> {
 			const item = current;
 			if (!item) return;
+			const key = requestKey();
 			let saved = false;
 			try {
 				await api.global.post(
@@ -335,6 +410,7 @@ function createDiscoverQueueDeck() {
 			} catch {
 				// removing it locally is still right even if the ignore write failed
 			}
+			if (key !== requestKey()) return;
 			this.removeByMbid(item.release_group_mbid);
 			if (saved) await invalidateDiscoverRecommendations();
 		},
@@ -347,6 +423,7 @@ function createDiscoverQueueDeck() {
 
 		/** End of the deck: clear the cache and brew a fresh queue in the background. */
 		finish(): void {
+			generation++;
 			queue = [];
 			currentIndex = 0;
 			queueId = '';
@@ -360,21 +437,38 @@ function createDiscoverQueueDeck() {
 		},
 
 		retryBuild(): void {
-			phase = 'building';
+			if (!sourceUnsub) {
+				void this.init();
+				return;
+			}
+			this.buildNow();
+		},
+
+		buildNow(): void {
+			if (!sourceUnsub) {
+				void this.init().then(() => {
+					if (sourceUnsub) this.buildNow();
+				});
+				return;
+			}
+			if (replacing) return;
+			replacing = true;
+			if (!queue.length) phase = 'building';
+			errorMessage = '';
 			watchStatusUntilReady();
 			void discoverQueueStatusStore.triggerGenerate(true);
 		},
 
-		/** Slow path: build inline right now instead of waiting on the background task. */
-		buildNow(): void {
-			void fetchQueue();
-		},
-
 		destroy(): void {
+			generation++;
+			sourceUnsub?.();
+			storageUnsub?.();
+			sourceUnsub = null;
+			storageUnsub = null;
 			abortController?.abort();
 			abortController = null;
 			stopWatchingStatus();
-			discoverQueueStatusStore.stopPolling();
+			discoverQueueStatusStore.reset();
 			inFlightEnrich.clear();
 			phase = 'idle';
 		}

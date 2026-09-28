@@ -1,10 +1,19 @@
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
+import os
 import shutil
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TYPE_CHECKING
+from dataclasses import asdict
+
+if TYPE_CHECKING:
+    from repositories.musicbrainz_response_cache import MbResponseMetadata
 
 from infrastructure.serialization import to_jsonable
 
@@ -20,13 +29,27 @@ def _decode_json(text: str) -> Any:
 class DiskMetadataCache:
     _CACHE_VERSION = "v3"
 
+    # F-PERF-06 named touch policy: a successful warm read updates the
+    # sidecar's ``last_accessed`` at most once per this interval. Inside the
+    # window hits are free of metadata writes; the in-memory map keeps eviction
+    # accurate until the next durable touch. Restart safety comes from the
+    # sidecar itself - a fresh process falls back to the stored value.
+    _ACCESS_TOUCH_INTERVAL_SECONDS = 300.0
+    _TOUCH_MEMORY_MAX_ENTRIES = 4096
+
     def __init__(
         self,
         base_path: Path,
         recent_metadata_max_size_mb: int = 128,
         recent_covers_max_size_mb: int = 0,
         persistent_metadata_ttl_hours: int = 24,
+        clock: Callable[[], float] | None = None,
     ):
+        self._clock: Callable[[], float] = clock or time.time
+        self._touch_lock = threading.Lock()
+        self._touch_memory: dict[str, float] = {}
+        self._publication_lock = threading.RLock()
+        self._clear_epoch = 0
         self.base_path = Path(base_path)
         self.recent_metadata_max_size_bytes = max(recent_metadata_max_size_mb, 0) * 1024 * 1024
         self.recent_covers_max_size_bytes = max(recent_covers_max_size_mb, 0) * 1024 * 1024
@@ -42,6 +65,9 @@ class DiskMetadataCache:
         self._persistent_audiodb_artists_dir = self.base_path / "persistent" / "audiodb_artists"
         self._persistent_audiodb_albums_dir = self.base_path / "persistent" / "audiodb_albums"
         self._ensure_dirs()
+
+    def capture_clear_token(self) -> tuple[object, int]:
+        return self, self._clear_epoch
 
     def _ensure_dirs(self) -> None:
         for path in (
@@ -92,6 +118,7 @@ class DiskMetadataCache:
     def _delete_file_pair(self, file_path: Path) -> None:
         file_path.unlink(missing_ok=True)
         self._meta_path(file_path).unlink(missing_ok=True)
+        self._forget_touch_memory(file_path)
 
     def _load_meta(self, meta_path: Path) -> dict[str, Any]:
         if not meta_path.exists():
@@ -102,10 +129,11 @@ class DiskMetadataCache:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    @staticmethod
-    def _is_expired(meta: dict[str, Any]) -> bool:
+    def _is_expired(self, meta: dict[str, Any]) -> bool:
+        # F-PERF-06 clock seam: expiry honours the same injectable clock as
+        # access touches so tests stay deterministic without real sleeps.
         expires_at = meta.get("expires_at")
-        return isinstance(expires_at, (int, float)) and time.time() > float(expires_at)
+        return isinstance(expires_at, (int, float)) and self._clock() > float(expires_at)
 
     def _cleanup_expired_directory(self, directory: Path) -> int:
         removed = 0
@@ -142,10 +170,9 @@ class DiskMetadataCache:
                 size_bytes = data_path.stat().st_size
             except FileNotFoundError:
                 continue
-            meta = self._load_meta(self._meta_path(data_path))
-            last_accessed = float(meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0)
             total_size += size_bytes
-            candidates.append((last_accessed, data_path, size_bytes))
+            # F-PERF-06: throttled touches stay visible between sidecar writes.
+            candidates.append((self._durable_or_memory_touch(data_path), data_path, size_bytes))
 
         if total_size <= max_size_bytes:
             return 0
@@ -159,7 +186,7 @@ class DiskMetadataCache:
                 break
         return freed
 
-    def _write_json_entry(self, file_path: Path, payload: dict[str, Any], expires_at: float | None) -> None:
+    def _write_json_entry(self, file_path: Path, payload: dict[str, Any], expires_at: float | None, metadata: MbResponseMetadata | None = None) -> None:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
         file_path.write_text(_encode_json(payload))
@@ -169,7 +196,10 @@ class DiskMetadataCache:
         }
         if expires_at is not None:
             meta["expires_at"] = expires_at
+        if metadata is not None:
+            meta["musicbrainz"] = asdict(metadata)
         self._meta_path(file_path).write_text(_encode_json(meta))
+        self._touch_memory[str(self._meta_path(file_path))] = now
 
     def _read_json_entry(self, file_path: Path, honor_expiry: bool) -> dict[str, Any] | None:
         if not file_path.exists():
@@ -200,13 +230,63 @@ class DiskMetadataCache:
             return None
 
         if meta_path.exists():
-            meta["last_accessed"] = time.time()
-            try:
-                meta_path.write_text(_encode_json(meta))
-            except OSError:
-                pass
+            self._touch_access_metadata(meta_path, meta)
 
         return payload
+
+    def _touch_access_metadata(self, meta_path: Path, meta: dict[str, Any]) -> None:
+        """F-PERF-06 throttled access touch.
+
+        A warm read updates the durable ``last_accessed`` at most once per
+        ``_ACCESS_TOUCH_INTERVAL_SECONDS``; inside the window the hit only
+        refreshes this cache's bounded in-memory map, which size enforcement
+        reads alongside the sidecar. The per-cache lock coalesces concurrent
+        hits for one path so a burst cannot schedule one write per worker
+        thread. Failures stay best-effort: a touch error never invalidates a
+        valid payload."""
+        now = self._clock()
+        key = str(meta_path)
+        stored = float(
+            meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0
+        )
+        with self._touch_lock:
+            last_touched = max(self._touch_memory.get(key, 0.0), stored)
+            if now - last_touched < self._ACCESS_TOUCH_INTERVAL_SECONDS:
+                # Inside the window: no durable write; keep the freshest known
+                # signal visible to eviction via the in-memory map.
+                self._touch_memory[key] = last_touched
+                return
+            meta["last_accessed"] = now
+            try:
+                meta_path.write_text(_encode_json(meta))
+                self._touch_memory[key] = now
+            except OSError:
+                pass
+            self._prune_touch_memory(now)
+
+    def _prune_touch_memory(self, now: float) -> None:
+        """Bounded cleanup: drop stale windows first, then oldest touches."""
+        cutoff = now - self._ACCESS_TOUCH_INTERVAL_SECONDS * 4
+        stale = [key for key, touched in self._touch_memory.items() if touched < cutoff]
+        for key in stale:
+            del self._touch_memory[key]
+        while len(self._touch_memory) > self._TOUCH_MEMORY_MAX_ENTRIES:
+            oldest_key = min(self._touch_memory, key=self._touch_memory.get)
+            del self._touch_memory[oldest_key]
+
+    def _durable_or_memory_touch(self, data_path: Path) -> float:
+        """Most recent recency signal for eviction decisions: durable sidecar
+        value (or created_at fallback) unless an in-memory throttled touch is
+        newer. Keeps LRU/size eviction correct between durable touches."""
+        meta = self._load_meta(self._meta_path(data_path))
+        durable = float(meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0)
+        memory_value = self._touch_memory.get(str(self._meta_path(data_path)))
+        return max(durable, memory_value) if memory_value is not None else durable
+
+    def _forget_touch_memory(self, *data_paths: Path) -> None:
+        with self._touch_lock:
+            for data_path in data_paths:
+                self._touch_memory.pop(str(self._meta_path(data_path)), None)
 
     async def _set_entity(
         self,
@@ -215,6 +295,9 @@ class DiskMetadataCache:
         payload: Any,
         is_monitored: bool,
         ttl_seconds: int | None,
+        *,
+        metadata: MbResponseMetadata | None = None,
+        cache_token: tuple[object, int] | None = None,
     ) -> None:
         builtins = to_jsonable(payload)
         if not isinstance(builtins, dict):
@@ -222,18 +305,31 @@ class DiskMetadataCache:
 
         recent_path, persistent_path = self._entity_paths(entity_type, identifier)
 
+        cache_token = cache_token or self.capture_clear_token()
         def operation() -> None:
             target_path = persistent_path if is_monitored else recent_path
             other_path = recent_path if is_monitored else persistent_path
-            self._delete_file_pair(other_path)
             expires_at = None
             if ttl_seconds is not None:
                 expires_at = time.time() + max(ttl_seconds, 1)
             elif not is_monitored:
                 expires_at = time.time() + max(self.default_ttl_seconds, 1)
-            self._write_json_entry(target_path, builtins, expires_at)
+            projection_metadata = metadata
+            if metadata is not None:
+                from repositories.musicbrainz_response_cache import bound_mb_metadata
 
-        await asyncio.to_thread(operation)
+                expires_at = min(expires_at, metadata.fresh_until) if expires_at is not None else metadata.fresh_until
+                if expires_at <= time.time():
+                    return
+                projection_metadata = bound_mb_metadata(metadata, expires_at)
+            self._delete_file_pair(other_path)
+            self._write_json_entry(target_path, builtins, expires_at, projection_metadata)
+
+        def guarded_operation() -> None:
+            with self._publication_lock:
+                if cache_token == self.capture_clear_token():
+                    operation()
+        await asyncio.to_thread(guarded_operation)
 
     async def _get_entity(self, entity_type: str, identifier: str) -> dict[str, Any] | None:
         recent_path, persistent_path = self._entity_paths(entity_type, identifier)
@@ -258,17 +354,62 @@ class DiskMetadataCache:
     async def get_album(self, musicbrainz_id: str) -> dict[str, Any] | None:
         return await self._get_entity("album", musicbrainz_id)
 
+    @staticmethod
+    def _artist_cache_identifier(
+        musicbrainz_id: str, profile: str = "full"
+    ) -> str:
+        if profile == "full":
+            return musicbrainz_id
+        if profile == "basic":
+            return f"{musicbrainz_id}:basic"
+        raise ValueError(f"Unsupported artist cache profile: {profile}")
+
     async def set_artist(
         self,
         musicbrainz_id: str,
         artist_info: Any,
         is_monitored: bool = False,
         ttl_seconds: int | None = None,
+        *,
+        profile: str = "full",
+        metadata: MbResponseMetadata | None = None,
+        cache_token: tuple[object, int] | None = None,
     ) -> None:
-        await self._set_entity("artist", musicbrainz_id, artist_info, is_monitored, ttl_seconds)
+        identifier = self._artist_cache_identifier(musicbrainz_id, profile)
+        await self._set_entity(
+            "artist", identifier, artist_info, is_monitored, ttl_seconds,
+            metadata=metadata, cache_token=cache_token,
+        )
 
-    async def get_artist(self, musicbrainz_id: str) -> dict[str, Any] | None:
-        return await self._get_entity("artist", musicbrainz_id)
+    async def get_artist(
+        self, musicbrainz_id: str, *, profile: str = "full"
+    ) -> dict[str, Any] | None:
+        payload, _metadata = await self.get_artist_with_metadata(musicbrainz_id, profile=profile)
+        return payload
+
+    async def get_artist_with_metadata(
+        self, musicbrainz_id: str, *, profile: str = "full"
+    ) -> tuple[dict[str, Any] | None, MbResponseMetadata | None]:
+        identifier = self._artist_cache_identifier(musicbrainz_id, profile)
+        recent_path, persistent_path = self._entity_paths("artist", identifier)
+
+        def operation():
+            with self._publication_lock:
+                for path in (persistent_path, recent_path):
+                    payload = self._read_json_entry(path, honor_expiry=True)
+                    if payload is None:
+                        continue
+                    raw = self._load_meta(self._meta_path(path)).get("musicbrainz")
+                    try:
+                        from repositories.musicbrainz_response_cache import MbResponseMetadata
+
+                        metadata = MbResponseMetadata(**raw) if isinstance(raw, dict) else None
+                    except (TypeError, ValueError):
+                        self._delete_file_pair(path)
+                        continue
+                    return payload, metadata
+                return None, None
+        return await asyncio.to_thread(operation)
 
     async def set_audiodb_artist(
         self,
@@ -299,10 +440,22 @@ class DiskMetadataCache:
         await asyncio.to_thread(self._delete_file_pair, recent_path)
         await asyncio.to_thread(self._delete_file_pair, persistent_path)
 
-    async def delete_artist(self, musicbrainz_id: str) -> None:
-        recent_path, persistent_path = self._entity_paths("artist", musicbrainz_id)
-        await asyncio.to_thread(self._delete_file_pair, recent_path)
-        await asyncio.to_thread(self._delete_file_pair, persistent_path)
+    async def delete_artist(
+        self, musicbrainz_id: str, *, profile: str | None = None
+    ) -> None:
+        profiles = ("full", "basic") if profile is None else (profile,)
+        identifiers = [
+            self._artist_cache_identifier(musicbrainz_id, current_profile)
+            for current_profile in profiles
+        ]
+
+        def operation() -> None:
+            for identifier in identifiers:
+                recent_path, persistent_path = self._entity_paths("artist", identifier)
+                self._delete_file_pair(recent_path)
+                self._delete_file_pair(persistent_path)
+
+        await asyncio.to_thread(operation)
 
     async def delete_entity(self, entity_type: str, identifier: str) -> None:
         recent_path, persistent_path = self._entity_paths(entity_type, identifier)
@@ -324,10 +477,12 @@ class DiskMetadataCache:
             persistent_meta = self._meta_path(persistent_path)
             if recent_meta.exists():
                 meta = _decode_json(recent_meta.read_text())
-                meta.pop("expires_at", None)
+                if "musicbrainz" not in meta:
+                    meta.pop("expires_at", None)
                 meta["last_accessed"] = time.time()
                 persistent_meta.write_text(_encode_json(meta))
                 recent_meta.unlink(missing_ok=True)
+            self._forget_touch_memory(recent_path)
             return True
 
         return await asyncio.to_thread(operation)
@@ -338,64 +493,67 @@ class DiskMetadataCache:
     async def promote_artist_to_persistent(self, musicbrainz_id: str) -> bool:
         return await self.promote_to_persistent(musicbrainz_id, "artist")
 
-    async def cleanup_expired_recent(self) -> int:
-        def operation() -> int:
-            removed = 0
-            for base_dir in (
-                self._recent_albums_dir,
-                self._recent_artists_dir,
-                self._recent_audiodb_artists_dir,
-                self._recent_audiodb_albums_dir,
-            ):
-                removed += self._cleanup_expired_directory(base_dir)
-            return removed
+    async def cleanup_recent(self) -> tuple[int, int]:
+        """Expire recent entries and enforce their shared metadata byte limit.
 
-        return await asyncio.to_thread(operation)
+        The inventory belongs to one worker cycle, not a filesystem snapshot:
+        arrivals after enumeration are picked up by the next periodic cycle.
+        """
+        return await asyncio.to_thread(self._cleanup_recent)
 
-    async def enforce_recent_size_limits(self) -> int:
-        if self.recent_metadata_max_size_bytes <= 0:
-            return 0
-
-        def operation() -> int:
-            candidates: list[tuple[float, Path, int]] = []
-            total_size = 0
-            for base_dir in (
-                self._recent_albums_dir,
-                self._recent_artists_dir,
-                self._recent_audiodb_artists_dir,
-                self._recent_audiodb_albums_dir,
-            ):
-                for data_path in base_dir.glob("*.json"):
-                    if data_path.name.endswith(".meta.json"):
+    def _cleanup_recent(self) -> tuple[int, int]:
+        candidates: list[tuple[float, str, int]] = []
+        total_size = 0
+        removed = 0
+        limit = self.recent_metadata_max_size_bytes
+        for directory in (
+            self._recent_albums_dir,
+            self._recent_artists_dir,
+            self._recent_audiodb_artists_dir,
+            self._recent_audiodb_albums_dir,
+        ):
+            # Non-JSON files can share a sidecar; partner-existence checks
+            # would change the existing orphan/expiry semantics.
+            handled: set[str] = set()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.is_file() or entry.name.endswith(".meta.json"):
+                        continue
+                    data_path = Path(entry.path)
+                    meta_path = self._meta_path(data_path)
+                    handled.add(meta_path.name)
+                    meta = self._load_meta(meta_path)
+                    if self._is_expired(meta):
+                        self._delete_file_pair(data_path)
+                        removed += 1
+                        continue
+                    if data_path.suffix != ".json" or limit <= 0:
                         continue
                     try:
-                        size_bytes = data_path.stat().st_size
+                        size_bytes = entry.stat().st_size
                     except FileNotFoundError:
                         continue
-                    meta_path = self._meta_path(data_path)
-                    meta: dict[str, Any] = {}
-                    if meta_path.exists():
-                        try:
-                            meta = _decode_json(meta_path.read_text())
-                        except Exception:  # noqa: BLE001
-                            meta = {}
-                    last_accessed = float(meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0)
+                    durable = float(
+                        meta.get("last_accessed", meta.get("created_at", 0.0)) or 0.0
+                    )
+                    access = max(durable, self._touch_memory.get(str(meta_path), durable))
+                    candidates.append((access, entry.path, size_bytes))
                     total_size += size_bytes
-                    candidates.append((last_accessed, data_path, size_bytes))
+            for meta_path in directory.glob("*.meta.json"):
+                if meta_path.name not in handled and self._is_expired(self._load_meta(meta_path)):
+                    meta_path.unlink(missing_ok=True)
+                    removed += 1
+            del handled
 
-            if total_size <= self.recent_metadata_max_size_bytes:
-                return 0
-
-            bytes_to_free = total_size - self.recent_metadata_max_size_bytes
-            freed = 0
-            for _, data_path, size_bytes in sorted(candidates, key=lambda item: item[0]):
-                self._delete_file_pair(data_path)
+        freed = 0
+        if total_size > limit > 0:
+            candidates.sort(key=lambda item: item[0])
+            for _, path, size_bytes in candidates:
+                self._delete_file_pair(Path(path))
                 freed += size_bytes
-                if freed >= bytes_to_free:
+                if freed >= total_size - limit:
                     break
-            return freed
-
-        return await asyncio.to_thread(operation)
+        return removed, freed
 
     async def cleanup_expired_covers(self) -> int:
         return await asyncio.to_thread(self._cleanup_expired_directory, self._recent_covers_dir)
@@ -457,7 +615,31 @@ class DiskMetadataCache:
                 shutil.rmtree(self.base_path)
             self._ensure_dirs()
 
-        await asyncio.to_thread(operation)
+        def guarded_operation() -> None:
+            with self._publication_lock:
+                self._clear_epoch += 1
+                operation()
+        await asyncio.to_thread(guarded_operation)
+
+    async def clear_musicbrainz(self) -> None:
+        """Clear only MusicBrainz album/artist metadata tiers."""
+
+        def operation() -> None:
+            for directory in (
+                self._recent_albums_dir,
+                self._persistent_albums_dir,
+                self._recent_artists_dir,
+                self._persistent_artists_dir,
+            ):
+                if directory.exists():
+                    shutil.rmtree(directory)
+            self._ensure_dirs()
+
+        def guarded_operation() -> None:
+            with self._publication_lock:
+                self._clear_epoch += 1
+                operation()
+        await asyncio.to_thread(guarded_operation)
 
     async def clear_audiodb(self) -> None:
         def operation() -> None:
