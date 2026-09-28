@@ -1,21 +1,5 @@
 # Contributing to DroppedNeedle
-INFO:     172.18.0.3:43916 - "GET /api/v1/downloads/activity-summary HTTP/1.1" 200 OK
-2026-09-27 23:24:32,211 - services.version_service - WARNING - Invalid version comparison: v2.15.0 vs dev-6227b7a
-INFO:     172.18.0.3:43954 - "GET /api/v1/requests/pending-approvals/count HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43850 - "GET /api/v1/version/check-update HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43876 - "GET /api/v1/version/releases HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43910 - "GET /api/v1/playlists/f07c3dea-82a9-4d60-8010-1b4e4f37a089 HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43818 - "POST /api/v1/playlists/f07c3dea-82a9-4d60-8010-1b4e4f37a089/resolve-sources HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43984 - "GET /api/v1/me/scrobble-preferences HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43780 - "GET /api/v1/library/activity/stream HTTP/1.1" 200 OK
-INFO:     172.18.0.3:43794 - "GET /api/v1/library/operations/stream HTTP/1.1" 200 OK
-2026-09-27 23:24:33,972 - middleware - WARNING - Slow request: POST /api/v1/playlists/f07c3dea-82a9-4d60-8010-1b4e4f37a089/match-library took 2.31s
-INFO:     172.18.0.3:43832 - "POST /api/v1/playlists/f07c3dea-82a9-4d60-8010-1b4e4f37a089/match-library HTTP/1.1" 200 OK
-INFO:     172.18.0.3:44004 - "POST /api/v1/playlists/f07c3dea-82a9-4d60-8010-1b4e4f37a089/request-missing HTTP/1.1" 202 Accepted
-2026-09-27 23:24:34,021 - middleware - WARNING - Slow request: GET /api/v1/me/section-prefs took 2.14s
-INFO:     172.18.0.3:43940 - "GET /api/v1/me/section-prefs HTTP/1.1" 200 OK
-2026-09-27 23:24:34,052 - middleware - WARNING - Slow request: GET /api/v1/library/activity took 2.24s
-INFO:     172.18.0.3:43988 - "GET /api/v1/library/activity HTTP/1.1" 200 OK
+
 Thanks for your interest. Bug reports, feature requests, and pull requests are all welcome.
 
 ## Reporting bugs
