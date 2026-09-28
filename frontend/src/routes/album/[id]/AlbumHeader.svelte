@@ -36,7 +36,6 @@
 		setEditionPin
 	} from '$lib/queries/albums/EditionQueries.svelte';
 	import type { AlbumEditionItem } from '$lib/types';
-	import { ApiError } from '$lib/api/client';
 	import { authStore } from '$lib/stores/authStore.svelte';
 	import { toastStore } from '$lib/stores/toast';
 	import { deckSampler } from '$lib/stores/deckSampler.svelte';

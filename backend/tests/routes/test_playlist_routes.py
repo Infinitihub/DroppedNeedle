@@ -583,3 +583,36 @@ class TestRequestMissingTracks:
             assert request_service.request_track.await_args.args[0] == "recording-missing"
         finally:
             del client.app.dependency_overrides[get_request_service]
+
+    def test_requests_song_without_track_number_when_title_matches(
+        self, client, mock_playlist_service, mock_album_service
+    ):
+        request_service = AsyncMock()
+        request_service.request_track.return_value = SimpleNamespace(status="queued")
+        self._override_requests(client, request_service)
+        try:
+            missing = _track(id="t-1")
+            missing.album_id = "mbid-missing"
+            missing.available_sources = None
+            missing.source_type = ""
+            missing.track_number = None
+            missing.track_name = "Song - Remastered 2011"
+            mock_playlist_service.get_playlist_with_tracks.return_value = (
+                PlaylistDetailView(record=_playlist(), tracks=[missing], is_owner=True)
+            )
+            mock_album_service.get_album_tracks_info.return_value = SimpleNamespace(
+                tracks=[SimpleNamespace(
+                    position=4,
+                    disc_number=1,
+                    title="Song",
+                    recording_id="recording-missing",
+                )],
+                selected_release_mbid="release-missing",
+            )
+            resp = client.post("/playlists/p-1/request-missing")
+            assert resp.status_code == 202
+            assert resp.json()["requested"] == 1
+            request_service.request_track.assert_awaited_once()
+            assert request_service.request_track.await_args.args[0] == "recording-missing"
+        finally:
+            del client.app.dependency_overrides[get_request_service]

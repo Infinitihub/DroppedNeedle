@@ -1,3 +1,4 @@
+import re
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Annotated
@@ -58,8 +59,21 @@ async def _get_user_navidrome_folder_ids(
     return None if resolution.scope.mode == "all" else resolution.scope.folder_ids
 
 
+# Spotify and Exportify titles often carry edition noise that MusicBrainz omits.
+# Strip that before comparing, or a correct song never clears the match threshold.
+_TITLE_NOISE = re.compile(
+    r"(?:"
+    r"\s*[\(\[][^)\]]*\b(?:feat\.?|featuring|ft\.?|remaster(?:ed)?|radio edit|mono|stereo|single version|album version|deluxe edition|live)\b[^)\]]*[\)\]]"
+    r"|\s+-\s+(?:remaster(?:ed)?|radio edit|mono|stereo|single version|album version|live)\b.*"
+    r"|\s+(?:feat\.?|featuring|ft\.?)\s+.+"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _normalize_track_title(value: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", value)
+    cleaned = _TITLE_NOISE.sub("", value)
+    decomposed = unicodedata.normalize("NFKD", cleaned)
     return "".join(character for character in decomposed.casefold() if character.isalnum())
 
 
@@ -558,9 +572,7 @@ async def request_missing_tracks(
         release_group_mbid = track.album_id
         if (
             not release_group_mbid
-            or track.track_number is None
             or track.library_file_id
-            or track.source_type == "local"
             or track.available_sources
         ):
             skipped += 1
