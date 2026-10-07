@@ -1,6 +1,7 @@
 import { API } from '$lib/constants';
 import { api } from '$lib/api/client';
 import type { QueueItem } from '$lib/player/types';
+import type { CrateTrack, LocalSearchResponse } from '$lib/types';
 
 export interface PlaylistTrack {
 	id: string;
@@ -219,6 +220,11 @@ export interface PlaylistLibraryMatchResult {
 
 export async function matchPlaylistLibrary(id: string): Promise<PlaylistLibraryMatchResult> {
 	return api.global.post<PlaylistLibraryMatchResult>(API.playlists.matchLibrary(id));
+}
+
+export async function searchPlaylistLibraryTracks(query: string): Promise<CrateTrack[]> {
+	const result = await api.global.get<LocalSearchResponse>(API.local.search(query));
+	return result.tracks;
 }
 
 export async function linkPlaylistTrackToLibrary(

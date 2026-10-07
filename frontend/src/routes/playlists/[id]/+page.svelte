@@ -6,6 +6,7 @@
 		deletePlaylist,
 		linkPlaylistTrackToLibrary,
 		matchPlaylistLibrary,
+		searchPlaylistLibraryTracks,
 		resolvePlaylistSources,
 		requestMissingTracks,
 		isRedactedPlaylist,
@@ -14,6 +15,7 @@
 		type PlaylistLibraryMatchResult,
 		type RedactedPlaylist
 	} from '$lib/api/playlists';
+	import type { CrateTrack } from '$lib/types';
 	import { playlistTrackToQueueItem } from '$lib/player/queueHelpers';
 	import { playerStore } from '$lib/stores/player.svelte';
 	import { toastStore } from '$lib/stores/toast';
@@ -26,7 +28,7 @@
 	import { extractDominantColor, DEFAULT_GRADIENT } from '$lib/utils/colors';
 	import { getApiUrl } from '$lib/api/api-utils';
 	import { withBasePath } from '$lib/utils/basePath';
-	import { Music, Lock, Download, LoaderCircle } from 'lucide-svelte';
+	import { Music, Lock, Download, LoaderCircle, Search } from 'lucide-svelte';
 	import BackButton from '$lib/components/BackButton.svelte';
 	import HeroBackdrop from '$lib/components/HeroBackdrop.svelte';
 	import type { PageData } from './$types';
@@ -87,6 +89,47 @@
 	let libraryMatch = $state<PlaylistLibraryMatchResult | null>(null);
 	let matchedPlaylistIds = new SvelteSet<string>();
 	let linkingTrackIds = new SvelteSet<string>();
+	let manualSearchTrackId = $state<string | null>(null);
+	let manualSearchTerm = $state('');
+	let manualSearchResults = $state<CrateTrack[]>([]);
+	let manualSearchLoading = $state(false);
+	let manualSearchError = $state(false);
+	let manualSearchGeneration = 0;
+
+	$effect(() => {
+		const trackId = manualSearchTrackId;
+		const term = manualSearchTerm.trim();
+		const generation = ++manualSearchGeneration;
+		if (!trackId || term.length < 2) {
+			manualSearchResults = [];
+			manualSearchLoading = false;
+			manualSearchError = false;
+			return;
+		}
+
+		let active = true;
+		const timeout = setTimeout(() => {
+			manualSearchLoading = true;
+			manualSearchError = false;
+			void searchPlaylistLibraryTracks(term)
+				.then((results) => {
+					if (active && generation === manualSearchGeneration) manualSearchResults = results;
+				})
+				.catch(() => {
+					if (active && generation === manualSearchGeneration) {
+						manualSearchResults = [];
+						manualSearchError = true;
+					}
+				})
+				.finally(() => {
+					if (active && generation === manualSearchGeneration) manualSearchLoading = false;
+				});
+		}, 220);
+		return () => {
+			active = false;
+			clearTimeout(timeout);
+		};
+	});
 
 	async function handleRequestMissing() {
 		if (requesting || !playlist) return;
@@ -130,6 +173,7 @@
 	async function acceptLibraryMatch(trackId: string, trackFileId: string) {
 		if (!playlist || !libraryMatch || linkingTrackIds.has(trackId)) return;
 		const selectedMatch = libraryMatch.tracks.find((match) => match.track_id === trackId);
+		const previousStatus = selectedMatch?.status;
 		linkingTrackIds.add(trackId);
 		try {
 			const updated = await linkPlaylistTrackToLibrary(playlist.id, trackId, trackFileId);
@@ -146,17 +190,28 @@
 			libraryMatch = {
 				...libraryMatch,
 				matched: libraryMatch.matched + 1,
-				close: Math.max(0, libraryMatch.close - 1),
+				close: Math.max(0, libraryMatch.close - (previousStatus === 'close' ? 1 : 0)),
+				missing: Math.max(0, libraryMatch.missing - (previousStatus === 'missing' ? 1 : 0)),
 				tracks: libraryMatch.tracks.map((match) =>
 					match.track_id === trackId ? { ...match, status: 'matched' } : match
 				)
 			};
+			if (manualSearchTrackId === trackId) manualSearchTrackId = null;
 			toastStore.show({ message: 'Linked track to your library', type: 'success' });
 		} catch {
 			toastStore.show({ message: "Couldn't link that library match", type: 'error' });
 		} finally {
 			linkingTrackIds.delete(trackId);
 		}
+	}
+
+	function toggleManualSearch(trackId: string, trackName: string) {
+		if (manualSearchTrackId === trackId) {
+			manualSearchTrackId = null;
+			return;
+		}
+		manualSearchTrackId = trackId;
+		manualSearchTerm = trackName;
 	}
 
 	// Source-resolution cache is namespaced per user so two accounts on a shared
@@ -489,7 +544,7 @@
 					<div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
 						{#if matchingLibrary && !libraryMatch}
 							<span class="inline-flex items-center gap-2 text-base-content/65">
-								<Loader2 class="h-4 w-4 animate-spin" /> Checking your library…
+								<LoaderCircle class="h-4 w-4 animate-spin" /> Checking your library…
 							</span>
 						{:else if libraryMatch}
 							<span class="font-medium text-success">{libraryMatch.matched} matched</span>
@@ -542,8 +597,67 @@
 									{@const sourceTrack = playlist.tracks.find(
 										(track) => track.id === match.track_id
 									)}
-									<li class="py-2 text-base-content/70">
-										{sourceTrack?.artist_name} · {sourceTrack?.track_name}
+									<li class="space-y-2 py-2 text-base-content/70">
+										<div class="flex items-center justify-between gap-3">
+											<span class="min-w-0 truncate"
+												>{sourceTrack?.artist_name} · {sourceTrack?.track_name}</span
+											>
+											<button
+												class="btn btn-xs"
+												onclick={() =>
+													toggleManualSearch(match.track_id, sourceTrack?.track_name ?? '')}
+												aria-expanded={manualSearchTrackId === match.track_id}
+											>
+												<Search class="h-3 w-3" />
+												{manualSearchTrackId === match.track_id
+													? 'Close search'
+													: 'Find in library'}
+											</button>
+										</div>
+										{#if manualSearchTrackId === match.track_id}
+											<div class="space-y-2 pl-2">
+												<label class="input input-sm flex w-full items-center gap-2">
+													<Search class="h-4 w-4 shrink-0 text-base-content/45" />
+													<input
+														type="search"
+														class="grow"
+														bind:value={manualSearchTerm}
+														aria-label="Search your library for {sourceTrack?.track_name}"
+													/>
+												</label>
+												{#if manualSearchLoading}
+													<p class="text-xs text-base-content/55">Searching your library…</p>
+												{:else if manualSearchError}
+													<p class="text-xs text-error">Library search failed. Try again.</p>
+												{:else if manualSearchTerm.trim().length < 2}
+													<p class="text-xs text-base-content/55">Enter at least 2 characters.</p>
+												{:else if manualSearchResults.length === 0}
+													<p class="text-xs text-base-content/55">No matching library tracks.</p>
+												{:else}
+													<ul class="divide-y divide-base-300/40">
+														{#each manualSearchResults as candidate (candidate.track_file_id)}
+															<li class="flex items-center justify-between gap-3 py-2">
+																<span class="min-w-0 flex-1 truncate text-xs">
+																	{candidate.artist_name} · {candidate.title}
+																	<span class="text-base-content/50">· {candidate.album_name}</span>
+																</span>
+																<button
+																	class="btn btn-xs btn-accent"
+																	onclick={() =>
+																		void acceptLibraryMatch(
+																			match.track_id,
+																			candidate.track_file_id
+																		)}
+																	disabled={linkingTrackIds.has(match.track_id)}
+																>
+																	Link
+																</button>
+															</li>
+														{/each}
+													</ul>
+												{/if}
+											</div>
+										{/if}
 									</li>
 								{/each}
 							</ul>

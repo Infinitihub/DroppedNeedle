@@ -19,6 +19,8 @@ const mockDeletePlaylistCover = vi.fn();
 const mockCheckTrackMembership = vi.fn();
 const mockResolvePlaylistSources = vi.fn();
 const mockMatchPlaylistLibrary = vi.fn();
+const mockSearchPlaylistLibraryTracks = vi.fn();
+const mockLinkPlaylistTrackToLibrary = vi.fn();
 
 vi.mock('$lib/api/playlists', () => ({
 	queueItemToTrackData: (item: unknown) => item,
@@ -38,7 +40,8 @@ vi.mock('$lib/api/playlists', () => ({
 	checkTrackMembership: (...args: unknown[]) => mockCheckTrackMembership(...args),
 	resolvePlaylistSources: (...args: unknown[]) => mockResolvePlaylistSources(...args),
 	matchPlaylistLibrary: (...args: unknown[]) => mockMatchPlaylistLibrary(...args),
-	linkPlaylistTrackToLibrary: vi.fn(),
+	searchPlaylistLibraryTracks: (...args: unknown[]) => mockSearchPlaylistLibraryTracks(...args),
+	linkPlaylistTrackToLibrary: (...args: unknown[]) => mockLinkPlaylistTrackToLibrary(...args),
 	requestMissingTracks: vi.fn()
 }));
 
@@ -182,6 +185,8 @@ describe('Playlist detail page', () => {
 		mockResolvePlaylistSources.mockReset();
 		mockResolvePlaylistSources.mockResolvedValue({});
 		mockMatchPlaylistLibrary.mockReset();
+		mockSearchPlaylistLibraryTracks.mockReset();
+		mockLinkPlaylistTrackToLibrary.mockReset();
 		mockToastShow.mockReset();
 		mockPlayQueue.mockReset();
 		mockAddToQueue.mockReset();
@@ -392,6 +397,58 @@ describe('Playlist detail page', () => {
 		await expect.element(page.getByText('1 not found')).toBeVisible();
 		await expect.element(page.getByText('Review close matches')).toBeVisible();
 		await expect.element(page.getByText('Not found in your library')).toBeVisible();
+	});
+
+	it('manually searches and links a missing CSV track to the local library', async () => {
+		detailQuery.data = makePlaylist({
+			source_ref: 'exportify:test-csv',
+			tracks: [makeTrack({ id: 'trk-missing', track_name: 'Missing Song' })],
+			track_count: 1
+		});
+		mockMatchPlaylistLibrary.mockResolvedValue({
+			matched: 0,
+			close: 0,
+			missing: 1,
+			tracks: [{ track_id: 'trk-missing', status: 'missing', candidate: null }]
+		});
+		mockSearchPlaylistLibraryTracks.mockResolvedValue([
+			{
+				track_file_id: 'file-manual',
+				title: 'Missing Song (Album Version)',
+				artist_name: 'Test Artist',
+				album_name: 'Test Album',
+				album_mbid: 'alb-1',
+				cover_url: null,
+				format: 'flac',
+				year: 2008,
+				duration_seconds: 240,
+				reason: 'recent'
+			}
+		]);
+		mockLinkPlaylistTrackToLibrary.mockResolvedValue(
+			makeTrack({
+				id: 'trk-missing',
+				source_type: 'local',
+				track_source_id: 'file-manual',
+				library_file_id: 'file-manual',
+				available_sources: ['local']
+			})
+		);
+		await renderDetail('pl-1');
+
+		await page.getByText('Not found in your library').click();
+		await page.getByRole('button', { name: 'Find in library' }).click();
+		await vi.waitFor(() => {
+			expect(mockSearchPlaylistLibraryTracks).toHaveBeenCalledWith('Missing Song');
+		});
+		await page.getByRole('button', { name: 'Link', exact: true }).click();
+
+		expect(mockLinkPlaylistTrackToLibrary).toHaveBeenCalledWith(
+			'pl-1',
+			'trk-missing',
+			'file-manual'
+		);
+		await expect.element(page.getByText('0 not found')).toBeVisible();
 	});
 
 	it('shows play button on track hover with correct aria label', async () => {
