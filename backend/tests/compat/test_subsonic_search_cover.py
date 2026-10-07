@@ -70,6 +70,22 @@ async def test_search3_counts_respected(compat_env):
     assert len(res["song"]) == 2
 
 
+async def test_search3_accepts_substreamer_page_size(compat_env):
+    res = _sub(
+        _get(
+            compat_env,
+            "search3",
+            query="",
+            artistCount="1000",
+            albumCount="1000",
+            songCount="1000",
+        )
+    )["searchResult3"]
+    assert len(res["artist"]) == 1
+    assert len(res["album"]) == 1
+    assert len(res["song"]) == 2
+
+
 async def test_get_cover_art_album_returns_image(compat_env):
     album_id = _sub(_get(compat_env, "getAlbumList2", type="newest"))["albumList2"]["album"][0]["id"]
     r = _get(compat_env, "getCoverArt", id=album_id)
