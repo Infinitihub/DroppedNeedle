@@ -18,8 +18,15 @@ def _fsync_file_contents(path: Path) -> None:
 
 
 def _fsync_directory_best_effort(directory: Path) -> None:
+    # ``os.O_DIRECTORY`` is POSIX-only. This helper is best-effort, so a platform
+    # that cannot fsync directories (Windows) must skip it instead of aborting
+    # the surrounding atomic write.
     try:
-        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        flags = os.O_RDONLY | os.O_DIRECTORY
+    except AttributeError:
+        return
+    try:
+        descriptor = os.open(directory, flags)
     except OSError:
         return
     try:

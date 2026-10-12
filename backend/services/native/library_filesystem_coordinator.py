@@ -21,7 +21,10 @@ _RENAME_NOREPLACE = 1 << 0
 _NOREPLACE_UNSUPPORTED_ERRNOS = frozenset(
     {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTTY}
 )
-_LIBC = ctypes.CDLL(None, use_errno=True)
+# ``ctypes.CDLL(None)`` exposes the host libc (for ``renameat2``) on POSIX only.
+# Windows has no equivalent, so the NOREPLACE backstop stays disabled there and
+# callers fall back to the recheck-then-replace path.
+_LIBC = ctypes.CDLL(None, use_errno=True) if os.name != "nt" else None
 
 
 def _wake_async_future(future: asyncio.Future[None]) -> None:
@@ -319,6 +322,10 @@ def _renameat2_noreplace(
     old_dir_fd: int, old_name: str, new_dir_fd: int, new_name: str
 ) -> None:
     """renameat2(RENAME_NOREPLACE): fail with EEXIST instead of overwriting."""
+
+    if _LIBC is None:
+        # No host libc (Windows): report unsupported so the caller falls back.
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), os.fspath(new_name))
 
     result = _LIBC.renameat2(
         ctypes.c_int(old_dir_fd),
