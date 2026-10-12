@@ -16,6 +16,8 @@
 </script>
 
 <script lang="ts">
+	import { Disc3 } from 'lucide-svelte';
+
 	import AlbumImage from '$lib/components/AlbumImage.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import type { ReviewListItem } from '$lib/queries/library/LibraryOperationsTypes';
@@ -57,6 +59,7 @@
 
 {#if items.length === 0}
 	<EmptyState
+		icon={Disc3}
 		title={state === 'keep_tagged'
 			? 'No albums have been kept with local metadata yet.'
 			: state === 'edition_to_confirm'

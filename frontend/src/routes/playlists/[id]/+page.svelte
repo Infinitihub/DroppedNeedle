@@ -578,7 +578,7 @@
 												void acceptLibraryMatch(match.track_id, match.candidate!.track_file_id)}
 											disabled={linkingTrackIds.has(match.track_id)}
 										>
-											{#if linkingTrackIds.has(match.track_id)}<Loader2
+											{#if linkingTrackIds.has(match.track_id)}<LoaderCircle
 													class="h-3 w-3 animate-spin"
 												/>{:else}Use this match{/if}
 										</button>

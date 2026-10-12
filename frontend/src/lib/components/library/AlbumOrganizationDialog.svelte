@@ -13,6 +13,7 @@
 	} from '$lib/queries/library/LibraryCatalogMutations.svelte';
 	import { createEditionConversionPreflight } from '$lib/queries/library/EditionConversionQueries.svelte';
 	import { getAlbumEditionsQuery } from '$lib/queries/albums/EditionQueries.svelte';
+	import { authStore } from '$lib/stores/authStore.svelte';
 
 	type Action = 'split' | 'merge' | 'move' | 'reset';
 	interface Props {
@@ -60,6 +61,7 @@
 		targetAlbum.data?.musicbrainz_release_group_id ?? album.musicbrainz_release_group_id ?? ''
 	);
 	const editionsQuery = getAlbumEditionsQuery(
+		() => authStore.user?.id,
 		() => editionGroupMbid,
 		() => action === 'merge' && !!targetAlbumId && !!editionGroupMbid
 	);

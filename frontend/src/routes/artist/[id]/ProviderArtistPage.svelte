@@ -68,8 +68,7 @@
 	const connectionsUsable = $derived(
 		connectionsSettled &&
 			connectionsQuery.data !== undefined &&
-			connectionsQuery.isError !== true &&
-			connectionsQuery.isSuccess !== false
+			connectionsQuery.isError !== true
 	);
 	const linkedSources = $derived.by<MusicSource[]>(() => {
 		if (!connectionsUsable) return [];
